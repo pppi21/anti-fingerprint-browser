@@ -1,8 +1,6 @@
 # NoDriver4j Browser
 
-A Chromium-derived browser with anti-fingerprinting and telemetry-suppression
-features layered on top.
-
+A Chromium-derived browser with anti-fingerprinting. Made this for personal use but making public for feedback/stars. This guide is AI so there may be mistakes. Credit to the writers of chromium as well as the ungoogled-chromium project for helping with the removal of safebrowsing. Feedback and feature requests are appreciated.
 ## Quick start
 
 1. Extract the zip anywhere.
