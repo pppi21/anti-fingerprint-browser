@@ -1,0 +1,140 @@
+NODRIVER4J BROWSER — END USER LICENSE AGREEMENT
+
+Copyright (c) 2026 Leo Rodarte. All rights reserved.
+
+This End User License Agreement ("Agreement") is a legal agreement between
+you ("You") and Leo Rodarte ("Author") for the NoDriver4j Browser software,
+including the executable binary, any associated data files, and any
+documentation distributed with it (collectively, the "Software"). By
+installing, copying, or otherwise using the Software, You agree to be bound
+by the terms of this Agreement. If You do not agree, do not install or use
+the Software.
+
+
+1. LICENSE GRANT
+
+   Subject to Your compliance with this Agreement, the Author grants You a
+   free, non-exclusive, non-transferable, revocable license to install and
+   use the Software for personal or commercial purposes on any number of
+   devices You own or control.
+
+
+2. RESTRICTIONS
+
+   You may not:
+
+     (a) redistribute, sublicense, sell, rent, lease, or otherwise transfer
+         the Software or any portion of it to any third party;
+     (b) modify, adapt, translate, decompile, disassemble, reverse engineer,
+         or attempt to derive the source code of the Software, except to the
+         extent that applicable law expressly permits such activity
+         notwithstanding this restriction;
+     (c) remove, alter, or obscure any copyright, trademark, license, or
+         other proprietary notices in or on the Software;
+     (d) use the Software in any manner that violates applicable laws or the
+         rights of any third party;
+     (e) use the Software to develop or distribute a competing product.
+
+
+3. THIRD-PARTY COMPONENTS
+
+   The Software incorporates components from The Chromium Authors (licensed
+   under the BSD 3-Clause License) and other third-party open-source
+   projects. A full list of these components, together with their copyright
+   notices and license terms, is available at the chrome://credits page
+   within the running Software. Your use of those components is governed by
+   their respective licenses.
+
+   "Chromium" is a trademark of Google LLC. This Software is not endorsed by
+   or affiliated with Google LLC or The Chromium Authors.
+
+
+4. OWNERSHIP
+
+   The Software is licensed, not sold. The Author retains all right, title,
+   and interest in and to the Software, including all intellectual property
+   rights, except as expressly licensed to You in this Agreement.
+
+
+5. NO WARRANTY
+
+   THE SOFTWARE IS PROVIDED "AS IS" AND "AS AVAILABLE", WITHOUT WARRANTY OF
+   ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES
+   OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, TITLE, AND
+   NON-INFRINGEMENT. THE AUTHOR DOES NOT WARRANT THAT THE SOFTWARE WILL BE
+   UNINTERRUPTED, ERROR-FREE, SECURE, OR FREE OF VIRUSES OR OTHER HARMFUL
+   COMPONENTS, OR THAT IT WILL MEET YOUR REQUIREMENTS.
+
+
+6. LIMITATION OF LIABILITY
+
+   TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, IN NO EVENT SHALL THE
+   AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+   EXEMPLARY, CONSEQUENTIAL, OR PUNITIVE DAMAGES (INCLUDING BUT NOT LIMITED
+   TO LOSS OF DATA, LOSS OF PROFITS, LOSS OF GOODWILL, BUSINESS
+   INTERRUPTION, ACCOUNT SUSPENSION OR TERMINATION BY ANY THIRD-PARTY
+   SERVICE, OR PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES) ARISING OUT OF
+   OR IN CONNECTION WITH THIS AGREEMENT OR THE USE OF OR INABILITY TO USE
+   THE SOFTWARE, WHETHER IN CONTRACT, TORT (INCLUDING NEGLIGENCE), STRICT
+   LIABILITY, OR ANY OTHER LEGAL THEORY, AND EVEN IF THE AUTHOR HAS BEEN
+   ADVISED OF THE POSSIBILITY OF SUCH DAMAGES.
+
+
+7. USER RESPONSIBILITY
+
+   You are solely responsible for ensuring that Your use of the Software
+   complies with all applicable laws, regulations, and the terms of service
+   of any website, platform, or service You access using the Software. The
+   Software is provided as a general-purpose tool; the Author makes no
+   representation that it is fit for, or appropriate to use for, any
+   specific purpose, including but not limited to evading automated
+   detection systems, circumventing access controls, or any other activity
+   prohibited by a third party's terms of service or by law. Any
+   consequences arising from Your use of the Software, including but not
+   limited to account suspension, banning, civil liability, or criminal
+   liability, are Your sole responsibility.
+
+
+8. NO SUPPORT OBLIGATION
+
+   The Author is under no obligation to provide updates, bug fixes,
+   maintenance, technical support, or any other services in connection with
+   the Software. Any such services that may be provided are at the sole
+   discretion of the Author and may be discontinued at any time without
+   notice.
+
+
+9. TERMINATION
+
+   This Agreement is effective until terminated. Your rights under this
+   Agreement will terminate automatically and without notice from the
+   Author if You fail to comply with any term of this Agreement. Upon
+   termination, You must cease all use of the Software and destroy all
+   copies of the Software in Your possession. Sections 2, 4, 5, 6, 7, 9,
+   10, and 11 survive any termination of this Agreement.
+
+
+10. GOVERNING LAW AND VENUE
+
+    This Agreement is governed by and construed in accordance with the laws
+    of the State of California, United States, without regard to its
+    conflict-of-laws principles. Any dispute arising out of or relating to
+    this Agreement or the Software shall be brought exclusively in the
+    state or federal courts located in California, and You consent to the
+    personal jurisdiction of those courts.
+
+
+11. ENTIRE AGREEMENT; SEVERABILITY
+
+    This Agreement constitutes the entire agreement between You and the
+    Author with respect to the Software and supersedes all prior or
+    contemporaneous understandings regarding the Software. If any provision
+    of this Agreement is held to be unenforceable or invalid, that
+    provision will be limited or eliminated to the minimum extent necessary
+    so that the remaining provisions of this Agreement remain in full force
+    and effect.
+
+
+12. CONTACT
+
+    Questions regarding this Agreement may be directed to the Author.
