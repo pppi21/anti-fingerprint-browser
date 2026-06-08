@@ -110,6 +110,93 @@ These don't fit the seed model. Pass a literal value or omit.
 
 ---
 
+## Custom CDP methods
+
+Three commands extend the standard Chrome DevTools Protocol. They're
+listed in the protocol JSON at `http://127.0.0.1:<port>/json/protocol` and
+can be invoked through any CDP client (chrome-devtools-frontend,
+Puppeteer / Playwright via `CDPSession.send(...)`, nodriver / Selenium
+CDP wrappers, raw WebSocket, etc.).
+
+### `Input.dispatchMousePath` — batched human-like mouse movement
+
+Walks a pre-computed cursor trajectory in a single CDP call instead of
+N per-segment `Input.dispatchMouseEvent` round-trips. Chromium dispatches
+the events internally at a fixed `1000 / pollingRateHz` ms interval so
+polling rates of 500–1000 Hz become achievable (per-segment CDP round-
+trip latency normally caps effective rates around 50–100 Hz).
+
+Parameters:
+- `path` — array of `{ x: number, y: number }` positions in CSS pixels.
+- `pollingRateHz` — integer (e.g. `125`, `500`, `1000`).
+
+Returns: `{ x, y }` — the final cursor position.
+
+```json
+{
+  "method": "Input.dispatchMousePath",
+  "params": {
+    "path": [{"x": 100, "y": 100}, {"x": 105, "y": 102}, {"x": 110, "y": 105}],
+    "pollingRateHz": 500
+  }
+}
+```
+
+### `Input.dispatchKeystrokes` — batched human-like typing
+
+Types a string with realistic timing, optional thinking pauses, and
+optional typo + correction sequences. The full schedule runs inside the
+browser process so per-key round-trip latency is gone; one CDP call per
+`type()` operation regardless of length.
+
+Parameters:
+- `text` — string to type. `\n` maps to Enter.
+- `speedMultiplier` — number > 0, default `1.0`. Values > 1 type faster.
+- `keystrokeDelayMin` / `keystrokeDelayMax` — integer ms, default `60` / `260`. Inter-keystroke delay range (before speed scaling).
+- `keyHoldMin` / `keyHoldMax` — integer ms. keyDown → keyUp hold duration range.
+- `contextAware` — bool, default `true`. Applies bigram-frequency and post-punctuation timing adjustments.
+- `thinkingPauseProbability` — number 0–1, default `0`. Chance of a longer pause before a character. Pair with `thinkingPauseMin` / `thinkingPauseMax` (integer ms).
+- `typoProbability` — number 0–1, default `0`. Chance of injecting a typo + backspace + correction. Realistic values: `0.01`–`0.03`.
+- `seed` — number, optional. RNG seed for a deterministic schedule (same params + text + seed → identical event sequence).
+
+Returns: nothing meaningful — the call blocks until the full schedule has run.
+
+```json
+{
+  "method": "Input.dispatchKeystrokes",
+  "params": {
+    "text": "hello world",
+    "speedMultiplier": 1.2,
+    "typoProbability": 0.02,
+    "thinkingPauseProbability": 0.05
+  }
+}
+```
+
+### `DOM.getShadowRoot` — closed shadow root access
+
+Returns the shadow root of a host element regardless of `closed` vs `open`
+mode. Standard `DOM.describeNode` (even with `pierce: true`) skips closed
+roots; this command exposes them, and page JavaScript cannot detect that
+the access happened.
+
+Parameters:
+- `nodeId` — integer. The host element's CDP node ID.
+
+Returns: `{ shadowRoot: Node | null }` — the shadow root as a standard CDP Node, or `null` if the element has no shadow root.
+
+```json
+{
+  "method": "DOM.getShadowRoot",
+  "params": { "nodeId": 42 }
+}
+```
+
+Once you have the shadow root's `nodeId`, the standard `DOM.querySelector`,
+`DOM.describeNode`, `DOM.resolveNode`, etc. all work against it.
+
+---
+
 ## License
 
 See `LICENSE.txt`. The build is free for personal and commercial use, with
