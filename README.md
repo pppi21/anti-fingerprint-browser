@@ -38,10 +38,10 @@ support enabled** — so uBlock Origin classic (Chrome Web Store or a sideloaded
 
 To launch with stock Chromium behavior instead, add `--use-chromium-defaults`.
 
-## Fingerprint identity — `chrome://nodriver4j-settings`
+## Fingerprint identity — `chrome://browser-settings`
 
 Fingerprint spoofing is **off by default**. Turn it on at
-**`chrome://nodriver4j-settings`**:
+**`chrome://browser-settings`**:
 
 - **Off** — no spoofing (standard Chromium fingerprint).
 - **Auto** — a fresh random identity each launch.
@@ -57,7 +57,7 @@ saved value for that one launch.)
 ## Custom command-line switches
 
 Most people won't need these: the privacy defaults are automatic and the
-fingerprint identity is set at `chrome://nodriver4j-settings`. The switches
+fingerprint identity is set at `chrome://browser-settings`. The switches
 below are for finer control. Pass one by adding it to the **Target** field of
 your browser shortcut — it then applies to launches from *that* shortcut only,
 while the privacy defaults and the saved fingerprint seed apply to every launch
@@ -78,7 +78,7 @@ per-switch `auto`/`seed:N`).
 
 | Switch | Modes | Description |
 |---|---|---|
-| `--fingerprint-seed=auto\|<int>` | auto, integer | Master seed driving every "Master ✓" switch below. `auto` allocates one random seed per launch; `<int>` is reproducible across launches. Usually set persistently via `chrome://nodriver4j-settings` (see above) rather than here; a command-line value overrides the saved one for that launch. |
+| `--fingerprint-seed=auto\|<int>` | auto, integer | Master seed driving every "Master ✓" switch below. `auto` allocates one random seed per launch; `<int>` is reproducible across launches. Usually set persistently via `chrome://browser-settings` (see above) rather than here; a command-line value overrides the saved one for that launch. |
 | `--use-chromium-defaults` | presence-only | Opt out of the always-on browser-defaults preset for this launch — run with stock Chromium behavior. |
 | `--browser-defaults` | presence-only | No-op, kept for backward compatibility: the preset it used to enable is now applied by default on every launch (opt out with `--use-chromium-defaults`). |
 
@@ -108,7 +108,7 @@ embedded pool) or from pure seed math. All accept per-switch `auto` or
 | `--canvas-blur-noise=<float>` | auto, seed:N, explicit | ✓ | Multiplicative perturbation on Gaussian blur sigmas (`shadowBlur`, `ctx.filter='blur(...)'`). Range `[0.005, 0.03]`. |
 | `--canvas-gradient-noise=<float>` | auto, seed:N, explicit | ✓ | Additive perturbation on Canvas 2D gradient color-stop offsets. Range `[0.003, 0.02]`. |
 | `--webgl-shader-noise=<float>` | auto, seed:N, explicit | ✓ | Sub-LSB perturbation on WebGL fragment-shader natural-variance constructs. Range `[1e-3, 3e-3]`. |
-| `--nodriver4j-font-bundle=<seed-string>` | auto, seed:N, explicit | ✓ | Selects an on-disk font bundle from `nodriver4j_fonts/`; affects `document.fonts` enumeration and text metric widths. |
+| `--browser-font-bundle=<seed-string>` | auto, seed:N, explicit | ✓ | Selects an on-disk font bundle from `browser_fonts/`; affects `document.fonts` enumeration and text metric widths. |
 
 ---
 
