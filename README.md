@@ -1,24 +1,67 @@
 # Anti-fingerprint Browser
 
 A Chromium-derived browser with anti-fingerprinting. Made this for personal use but making public for feedback/stars. This guide is AI so there may be mistakes. Credit to the writers of chromium as well as the ungoogled-chromium project for helping with the removal of safebrowsing. Feedback and feature requests are appreciated.
-## Quick start
+## Install
 
-1. Extract the zip anywhere.
-2. Right-click `chrome.exe` → **Send to → Desktop (create shortcut)**.
-3. Right-click the new shortcut → **Properties**. In the **Target** field,
-   append the recommended switches after the path:
-   ```
-   "C:\path\to\chrome.exe" --browser-defaults --fingerprint-seed=auto
-   ```
-4. OK. Pin to taskbar if you like. Launching that shortcut starts the
-   browser with telemetry off and per-launch fingerprint randomization on.
+Two ways to run it — an installer or a portable zip. Both are the same browser;
+the installer just handles setup and Windows integration for you.
 
-**uBlock Origin works.** The build keeps Manifest V2 extension support
-enabled (via the `--browser-defaults` preset), so installing uBO classic
-from the Chrome Web Store or sideloading the `.crx` works as it did
-pre-Chrome-127.
+### Installer (recommended)
+
+1. Download `AntiFingerprintChromium-Setup-<version>.exe` and run it.
+2. Choose an install location (or accept the default) and all-users vs. just-me.
+3. It installs the browser, adds Start Menu / desktop shortcuts, and registers
+   it with Windows as a web browser.
+4. To make it your default: tick **"Choose … as your default browser"** on the
+   last wizard page, or later open **Settings → Apps → Default apps**, find
+   **Anti-Fingerprint Chromium**, and set it for `http`, `https`, and `.html`.
+   (Windows only lets *you* pick the default — no app can force it.)
+
+Uninstall from **Settings → Apps** like any normal program.
+
+### Portable (zip)
+
+1. Extract the zip anywhere and run `chrome.exe` — no installation required.
+2. *(Optional)* To make the portable copy selectable as your default browser,
+   run the included `register-browser.ps1` from the extracted folder in an
+   **elevated** PowerShell (or add `-PerUser` to register for just your account,
+   no admin needed), then set it in **Settings → Default apps**. Undo any time
+   with `register-browser.ps1 -Unregister`.
+
+## Privacy defaults (always on)
+
+A telemetry-off + privacy preset is applied automatically on **every** launch —
+no flags or shortcuts needed. It turns off pings, background networking, and
+usage/crash reporting, disables Safe Browsing, and **keeps Manifest V2 extension
+support enabled** — so uBlock Origin classic (Chrome Web Store or a sideloaded
+`.crx`) works as it did pre-Chrome-127.
+
+To launch with stock Chromium behavior instead, add `--use-chromium-defaults`.
+
+## Fingerprint identity — `chrome://nodriver4j-settings`
+
+Fingerprint spoofing is **off by default**. Turn it on at
+**`chrome://nodriver4j-settings`**:
+
+- **Off** — no spoofing (standard Chromium fingerprint).
+- **Auto** — a fresh random identity each launch.
+- **Fixed seed** — a stable identity derived from a number you choose (the same
+  number reproduces the same identity across launches).
+
+Your choice is saved and applied on **every** launch, no matter how the browser
+is started — a clicked link, a shortcut, or as your default browser. Restart the
+browser after changing it. (This is equivalent to the `--fingerprint-seed`
+switch below; passing `--fingerprint-seed` on the command line overrides the
+saved value for that one launch.)
 
 ## Custom command-line switches
+
+Most people won't need these: the privacy defaults are automatic and the
+fingerprint identity is set at `chrome://nodriver4j-settings`. The switches
+below are for finer control. Pass one by adding it to the **Target** field of
+your browser shortcut — it then applies to launches from *that* shortcut only,
+while the privacy defaults and the saved fingerprint seed apply to every launch
+however the browser is started.
 
 Notation in the **Modes** column: `explicit` means a literal value;
 `auto` randomizes once per launch; `seed:N` derives deterministically from
@@ -35,8 +78,9 @@ per-switch `auto`/`seed:N`).
 
 | Switch | Modes | Description |
 |---|---|---|
-| `--fingerprint-seed=auto\|<int>` | auto, integer | Master seed driving every "Master ✓" switch below. `auto` allocates one random seed per launch; `<int>` is reproducible across launches. |
-| `--browser-defaults` | presence-only | Expands to a preset of telemetry-off switches and privacy-positive feature flags. User-supplied switches always win; `--enable-features` and `--disable-features` are merged. |
+| `--fingerprint-seed=auto\|<int>` | auto, integer | Master seed driving every "Master ✓" switch below. `auto` allocates one random seed per launch; `<int>` is reproducible across launches. Usually set persistently via `chrome://nodriver4j-settings` (see above) rather than here; a command-line value overrides the saved one for that launch. |
+| `--use-chromium-defaults` | presence-only | Opt out of the always-on browser-defaults preset for this launch — run with stock Chromium behavior. |
+| `--browser-defaults` | presence-only | No-op, kept for backward compatibility: the preset it used to enable is now applied by default on every launch (opt out with `--use-chromium-defaults`). |
 
 ---
 
