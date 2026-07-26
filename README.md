@@ -34,7 +34,7 @@ Grab the latest build from the [Releases page](../../releases):
 
 ## Trust & verification
 
-**The source is closed, and I don't intend to open it for now.** I don't have any experience with open source so I'd rather keep it closed for now. If someone would like to help me safely open-source this project just email me [support@nodriver.app].
+**The source is closed, and I don't intend to open it.** I don't have any experience with open source so I'd rather keep it closed for now. If someone would like to help me safely open-source this project just email me [support@nodriver.app].
 
 Use [Mullvad Browser](https://mullvad.net/en/browser), [LibreWolf](https://librewolf.net/), or [Brave](https://brave.com/) instead if you need open source.
 
