@@ -180,7 +180,7 @@ These don't fit the seed model. Pass a literal value or omit. Set them to match 
 
 ## Automation: custom CDP methods
 
-Three commands extend the standard Chrome DevTools Protocol, aimed at browser automation and UI testing where per-event round-trip latency is the bottleneck. They're listed in the protocol JSON at `http://127.0.0.1:<port>/json/protocol` and can be invoked through any CDP client (chrome-devtools-frontend, Puppeteer / Playwright via `CDPSession.send(...)`, nodriver / Selenium CDP wrappers, raw WebSocket, etc.).
+Five commands extend the standard Chrome DevTools Protocol, aimed at browser automation and UI testing. Some collapse per-event round-trip latency into a single call; others expose page state standard CDP cannot reach. They're listed in the protocol JSON at `http://127.0.0.1:<port>/json/protocol` and can be invoked through any CDP client (chrome-devtools-frontend, Puppeteer / Playwright via `CDPSession.send(...)`, nodriver / Selenium CDP wrappers, raw WebSocket, etc.).
 
 ### `Input.dispatchMousePath`: batched mouse movement
 
@@ -249,6 +249,43 @@ Returns: `{ shadowRoot: Node | null }`, the shadow root as a standard CDP Node, 
 ```
 
 Once you have the shadow root's `nodeId`, the standard `DOM.querySelector`, `DOM.describeNode`, `DOM.resolveNode`, etc. all work against it.
+
+### `Page.captureAgentSnapshot`: one-call page perception
+
+Returns every interactive element on the page, across cross-origin iframes and both open and closed shadow DOM, with geometry already composed into the root viewport's CSS-pixel space, plus an OOPIF-aggregated screenshot. Replaces the usual accessibility-tree walk and per-frame coordinate math, which costs many round-trips and still misses closed roots and cross-frame occlusion.
+
+Elements that are on-screen, interactive, and unobscured get a short `label` (`"a1"`, `"a2"`) and a distinct outline `color` drawn on the screenshot, so a caller can name a target unambiguously.
+
+Parameters:
+- `format`: `png` | `jpeg` | `webp`, default `png`. Screenshot compression format.
+- `quality`: integer 0-100, `jpeg`/`webp` only.
+- `offscreenMode`: `none` | `summary` | `full`, default `summary`. How to report elements outside the viewport.
+- `includeScreenshot`: bool, default `true`.
+
+Returns: `{ url, title, viewport, elements, screenshot?, snapshotToken }`. `viewport` carries scroll offsets and `deviceScaleFactor`. Each element carries `agentNodeId`, `backendNodeId`, `frameId`, `role`, `name`, `tag`, `states[]`, its border box, `inViewport`, `obscured`, and `href` / `src` where applicable. `snapshotToken` is a cheap change-detection token.
+
+```json
+{
+  "method": "Page.captureAgentSnapshot",
+  "params": { "format": "webp", "quality": 80, "offscreenMode": "summary" }
+}
+```
+
+### `Page.resolveAgentNode`: re-locate a snapshot element
+
+Maps an `agentNodeId` from an earlier `captureAgentSnapshot` back to that element's *current* border box, in the same root-viewport coordinate space. Use it to confirm a target hasn't moved between perception and action without paying for a full re-snapshot. The id is browser-minted and unique across all frames, so it resolves elements in cross-origin iframes too.
+
+Parameters:
+- `agentNodeId`: integer from a prior snapshot.
+
+Returns: `{ found, x?, y?, width?, height? }`. `found` is `false` when the id is unknown, or the element no longer exists or isn't laid out.
+
+```json
+{
+  "method": "Page.resolveAgentNode",
+  "params": { "agentNodeId": 17 }
+}
+```
 
 ## Intended use
 
