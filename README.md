@@ -189,15 +189,17 @@ Walks a pre-computed cursor trajectory in a single CDP call instead of N per-seg
 Parameters:
 - `path`: array of `{ x: number, y: number }` positions in CSS pixels.
 - `pollingRateHz`: integer (e.g. `125`, `500`, `1000`).
+- `button`: optional `none` | `left` | `middle` | `right` | `back` | `forward`, default `none`. Held down for the duration of the path. Without it every move is a hover: the compositor starts no drag and grants no pointer capture, so a native control follows the initial press and ignores the rest of the path. Set it to drag, issuing the `mousePressed` and `mouseReleased` around it with `Input.dispatchMouseEvent`.
 
-Returns: `{ x, y }`, the final cursor position.
+Returns: nothing. The call completes once the schedule has run.
 
 ```json
 {
   "method": "Input.dispatchMousePath",
   "params": {
     "path": [{"x": 100, "y": 100}, {"x": 105, "y": 102}, {"x": 110, "y": 105}],
-    "pollingRateHz": 500
+    "pollingRateHz": 500,
+    "button": "left"
   }
 }
 ```
@@ -236,10 +238,12 @@ Returns the shadow root of a host element regardless of `closed` vs `open` mode.
 
 The access is not observable from page JavaScript.
 
-Parameters:
+Parameters, exactly one of:
 - `nodeId`: integer. The host element's CDP node ID.
+- `backendNodeId`: integer. The host element's backend node ID, which is what `Page.captureAgentSnapshot` returns for every element.
+- `objectId`: string. A `Runtime.RemoteObjectId` wrapping the host element.
 
-Returns: `{ shadowRoot: Node | null }`, the shadow root as a standard CDP Node, or `null` if the element has no shadow root.
+Returns: `{ shadowRoot?: Node }`, the shadow root as a standard CDP Node. The field is omitted when the element has no shadow root. Errors when the node is not an element.
 
 ```json
 {
@@ -262,7 +266,9 @@ Parameters:
 - `offscreenMode`: `none` | `summary` | `full`, default `summary`. How to report elements outside the viewport.
 - `includeScreenshot`: bool, default `true`.
 
-Returns: `{ url, title, viewport, elements, screenshot?, snapshotToken }`. `viewport` carries scroll offsets and `deviceScaleFactor`. Each element carries `agentNodeId`, `backendNodeId`, `frameId`, `role`, `name`, `tag`, `states[]`, its border box, `inViewport`, `obscured`, and `href` / `src` where applicable. `snapshotToken` is a cheap change-detection token.
+Returns: `{ url, title, viewport, elements, screenshot?, snapshotToken }`. `viewport` carries its own size, the scroll offsets, the full scrollable size and `deviceScaleFactor`. `snapshotToken` is a cheap change-detection token.
+
+Each element carries `agentNodeId`, `backendNodeId`, `frameId`, `role`, `tag`, `interactive`, `states[]`, its border box (`x`, `y`, `width`, `height`), `inViewport` and `obscured`, plus the following where applicable: `name`, `value`, `description`, `interactiveReason` (`role` | `form-control` | `listener` | `cursor` | `tabindex`), `shadowHostBackendNodeId`, `label`, `color`, `href`, `src`.
 
 ```json
 {
