@@ -1,0 +1,22 @@
+# Chromium 148 added kJavascriptOptimizerBlockedForUnfamiliarSites to
+# safe_browsing_prefs.h (CL 6898756) after ungoogled's
+# remove-unused-preferences-fields.patch was last regenerated, so the constant
+# survives there. move-js-optimizer-unfamiliar-sites.patch then defines the same
+# constant in content_settings/core/common/pref_names.h, causing a redefinition
+# error when both headers are transitively included. Drop the safebrowsing copy.
+
+--- a/components/safe_browsing/core/common/safe_browsing_prefs.h
++++ b/components/safe_browsing/core/common/safe_browsing_prefs.h
+@@ -305,12 +305,5 @@
+     "safebrowsing.bundled_settings.migration_toast_state";
+
+-// A boolean indicating whether the user selected on chrome://settings to
+-// disable the JavaScript optimizer on unfamiliar sites for improved security.
+-// The site-familiarity computation is done locally based on the user's
+-// browsing habits.
+-inline constexpr char kJavascriptOptimizerBlockedForUnfamiliarSites[] =
+-    "safebrowsing.javascript_optimizer_blocked_for_unfamiliar_sites";
+-
+ // A boolean indicating whether this profile had the automatic JavaScript
+ // optimizer control enabled by the kMigrateToBlockV8OptimizerOnUnfamiliarSites
+ // feature. This preference value is used to ensure that a profile is only

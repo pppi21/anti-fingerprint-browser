@@ -1,0 +1,76 @@
+From 1bdfc8c707407ea104ba3f9ae14dad022168e819 Mon Sep 17 00:00:00 2001
+From: Leo Rodarte <leorodarte07@gmail.com>
+Date: Sat, 19 Sep 2026 23:45:24 -0400
+Subject: [PATCH 15/41] media-capabilities
+
+MediaCapabilities decodingInfo spoof.
+---
+ .../modules/media_capabilities/BUILD.gn       |  1 +
+ .../media_capabilities/media_capabilities.cc  | 35 +++++++++++++++++++
+ 2 files changed, 36 insertions(+)
+
+diff --git a/third_party/blink/renderer/modules/media_capabilities/BUILD.gn b/third_party/blink/renderer/modules/media_capabilities/BUILD.gn
+index 830b332f18..16968d423f 100644
+--- a/third_party/blink/renderer/modules/media_capabilities/BUILD.gn
++++ b/third_party/blink/renderer/modules/media_capabilities/BUILD.gn
+@@ -12,6 +12,7 @@ blink_modules_sources("media_capabilities") {
+     "media_capabilities.h",
+   ]
+   deps = [
++    "//components/browser:browser_switches",
+     "//media",
+     "//third_party/blink/renderer/modules/encryptedmedia",
+     "//third_party/blink/renderer/modules/mediarecorder",
+diff --git a/third_party/blink/renderer/modules/media_capabilities/media_capabilities.cc b/third_party/blink/renderer/modules/media_capabilities/media_capabilities.cc
+index 8d900f2270..1d95893df1 100644
+--- a/third_party/blink/renderer/modules/media_capabilities/media_capabilities.cc
++++ b/third_party/blink/renderer/modules/media_capabilities/media_capabilities.cc
+@@ -14,6 +14,7 @@
+ #include "base/metrics/histogram_macros.h"
+ #include "base/numerics/safe_conversions.h"
+ #include "base/task/single_thread_task_runner.h"
++#include "components/browser/browser_runtime.h"
+ #include "media/base/media_switches.h"
+ #include "media/base/media_util.h"
+ #include "media/base/mime_util.h"
+@@ -794,6 +795,40 @@ ScriptPromise<MediaCapabilitiesDecodingInfo> MediaCapabilities::decodingInfo(
+     ExceptionState& exception_state) {
+   const base::TimeTicks request_time = base::TimeTicks::Now();
+ 
++  // browser: claim support for Microsoft PlayReady recommendation 3000
++  // (Media Foundation hardware DRM). Fingerprinting scripts probe
++  // decodingInfo() with that key system and treat supported === true as a
++  // Chrome-on-Windows signal; real Chrome answers true through the Media
++  // Foundation pipeline, while ungoogled-chromium has no such pipeline and
++  // answers false. Only the flag is spoofed: no MediaKeys are created, so a
++  // real decryption attempt still fails at session creation. Gated on the
++  // brand spoof, since the answer is only coherent for Chrome or Edge on
++  // Windows.
++  //
++  // The stock path resolves after an async CDM factory round trip of a few
++  // milliseconds. A promise resolved in one microtask would show the
++  // difference to a performance.now() timer, so the resolution is delayed.
++  if (config->hasKeySystemConfiguration() &&
++      config->keySystemConfiguration()->keySystem() ==
++          "com.microsoft.playready.recommendation.3000" &&
++      browser::BrandSpoofActive()) {
++    auto* resolver = MakeGarbageCollected<
++        ScriptPromiseResolver<MediaCapabilitiesDecodingInfo>>(
++        script_state, exception_state.GetContext());
++    auto promise = resolver->Promise();
++    ExecutionContext::From(script_state)
++        ->GetTaskRunner(TaskType::kInternalMediaRealTime)
++        ->PostDelayedTask(
++            FROM_HERE,
++            BindOnce(
++                [](ScriptPromiseResolver<MediaCapabilitiesDecodingInfo>* r) {
++                  r->Resolve(CreateDecodingInfoWith(true));
++                },
++                WrapPersistent(resolver)),
++            base::Milliseconds(2));
++    return promise;
++  }
++
+   if (config->hasKeySystemConfiguration()) {
+     UseCounter::Count(
+         ExecutionContext::From(script_state),

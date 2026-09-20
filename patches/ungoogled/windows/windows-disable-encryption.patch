@@ -1,0 +1,69 @@
+# Disable encryption of cookies, passwords, settings...
+# WARNING! Use ONLY if your hard drive is encrypted or if you know what you are doing.
+# See https://github.com/Eloston/ungoogled-chromium/issues/444
+
+--- a/chrome/browser/ungoogled_platform_flag_entries.h
++++ b/chrome/browser/ungoogled_platform_flag_entries.h
+@@ -4,4 +4,8 @@
+ 
+ #ifndef CHROME_BROWSER_UNGOOGLED_PLATFORM_FLAG_ENTRIES_H_
+ #define CHROME_BROWSER_UNGOOGLED_PLATFORM_FLAG_ENTRIES_H_
++    {"disable-encryption",
++     "Disable encryption",
++     "Disable encryption of cookies, passwords, and settings which uses a generated machine-specific encryption key.  This is used to enable portable user data directories.  ungoogled-chromium flag.",
++     kOsWin, SINGLE_VALUE_TYPE("disable-encryption")},
+ #endif  // CHROME_BROWSER_UNGOOGLED_PLATFORM_FLAG_ENTRIES_H_
+--- a/components/os_crypt/async/browser/dpapi_key_provider.cc
++++ b/components/os_crypt/async/browser/dpapi_key_provider.cc
+@@ -9,6 +9,7 @@
+ #include <wincrypt.h>
+ 
+ #include "base/base64.h"
++#include "base/command_line.h"
+ #include "base/compiler_specific.h"
+ #include "base/logging.h"
+ #include "base/metrics/histogram_functions.h"
+@@ -37,6 +38,9 @@ constexpr uint8_t kDPAPIKeyPrefix[] = {'
+ 
+ std::optional<std::vector<uint8_t>> DecryptKeyWithDPAPI(
+     base::span<const uint8_t> ciphertext) {
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch("disable-encryption")) {
++    return std::vector<uint8_t>(ciphertext.begin(), ciphertext.end());
++  }
+   DATA_BLOB input = {};
+   input.pbData = const_cast<BYTE*>(ciphertext.data());
+   input.cbData = static_cast<DWORD>(ciphertext.size());
+--- a/components/os_crypt/async/browser/os_crypt_win.cc
++++ b/components/os_crypt/async/browser/os_crypt_win.cc
+@@ -12,6 +12,7 @@
+ #include <vector>
+ 
+ #include "base/base64.h"
++#include "base/command_line.h"
+ #include "base/logging.h"
+ #include "base/metrics/histogram_functions.h"
+ #include "base/strings/strcat.h"
+@@ -39,6 +40,11 @@ constexpr char kDPAPIKeyPrefix[] = "DPAP
+ 
+ bool EncryptStringWithDPAPI(const std::string& plaintext,
+                             std::string* ciphertext) {
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch("disable-encryption")) {
++    *ciphertext = plaintext;
++    return true;
++  }
++  
+   DATA_BLOB input;
+   input.pbData =
+       const_cast<BYTE*>(reinterpret_cast<const BYTE*>(plaintext.data()));
+@@ -73,6 +79,11 @@ bool EncryptStringWithDPAPI(const std::s
+ 
+ bool DecryptStringWithDPAPI(const std::string& ciphertext,
+                             std::string* plaintext) {
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch("disable-encryption")) {
++    *plaintext = ciphertext;
++    return true;
++  }
++
+   DATA_BLOB input;
+   input.pbData =
+       const_cast<BYTE*>(reinterpret_cast<const BYTE*>(ciphertext.data()));

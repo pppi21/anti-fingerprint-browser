@@ -1,0 +1,241 @@
+From 3170eb2ff0e1df9b2ece72249dd94bbad9e624cb Mon Sep 17 00:00:00 2001
+From: Leo Rodarte <leorodarte07@gmail.com>
+Date: Sat, 19 Sep 2026 23:45:34 -0400
+Subject: [PATCH 19/41] speech-voices
+
+speechSynthesis voice-list override.
+---
+ components/browser/default_voices.cc          | 61 +++++++++++++++++++
+ components/browser/default_voices.h           | 37 +++++++++++
+ .../blink/renderer/modules/speech/BUILD.gn    |  1 +
+ .../modules/speech/speech_synthesis.cc        | 52 ++++++++++++++--
+ .../modules/speech/speech_synthesis.h         |  4 ++
+ 5 files changed, 150 insertions(+), 5 deletions(-)
+ create mode 100644 components/browser/default_voices.cc
+ create mode 100644 components/browser/default_voices.h
+
+diff --git a/components/browser/default_voices.cc b/components/browser/default_voices.cc
+new file mode 100644
+index 0000000000..d5663765b1
+--- /dev/null
++++ b/components/browser/default_voices.cc
+@@ -0,0 +1,61 @@
++// Copyright 2026 The browser Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/browser/default_voices.h"
++
++namespace browser {
++
++namespace {
++
++// The Google list mirrors
++// chrome/browser/resources/network_speech_synthesis/manifest.json; names are
++// UTF-8 spelled as byte escapes.
++constexpr DefaultVoiceEntry kGoogleRemoteVoices[] = {
++    {"Google Deutsch", "de-DE", false, false},
++    {"Google US English", "en-US", false, false},
++    {"Google UK English Female", "en-GB", false, false},
++    {"Google UK English Male", "en-GB", false, false},
++    {"Google espa\xc3\xb1ol", "es-ES", false, false},
++    {"Google espa\xc3\xb1ol de Estados Unidos", "es-US", false, false},
++    {"Google fran\xc3\xa7\x61is", "fr-FR", false, false},
++    {"Google "
++     "\xe0\xa4\xb9\xe0\xa4\xbf\xe0\xa4\xa8\xe0\xa5\x8d\xe0\xa4\xa6\xe0\xa5\x80",
++     "hi-IN", false, false},
++    {"Google Bahasa Indonesia", "id-ID", false, false},
++    {"Google italiano", "it-IT", false, false},
++    {"Google \xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e", "ja-JP", false, false},
++    {"Google \xed\x95\x9c\xea\xb5\xad\xec\x9d\x98", "ko-KR", false, false},
++    {"Google Nederlands", "nl-NL", false, false},
++    {"Google polski", "pl-PL", false, false},
++    {"Google portugu\xc3\xaas do Brasil", "pt-BR", false, false},
++    {"Google \xd1\x80\xd1\x83\xd1\x81\xd1\x81\xd0\xba\xd0\xb8\xd0\xb9", "ru-RU",
++     false, false},
++    {"Google\xc2\xa0\xe6\x99\xae\xe9\x80\x9a\xe8\xaf\x9d\xef\xbc\x88\xe4\xb8"
++     "\xad\xe5\x9b\xbd\xe5\xa4\xa7\xe9\x99\x86\xef\xbc\x89",
++     "zh-CN", false, false},
++    {"Google\xc2\xa0\xe7\xb2\xa4\xe8\xaa\x9e\xef\xbc\x88\xe9\xa6\x99\xe6\xb8"
++     "\xaf\xef\xbc\x89",
++     "zh-HK", false, false},
++    {"Google "
++     "\xe5\x9c\x8b\xe8\xaa\x9e\xef\xbc\x88\xe8\x87\xba\xe7\x81\xa3\xef\xbc\x89",
++     "zh-TW", false, false},
++};
++
++constexpr DefaultVoiceEntry kBaselineLocalVoices[] = {
++    {"Microsoft David - English (United States)", "en-US", true, true},
++    {"Microsoft Mark - English (United States)", "en-US", true, false},
++    {"Microsoft Zira - English (United States)", "en-US", true, false},
++};
++
++}  // namespace
++
++base::span<const DefaultVoiceEntry> DefaultLocalVoices() {
++  return kBaselineLocalVoices;
++}
++
++base::span<const DefaultVoiceEntry> GoogleRemoteVoices() {
++  return kGoogleRemoteVoices;
++}
++
++}  // namespace browser
+diff --git a/components/browser/default_voices.h b/components/browser/default_voices.h
+new file mode 100644
+index 0000000000..5a19686e67
+--- /dev/null
++++ b/components/browser/default_voices.h
+@@ -0,0 +1,37 @@
++// Copyright 2026 The browser Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_BROWSER_DEFAULT_VOICES_H_
++#define COMPONENTS_BROWSER_DEFAULT_VOICES_H_
++
++#include "base/component_export.h"
++#include "base/containers/span.h"
++
++namespace browser {
++
++// One speechSynthesis.getVoices() entry. Chrome reports voiceURI equal to
++// the name, so one field serves both.
++struct DefaultVoiceEntry {
++  const char* name;
++  const char* lang;  // BCP 47 tag, e.g. "en-US"
++  bool is_local;     // false for Google network voices
++  bool is_default;
++};
++
++// The local voices reported in place of the real OS voice list.
++COMPONENT_EXPORT(BROWSER)
++base::span<const DefaultVoiceEntry> DefaultLocalVoices();
++
++// The Google network voices, appended while the brand spoof is active so a
++// Chrome-branded build lists them the way Chrome does.
++COMPONENT_EXPORT(BROWSER)
++base::span<const DefaultVoiceEntry> GoogleRemoteVoices();
++
++// Speaking rate of the simulated synthesizer, in characters per second, for
++// timing the synthetic end event.
++inline constexpr float kFakeSpeechCharsPerSecond = 12.5f;
++
++}  // namespace browser
++
++#endif  // COMPONENTS_BROWSER_DEFAULT_VOICES_H_
+diff --git a/third_party/blink/renderer/modules/speech/BUILD.gn b/third_party/blink/renderer/modules/speech/BUILD.gn
+index e49c0234d1..55abbc1435 100644
+--- a/third_party/blink/renderer/modules/speech/BUILD.gn
++++ b/third_party/blink/renderer/modules/speech/BUILD.gn
+@@ -40,6 +40,7 @@ blink_modules_sources("speech") {
+   ]
+ 
+   deps = [
++    "//components/browser:browser_switches",
+     "//media",
+     "//media/mojo/mojom:speech_recognition_audio_forwarder_blink",
+     "//third_party/blink/renderer/modules/mediastream",
+diff --git a/third_party/blink/renderer/modules/speech/speech_synthesis.cc b/third_party/blink/renderer/modules/speech/speech_synthesis.cc
+index 891a81543b..fd18e56942 100644
+--- a/third_party/blink/renderer/modules/speech/speech_synthesis.cc
++++ b/third_party/blink/renderer/modules/speech/speech_synthesis.cc
+@@ -27,7 +27,10 @@
+ 
+ #include <tuple>
+ 
++#include "base/time/time.h"
+ #include "build/build_config.h"
++#include "components/browser/browser_runtime.h"
++#include "components/browser/default_voices.h"
+ #include "third_party/blink/public/common/thread_safe_browser_interface_broker_proxy.h"
+ #include "third_party/blink/public/platform/browser_interface_broker_proxy.h"
+ #include "third_party/blink/public/platform/platform.h"
+@@ -82,12 +85,25 @@ SpeechSynthesis::SpeechSynthesis(LocalDOMWindow& window)
+       receiver_(this, &window),
+       mojom_synthesis_(&window) {}
+ 
++// browser
++void SpeechSynthesis::AppendVoices(
++    base::span<const browser::DefaultVoiceEntry> entries) {
++  for (const browser::DefaultVoiceEntry& entry : entries) {
++    voice_list_.push_back(MakeGarbageCollected<SpeechSynthesisVoice>(
++        mojom::blink::SpeechSynthesisVoice::New(
++            String::FromUtf8(entry.name), String::FromUtf8(entry.name),
++            String(entry.lang), entry.is_local, entry.is_default)));
++  }
++}
++
+ void SpeechSynthesis::OnSetVoiceList(
+     Vector<mojom::blink::SpeechSynthesisVoicePtr> mojom_voices) {
+   voice_list_.clear();
+-  for (auto& mojom_voice : mojom_voices) {
+-    voice_list_.push_back(
+-        MakeGarbageCollected<SpeechSynthesisVoice>(std::move(mojom_voice)));
++  // browser: the real voices are replaced by the fixed list, plus the Google
++  // network voices while the brand spoof is active.
++  AppendVoices(browser::DefaultLocalVoices());
++  if (browser::BrandSpoofActive()) {
++    AppendVoices(browser::GoogleRemoteVoices());
+   }
+   VoicesDidChange();
+ }
+@@ -239,8 +255,34 @@ void SpeechSynthesis::StartSpeakingImmediately() {
+   utterance->SetStartTime(millis / 1000.0);
+   is_paused_ = false;
+ 
+-  if (TryEnsureMojomSynthesis())
+-    utterance->Start(this);
++  // browser: every listed voice is synthetic, so no utterance reaches a real
++  // engine. Start and end events are simulated, the end after a duration
++  // estimated from the text length.
++  DidStartSpeaking(utterance);
++
++  float rate = static_cast<float>(utterance->rate());
++  if (rate <= 0.0f) {
++    rate = 1.0f;
++  }
++  const float duration_seconds =
++      static_cast<float>(utterance->text().length()) /
++      (browser::kFakeSpeechCharsPerSecond * rate);
++  GetSupplementable()
++      ->GetTaskRunner(TaskType::kMiscPlatformAPI)
++      ->PostDelayedTask(
++          FROM_HERE,
++          base::BindOnce(
++              [](WeakPersistent<SpeechSynthesis> weak_self,
++                 Persistent<SpeechSynthesisUtterance> utterance) {
++                if (weak_self &&
++                    weak_self->CurrentSpeechUtterance() == utterance.Get()) {
++                  weak_self->DidFinishSpeaking(
++                      utterance.Get(),
++                      mojom::blink::SpeechSynthesisErrorCode::kNoError);
++                }
++              },
++              WrapWeakPersistent(this), WrapPersistent(utterance)),
++          base::Seconds(duration_seconds));
+ }
+ 
+ void SpeechSynthesis::HandleSpeakingCompleted(
+diff --git a/third_party/blink/renderer/modules/speech/speech_synthesis.h b/third_party/blink/renderer/modules/speech/speech_synthesis.h
+index 0199d00326..9deaab59c7 100644
+--- a/third_party/blink/renderer/modules/speech/speech_synthesis.h
++++ b/third_party/blink/renderer/modules/speech/speech_synthesis.h
+@@ -26,6 +26,8 @@
+ #ifndef THIRD_PARTY_BLINK_RENDERER_MODULES_SPEECH_SPEECH_SYNTHESIS_H_
+ #define THIRD_PARTY_BLINK_RENDERER_MODULES_SPEECH_SPEECH_SYNTHESIS_H_
+ 
++#include "base/containers/span.h"
++#include "components/browser/default_voices.h"
+ #include "third_party/blink/public/mojom/speech/speech_synthesis.mojom-blink-forward.h"
+ #include "third_party/blink/renderer/bindings/modules/v8/v8_speech_synthesis_error_code.h"
+ #include "third_party/blink/renderer/modules/event_target_modules.h"
+@@ -80,6 +82,8 @@ class MODULES_EXPORT SpeechSynthesis final
+   // mojom::blink::SpeechSynthesisVoiceListObserver
+   void OnSetVoiceList(
+       Vector<mojom::blink::SpeechSynthesisVoicePtr> voices) override;
++  // browser: adds synthetic entries to voice_list_.
++  void AppendVoices(base::span<const browser::DefaultVoiceEntry> entries);
+ 
+   // These methods are called by SpeechSynthesisUtterance:
+   void DidStartSpeaking(SpeechSynthesisUtterance*);

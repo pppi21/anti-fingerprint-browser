@@ -1,0 +1,179 @@
+From 7d1186f19326ae48753cd4d28f45f5028d16f893 Mon Sep 17 00:00:00 2001
+From: Leo Rodarte <leorodarte07@gmail.com>
+Date: Sat, 19 Sep 2026 23:45:05 -0400
+Subject: [PATCH 06/41] webgl-spoof
+
+WebGL parameter/renderer spoof.
+---
+ .../webgl/webgl2_rendering_context_base.cc    | 40 +++++++++++++++--
+ .../webgl/webgl_rendering_context_base.cc     | 43 ++++++++++++++++---
+ 2 files changed, 72 insertions(+), 11 deletions(-)
+
+diff --git a/third_party/blink/renderer/modules/webgl/webgl2_rendering_context_base.cc b/third_party/blink/renderer/modules/webgl/webgl2_rendering_context_base.cc
+index 1e2b512f07..1acd6555f6 100644
+--- a/third_party/blink/renderer/modules/webgl/webgl2_rendering_context_base.cc
++++ b/third_party/blink/renderer/modules/webgl/webgl2_rendering_context_base.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "third_party/blink/renderer/modules/webgl/webgl2_rendering_context_base.h"
+ 
++#include <atomic>
+ #include <memory>
+ 
+ #include "base/compiler_specific.h"
+@@ -11,6 +12,7 @@
+ #include "base/feature_list.h"
+ #include "base/numerics/checked_math.h"
+ #include "base/numerics/safe_conversions.h"
++#include "components/browser/browser_runtime.h"
+ #include "gpu/command_buffer/client/gles2_interface.h"
+ #include "third_party/blink/public/common/features.h"
+ #include "third_party/blink/public/platform/web_graphics_context_3d_provider.h"
+@@ -4874,8 +4876,30 @@ ScriptValue WebGL2RenderingContextBase::getParameter(ScriptState* script_state,
+       return GetInt64Parameter(script_state, pname);
+     case GL_MAX_COMBINED_UNIFORM_BLOCKS:
+       return GetIntParameter(script_state, pname);
+-    case GL_MAX_COMBINED_VERTEX_UNIFORM_COMPONENTS:
+-      return GetInt64Parameter(script_state, pname);
++    case GL_MAX_COMBINED_VERTEX_UNIFORM_COMPONENTS: {
++      // browser: stock does a single GetInteger64v IPC here. We mirror it
++      // so per-call timing matches even when spoofing; the extra IPC needed to
++      // recover MAX_VERTEX_UNIFORM_COMPONENTS for the delta math runs only on
++      // the first spoofed call and is cached for the lifetime of the process
++      // (GPU/ANGLE caps are constant after init). std::atomic guards the
++      // cache against worker-thread OffscreenCanvas WebGL2 contexts racing.
++      GLint64 combined = 0;
++      if (!isContextLost()) {
++        ContextGL()->GetInteger64v(GL_MAX_COMBINED_VERTEX_UNIFORM_COMPONENTS,
++                                   &combined);
++      }
++      const int spoofed_vectors = browser::SpoofedMaxVertexUniformVectors();
++      if (spoofed_vectors != 0) {
++        static std::atomic<GLint> cached_real_components{0};
++        GLint real = cached_real_components.load(std::memory_order_relaxed);
++        if (real == 0 && !isContextLost()) {
++          ContextGL()->GetIntegerv(GL_MAX_VERTEX_UNIFORM_COMPONENTS, &real);
++          cached_real_components.store(real, std::memory_order_relaxed);
++        }
++        combined += spoofed_vectors * 4 - real;
++      }
++      return WebGLAny(script_state, combined);
++    }
+     case GL_MAX_DRAW_BUFFERS:
+       return GetIntParameter(script_state, pname);
+     case GL_MAX_ELEMENT_INDEX:
+@@ -4914,8 +4938,16 @@ ScriptValue WebGL2RenderingContextBase::getParameter(ScriptState* script_state,
+       return GetIntParameter(script_state, pname);
+     case GL_MAX_VERTEX_UNIFORM_BLOCKS:
+       return GetIntParameter(script_state, pname);
+-    case GL_MAX_VERTEX_UNIFORM_COMPONENTS:
+-      return GetIntParameter(script_state, pname);
++    case GL_MAX_VERTEX_UNIFORM_COMPONENTS: {
++      // browser: issue the underlying GetIntegerv IPC even when spoofing so
++      // per-call timing matches stock chromium.
++      ScriptValue real = GetIntParameter(script_state, pname);
++      const int spoofed_vectors = browser::SpoofedMaxVertexUniformVectors();
++      if (spoofed_vectors != 0) {
++        return WebGLAny(script_state, spoofed_vectors * 4);
++      }
++      return real;
++    }
+     case GL_MIN_PROGRAM_TEXEL_OFFSET:
+       return GetIntParameter(script_state, pname);
+     case GL_PACK_ROW_LENGTH:
+diff --git a/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc b/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
+index 403e1b307f..e662b2a35a 100644
+--- a/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
++++ b/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
+@@ -45,6 +45,7 @@
+ #include "base/trace_event/memory_dump_manager.h"
+ #include "base/trace_event/trace_event.h"
+ #include "build/build_config.h"
++#include "components/browser/browser_runtime.h"
+ #include "components/viz/common/gpu/raster_context_provider.h"
+ #include "components/viz/common/resources/shared_image_format_utils.h"
+ #include "device/vr/buildflags/buildflags.h"
+@@ -131,6 +132,7 @@
+ #include "third_party/blink/renderer/modules/webgl/webgl_program.h"
+ #include "third_party/blink/renderer/modules/webgl/webgl_renderbuffer.h"
+ #include "third_party/blink/renderer/modules/webgl/webgl_shader.h"
++#include "third_party/blink/renderer/modules/webgl/webgl_shader_noise.h"
+ #include "third_party/blink/renderer/modules/webgl/webgl_shader_precision_format.h"
+ #include "third_party/blink/renderer/modules/webgl/webgl_uniform_location.h"
+ #include "third_party/blink/renderer/modules/webgl/webgl_vertex_array_object.h"
+@@ -169,7 +171,6 @@
+ #include "third_party/skia/include/gpu/ganesh/GrTypes.h"
+ #include "ui/gfx/geometry/size.h"
+ 
+-
+ // Populates parameters from texImage2D except for border, width, height, and
+ // depth (which are not present for all texImage2D functions).
+ #define POPULATE_TEX_IMAGE_2D_PARAMS(params, src_type) \
+@@ -4087,8 +4088,17 @@ ScriptValue WebGLRenderingContextBase::getParameter(ScriptState* script_state,
+       return GetIntParameter(script_state, pname);
+     case GL_MAX_VERTEX_TEXTURE_IMAGE_UNITS:
+       return GetIntParameter(script_state, pname);
+-    case GL_MAX_VERTEX_UNIFORM_VECTORS:
+-      return GetIntParameter(script_state, pname);
++    case GL_MAX_VERTEX_UNIFORM_VECTORS: {
++      // browser: issue the underlying GetIntegerv IPC even when spoofing so
++      // the per-call timing matches stock chromium; fingerprint scripts that
++      // time getParameter() must not see a fast-path on spoofed builds.
++      ScriptValue real = GetIntParameter(script_state, pname);
++      const int spoofed_vectors = browser::SpoofedMaxVertexUniformVectors();
++      if (spoofed_vectors != 0) {
++        return WebGLAny(script_state, spoofed_vectors);
++      }
++      return real;
++    }
+     case GL_MAX_VIEWPORT_DIMS:
+       return GetWebGLIntArrayParameter(script_state, pname);
+     case GL_PACK_ALIGNMENT:
+@@ -4200,8 +4210,14 @@ ScriptValue WebGLRenderingContextBase::getParameter(ScriptState* script_state,
+       return ScriptValue::CreateNull(script_state->GetIsolate());
+     case WebGLDebugRendererInfo::kUnmaskedRendererWebgl:
+       if (ExtensionEnabled(kWebGLDebugRendererInfoName)) {
+-        return WebGLAny(script_state,
+-                        String(ContextGL()->GetString(GL_RENDERER)));
++        // browser: always perform the underlying GetString IPC so per-call
++        // timing matches stock even when a spoof switch is active.
++        String real = String(ContextGL()->GetString(GL_RENDERER));
++        const std::string& spoof = browser::SpoofedGpuRenderer();
++        if (!spoof.empty()) {
++          return WebGLAny(script_state, String(spoof));
++        }
++        return WebGLAny(script_state, real);
+       }
+       SynthesizeGLError(
+           GL_INVALID_ENUM, "getParameter",
+@@ -4209,8 +4225,14 @@ ScriptValue WebGLRenderingContextBase::getParameter(ScriptState* script_state,
+       return ScriptValue::CreateNull(script_state->GetIsolate());
+     case WebGLDebugRendererInfo::kUnmaskedVendorWebgl:
+       if (ExtensionEnabled(kWebGLDebugRendererInfoName)) {
+-        return WebGLAny(script_state,
+-                        String(ContextGL()->GetString(GL_VENDOR)));
++        // browser: always perform the underlying GetString IPC so per-call
++        // timing matches stock even when a spoof switch is active.
++        String real = String(ContextGL()->GetString(GL_VENDOR));
++        const std::string& spoof = browser::SpoofedGpuVendor();
++        if (!spoof.empty()) {
++          return WebGLAny(script_state, String(spoof));
++        }
++        return WebGLAny(script_state, real);
+       }
+       SynthesizeGLError(
+           GL_INVALID_ENUM, "getParameter",
+@@ -5466,6 +5488,13 @@ void WebGLRenderingContextBase::shaderSource(WebGLShader* shader,
+     return;
+   String ascii_string = ReplaceNonASCII(string).Result();
+   shader->SetSource(string);
++  // browser: per-profile fragment shader source rewriting for WebGL
++  // pixel-data variance spoofing. Operates on the GPU-bound copy only -
++  // shader->Source() (returned by gl.getShaderSource()) keeps the original
++  // unmodified source.
++  if (shader->GetType() == GL_FRAGMENT_SHADER) {
++    ascii_string = RewriteFragmentShaderForNoise(ascii_string);
++  }
+   DCHECK(ascii_string.Is8Bit() && ascii_string.ContainsOnlyAsciiOrEmpty());
+   const GLchar* shader_data = base::as_chars(ascii_string.Span8()).data();
+   const GLint shader_length = ascii_string.length();

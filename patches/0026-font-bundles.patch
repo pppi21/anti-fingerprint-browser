@@ -1,0 +1,1156 @@
+From 6f972ca5abea205bd31941dd5415e438e209be43 Mon Sep 17 00:00:00 2001
+From: Leo Rodarte <leorodarte07@gmail.com>
+Date: Sat, 19 Sep 2026 23:45:47 -0400
+Subject: [PATCH 26/41] font-bundles
+
+Font bundle selection + accept-language derivation + DirectWrite path provider.
+---
+ .../browser/chrome_content_browser_client.cc  |   7 +
+ .../net/profile_network_context_service.cc    |  13 +
+ components/browser/font_bundles.cc            | 399 ++++++++++++++
+ components/browser/font_bundles.h             |  54 ++
+ content/browser/browser_main_runner_impl.cc   |  13 +
+ ui/gfx/win/direct_write.cc                    | 512 ++++++++++++++++++
+ ui/gfx/win/direct_write.h                     |  12 +
+ 7 files changed, 1010 insertions(+)
+ create mode 100644 components/browser/font_bundles.cc
+ create mode 100644 components/browser/font_bundles.h
+
+diff --git a/chrome/browser/chrome_content_browser_client.cc b/chrome/browser/chrome_content_browser_client.cc
+index ef47025f7d..ba37067ced 100644
+--- a/chrome/browser/chrome_content_browser_client.cc
++++ b/chrome/browser/chrome_content_browser_client.cc
+@@ -232,6 +232,7 @@
+ #include "components/autofill/core/common/autofill_features.h"
+ #include "components/autofill/core/common/autofill_switches.h"
+ #include "components/blocked_content/popup_blocker.h"
++#include "components/browser/font_bundles.h"
+ #include "components/captive_portal/core/buildflags.h"
+ #include "components/content_settings/browser/page_specific_content_settings.h"
+ #include "components/content_settings/browser/ui/javascript_optimizer_setting.h"
+@@ -3286,6 +3287,12 @@ std::string ChromeContentBrowserClient::GetApplicationLocale() {
+ 
+ std::string ChromeContentBrowserClient::GetAcceptLangs(
+     content::BrowserContext* context) {
++  // browser: the font bundle owns navigator.languages so that it stays
++  // consistent with the language packs it loaded. Same shape as the
++  // kAcceptLanguages pref ("en-US,en,ja").
++  if (browser::IsFontBundleActive()) {
++    return base::JoinString(browser::GetBundleLanguagesList(), ",");
++  }
+   Profile* profile = Profile::FromBrowserContext(context);
+   return profile->GetPrefs()->GetString(language::prefs::kAcceptLanguages);
+ }
+diff --git a/chrome/browser/net/profile_network_context_service.cc b/chrome/browser/net/profile_network_context_service.cc
+index 3669c003c8..1ba2908842 100644
+--- a/chrome/browser/net/profile_network_context_service.cc
++++ b/chrome/browser/net/profile_network_context_service.cc
+@@ -53,6 +53,8 @@
+ #include "chrome/common/chrome_paths_internal.h"
+ #include "chrome/common/pref_names.h"
+ #include "chrome/common/webui_url_constants.h"
++#include "components/browser/browser_switches.h"
++#include "components/browser/font_bundles.h"
+ #include "components/certificate_transparency/pref_names.h"
+ #include "components/content_settings/core/browser/cookie_settings.h"
+ #include "components/content_settings/core/browser/host_content_settings_map.h"
+@@ -209,6 +211,17 @@ std::vector<std::string> TranslateStringArray(const base::ListValue& list) {
+ }
+ 
+ std::string ComputeAcceptLanguageFromPref(const std::string& language_pref) {
++  // browser: an active font bundle owns the header; otherwise
++  // --fingerprint-accept-language forces it verbatim.
++  if (browser::IsFontBundleActive()) {
++    return browser::GetBundleAcceptLanguage();
++  }
++  const std::string forced =
++      base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
++          switches::kFingerprintAcceptLanguage);
++  if (!forced.empty()) {
++    return forced;
++  }
+   std::string accept_languages_str =
+       net::HttpUtil::ExpandLanguageList(language_pref);
+   return net::HttpUtil::GenerateAcceptLanguageHeader(accept_languages_str);
+diff --git a/components/browser/font_bundles.cc b/components/browser/font_bundles.cc
+new file mode 100644
+index 0000000000..00f6e4c855
+--- /dev/null
++++ b/components/browser/font_bundles.cc
+@@ -0,0 +1,399 @@
++// Copyright 2026 The browser Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// See font_bundles.h for the public contract. Bundle directories under
++// <chrome.exe dir>/browser_fonts/ take one of two shapes:
++//
++//   1. Flat bundle: every .ttf / .ttc / .otf directly in the directory is
++//      loaded. Used for base_win11, emoji_*, lang_* and personal_common.
++//
++//   2. Tiered bundle: the directory contains the subdirectories "1", "2"
++//      and "3".
++//        1/  Everything in it is loaded whenever the bundle is picked.
++//        2/  Themed sub-bundles, one per immediate subdirectory. A
++//            Poisson-drawn number of them are sampled and every font inside
++//            the picked subdirectories is loaded.
++//        3/  Flat pool of fonts; a Poisson-drawn number are sampled
++//            individually.
++//      A bundle is tiered iff a "1" subdirectory exists. Used for
++//      app_office_365 and app_adobe_cc.
++//
++// After all bundles have contributed, filenames are deduplicated
++// case-insensitively with the first occurrence winning, so base_win11 beats
++// the application bundles, which beat personal_common.
++
++#include "components/browser/font_bundles.h"
++
++#include <algorithm>
++#include <cstdint>
++#include <iterator>
++#include <optional>
++#include <random>
++#include <string>
++#include <string_view>
++#include <unordered_set>
++#include <utility>
++#include <vector>
++
++#include "base/base_paths.h"
++#include "base/containers/span.h"
++#include "base/files/file_enumerator.h"
++#include "base/files/file_path.h"
++#include "base/files/file_util.h"
++#include "base/logging.h"
++#include "base/no_destructor.h"
++#include "base/path_service.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_util.h"
++#include "base/strings/stringprintf.h"
++#include "base/threading/scoped_blocking_call.h"
++#include "components/browser/browser_switches.h"
++#include "components/browser/switch_resolver.h"
++
++namespace browser {
++namespace {
++
++struct BundleSpec {
++  std::string_view dir_name;
++  base::span<const std::string_view> implied_langs;
++  // Selection probability in [0, 1]. Emoji bundles are weighted against
++  // each other; independent bundles are rolled on their own.
++  double probability;
++};
++
++constexpr BundleSpec kBaseBundle = {"base_win11", {}, 1.0};
++
++constexpr BundleSpec kEmojiBundles[] = {
++    {"emoji_v145", {}, 0.40},
++    {"emoji_v151", {}, 0.45},
++    {"emoji_emoji16", {}, 0.15},
++};
++
++constexpr std::string_view kLangJapanese[] = {"ja-JP", "ja"};
++constexpr std::string_view kLangHebrew[] = {"he-IL", "he"};
++constexpr std::string_view kLangArabic[] = {"ar-SA", "ar"};
++constexpr std::string_view kLangThai[] = {"th-TH", "th"};
++constexpr std::string_view kLangDevanagari[] = {"hi-IN", "hi"};
++constexpr std::string_view kLangCjkSimplified[] = {"zh-CN", "zh"};
++constexpr std::string_view kLangKorean[] = {"ko-KR", "ko"};
++
++constexpr BundleSpec kIndependentBundles[] = {
++    {"lang_pan_european", {}, 0.15},
++    {"lang_japanese", kLangJapanese, 0.04},
++    {"lang_hebrew", kLangHebrew, 0.02},
++    {"lang_arabic", kLangArabic, 0.03},
++    {"lang_thai", kLangThai, 0.02},
++    {"lang_devanagari", kLangDevanagari, 0.03},
++    {"lang_cjk_simplified", kLangCjkSimplified, 0.04},
++    {"lang_korean_extras", kLangKorean, 0.02},
++    {"app_office_365", {}, 0.60},
++    {"app_adobe_cc", {}, 0.25},
++};
++
++constexpr std::string_view kPersonalCommonDir = "personal_common";
++
++// Tier 2: expected number of themed sub-bundles picked, and the cap.
++constexpr double kTier2Mean = 2.0;
++constexpr int kTier2Cap = 4;
++
++// Tier 3: expected number of fonts pulled from the flat pool, and the cap.
++constexpr double kTier3Mean = 10.0;
++constexpr int kTier3Cap = 30;
++
++// personal_common: expected number of third-party fonts, and the cap.
++constexpr double kPersonalMean = 2.0;
++constexpr int kPersonalCap = 5;
++
++// Languages every profile reports before any bundle-implied ones.
++constexpr std::string_view kDefaultLanguages[] = {"en-US", "en"};
++
++// FNV-1a; the seed string is arbitrary text and only needs to spread.
++uint64_t HashSeed(std::string_view seed) {
++  uint64_t hash = 0xcbf29ce484222325ULL;
++  for (char c : seed) {
++    hash ^= static_cast<uint64_t>(static_cast<unsigned char>(c));
++    hash *= 0x100000001b3ULL;
++  }
++  return hash;
++}
++
++std::optional<std::string> ParseExplicitSeed(const std::string& value) {
++  // Every non-empty string is a valid HashSeed input.
++  if (value.empty()) {
++    return std::nullopt;
++  }
++  return value;
++}
++
++// Derived seeds are stringified so that explicit and derived values take the
++// same path through HashSeed.
++std::string DeriveSeed(int32_t seed) {
++  return base::NumberToString(DeterministicBucket(
++      seed, kSaltFontBundle, static_cast<uint32_t>(INT32_MAX)));
++}
++
++base::FilePath ResolveBundleRoot() {
++  base::FilePath exe_dir;
++  if (!base::PathService::Get(base::DIR_EXE, &exe_dir)) {
++    return {};
++  }
++  return exe_dir.Append(FILE_PATH_LITERAL("browser_fonts"));
++}
++
++bool IsFontFile(const base::FilePath& path) {
++  return path.MatchesExtension(FILE_PATH_LITERAL(".ttf")) ||
++         path.MatchesExtension(FILE_PATH_LITERAL(".ttc")) ||
++         path.MatchesExtension(FILE_PATH_LITERAL(".otf"));
++}
++
++// Sorted font files (FILES) or immediate subdirectories (DIRECTORIES) of
++// |dir|. Sorting makes the later sampling independent of enumeration order.
++std::vector<base::FilePath> EnumerateSorted(
++    const base::FilePath& dir,
++    base::FileEnumerator::FileType type) {
++  std::vector<base::FilePath> out;
++  base::FileEnumerator enumerator(dir, /*recursive=*/false, type);
++  for (base::FilePath path = enumerator.Next(); !path.empty();
++       path = enumerator.Next()) {
++    if (type == base::FileEnumerator::DIRECTORIES || IsFontFile(path)) {
++      out.push_back(std::move(path));
++    }
++  }
++  std::sort(out.begin(), out.end());
++  return out;
++}
++
++std::vector<base::FilePath> EnumerateFontFiles(const base::FilePath& dir) {
++  return EnumerateSorted(dir, base::FileEnumerator::FILES);
++}
++
++std::vector<base::FilePath> EnumerateSubdirs(const base::FilePath& dir) {
++  return EnumerateSorted(dir, base::FileEnumerator::DIRECTORIES);
++}
++
++void MoveAppend(std::vector<base::FilePath> from,
++                std::vector<base::FilePath>* to) {
++  to->insert(to->end(), std::make_move_iterator(from.begin()),
++             std::make_move_iterator(from.end()));
++}
++
++// Shuffles |pool| and keeps a Poisson(|mean|)-distributed number of entries,
++// at most |cap|. An empty pool consumes no randomness.
++void SamplePoisson(std::vector<base::FilePath>* pool,
++                   std::mt19937_64& rng,
++                   double mean,
++                   int cap) {
++  if (pool->empty()) {
++    return;
++  }
++  std::shuffle(pool->begin(), pool->end(), rng);
++  std::poisson_distribution<int> poisson(mean);
++  const size_t count = std::clamp(poisson(rng), 0, cap);
++  if (count < pool->size()) {
++    pool->resize(count);
++  }
++}
++
++// Appends the files a bundle contributes; tiered when a "1" subdirectory
++// exists, flat otherwise. Returns false when nothing was found.
++bool CollectBundleFiles(const base::FilePath& root,
++                        const BundleSpec& bundle,
++                        std::mt19937_64& rng,
++                        std::vector<base::FilePath>* out) {
++  const base::FilePath dir = root.AppendASCII(bundle.dir_name);
++  const base::FilePath tier1_dir = dir.AppendASCII("1");
++  const size_t start = out->size();
++
++  if (base::DirectoryExists(tier1_dir)) {
++    MoveAppend(EnumerateFontFiles(tier1_dir), out);
++
++    const base::FilePath tier2_dir = dir.AppendASCII("2");
++    if (base::DirectoryExists(tier2_dir)) {
++      std::vector<base::FilePath> subdirs = EnumerateSubdirs(tier2_dir);
++      SamplePoisson(&subdirs, rng, kTier2Mean, kTier2Cap);
++      for (const base::FilePath& subdir : subdirs) {
++        MoveAppend(EnumerateFontFiles(subdir), out);
++      }
++    }
++
++    const base::FilePath tier3_dir = dir.AppendASCII("3");
++    if (base::DirectoryExists(tier3_dir)) {
++      std::vector<base::FilePath> pool = EnumerateFontFiles(tier3_dir);
++      SamplePoisson(&pool, rng, kTier3Mean, kTier3Cap);
++      MoveAppend(std::move(pool), out);
++    }
++  } else {
++    MoveAppend(EnumerateFontFiles(dir), out);
++  }
++
++  if (out->size() == start) {
++    VLOG(1) << "browser: font bundle \"" << bundle.dir_name
++            << "\" contributed no files";
++    return false;
++  }
++  return true;
++}
++
++// Appends the bundle's implied languages that |languages| lacks.
++void AppendBundleLanguages(const BundleSpec& bundle,
++                           std::vector<std::string>* languages) {
++  for (std::string_view lang : bundle.implied_langs) {
++    if (!std::ranges::contains(*languages, lang)) {
++      languages->emplace_back(lang);
++    }
++  }
++}
++
++// Drops every file whose lowercased filename was seen earlier in the list,
++// preserving first-seen order.
++void DedupByFilename(std::vector<base::FilePath>* files) {
++  std::unordered_set<std::string> seen;
++  seen.reserve(files->size());
++  std::vector<base::FilePath> kept;
++  kept.reserve(files->size());
++  for (base::FilePath& file : *files) {
++    if (seen.insert(base::ToLowerASCII(file.BaseName().AsUTF8Unsafe()))
++            .second) {
++      kept.push_back(std::move(file));
++    }
++  }
++  *files = std::move(kept);
++}
++
++// "en-US,en;q=0.9,ja;q=0.8,...": the primary tag carries no q, later tags
++// step down by 0.1 and stay at 0.1 for the long tail.
++std::string BuildAcceptLanguageHeader(
++    const std::vector<std::string>& languages) {
++  if (languages.empty()) {
++    return {};
++  }
++  std::string header = languages[0];
++  double q = 0.9;
++  for (size_t i = 1; i < languages.size(); ++i) {
++    base::StringAppendF(&header, ",%s;q=%.1f", languages[i].c_str(), q);
++    if (q > 0.1) {
++      q -= 0.1;
++    }
++  }
++  return header;
++}
++
++struct Selection {
++  bool active = false;
++  std::vector<base::FilePath> files;
++  std::string accept_language;
++  std::vector<std::string> languages;
++};
++
++Selection BuildSelection() {
++  Selection selection;
++
++  // Explicit values feed HashSeed unchanged; "auto", "seed:N" and an
++  // inherited --fingerprint-seed produce a derived seed string.
++  const ResolvedSwitch<std::string> resolved = ResolveSwitch<std::string>(
++      switches::kBrowserFontBundle, &ParseExplicitSeed, &DeriveSeed,
++      std::string());
++  if (resolved.source == SwitchSource::kAbsent) {
++    return selection;
++  }
++  const std::string& seed = resolved.value;
++
++  const base::FilePath root = ResolveBundleRoot();
++  if (root.empty()) {
++    LOG(ERROR) << "browser: font bundle root unresolvable (DIR_EXE failed); "
++               << "falling back to system fonts";
++    return selection;
++  }
++
++  base::ScopedBlockingCall scoped_blocking_call(FROM_HERE,
++                                                base::BlockingType::MAY_BLOCK);
++
++  std::mt19937_64 rng(HashSeed(seed));
++
++  // The Windows 11 inbox fonts are always present; without them the bundle
++  // root is unusable and the system collection stays in place.
++  if (!CollectBundleFiles(root, kBaseBundle, rng, &selection.files)) {
++    LOG(ERROR) << "browser: font bundle root \"" << root.value()
++               << "\" has no base_win11 fonts; falling back to system fonts";
++    selection.files.clear();
++    return selection;
++  }
++  selection.languages.assign(std::begin(kDefaultLanguages),
++                             std::end(kDefaultLanguages));
++  AppendBundleLanguages(kBaseBundle, &selection.languages);
++
++  // Exactly one emoji font, weighted.
++  {
++    double total = 0;
++    for (const BundleSpec& bundle : kEmojiBundles) {
++      total += bundle.probability;
++    }
++    const double roll = std::uniform_real_distribution<double>(0, total)(rng);
++    double cumulative = 0;
++    for (const BundleSpec& bundle : kEmojiBundles) {
++      cumulative += bundle.probability;
++      if (roll < cumulative) {
++        CollectBundleFiles(root, bundle, rng, &selection.files);
++        AppendBundleLanguages(bundle, &selection.languages);
++        break;
++      }
++    }
++  }
++
++  // Each independent bundle is rolled against its own probability.
++  std::uniform_real_distribution<double> unit(0, 1);
++  for (const BundleSpec& bundle : kIndependentBundles) {
++    if (unit(rng) < bundle.probability) {
++      CollectBundleFiles(root, bundle, rng, &selection.files);
++      AppendBundleLanguages(bundle, &selection.languages);
++    }
++  }
++
++  // A few third-party fonts a typical user has installed.
++  {
++    std::vector<base::FilePath> pool =
++        EnumerateFontFiles(root.AppendASCII(kPersonalCommonDir));
++    SamplePoisson(&pool, rng, kPersonalMean, kPersonalCap);
++    MoveAppend(std::move(pool), &selection.files);
++  }
++
++  // Bundles overlap (base_win11 and app_office_365 tier 3 both ship
++  // Consolas, for example). Traversal order sets precedence: base, emoji,
++  // independent, personal.
++  const size_t before_dedup = selection.files.size();
++  DedupByFilename(&selection.files);
++
++  selection.accept_language = BuildAcceptLanguageHeader(selection.languages);
++  selection.active = true;
++
++  VLOG(1) << "browser: font bundle active, seed=\"" << seed
++          << "\", files=" << selection.files.size() << " (of " << before_dedup
++          << " before dedup), languages=" << selection.accept_language;
++  return selection;
++}
++
++const Selection& GetSelection() {
++  static const base::NoDestructor<Selection> selection(BuildSelection());
++  return *selection;
++}
++
++}  // namespace
++
++bool IsFontBundleActive() {
++  return GetSelection().active;
++}
++
++const std::vector<base::FilePath>& GetSelectedFontFilePaths() {
++  return GetSelection().files;
++}
++
++const std::string& GetBundleAcceptLanguage() {
++  return GetSelection().accept_language;
++}
++
++const std::vector<std::string>& GetBundleLanguagesList() {
++  return GetSelection().languages;
++}
++
++}  // namespace browser
+diff --git a/components/browser/font_bundles.h b/components/browser/font_bundles.h
+new file mode 100644
+index 0000000000..eb422d021d
+--- /dev/null
++++ b/components/browser/font_bundles.h
+@@ -0,0 +1,54 @@
++// Copyright 2026 The browser Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// Resolves a per-profile font set and its implied languages from the
++// --browser-font-bundle switch. Everything is computed once, on first access,
++// and cached for the process lifetime.
++//
++// Bundles are constexpr tables in font_bundles.cc naming subdirectories of
++// <chrome.exe dir>/browser_fonts/. The seed deterministically picks:
++//   - always: the Windows 11 inbox baseline
++//   - one Segoe UI Emoji version (weighted)
++//   - zero or more optional language packs, each rolled independently
++//     against its own probability
++//   - zero or more common application bundles (Office, Adobe)
++//   - a handful of commonly installed third-party fonts
++//
++// A bundle may declare implied BCP-47 language tags; selecting it adds those
++// tags to navigator.languages and Accept-Language.
++
++#ifndef COMPONENTS_BROWSER_FONT_BUNDLES_H_
++#define COMPONENTS_BROWSER_FONT_BUNDLES_H_
++
++#include <string>
++#include <vector>
++
++#include "base/component_export.h"
++#include "base/files/file_path.h"
++
++namespace browser {
++
++// True when --browser-font-bundle was set, the bundle root resolved and at
++// least one base font file was found. When false, callers leave Chromium's
++// default font and locale behavior alone.
++COMPONENT_EXPORT(BROWSER) bool IsFontBundleActive();
++
++// Absolute paths of the font files selected for this profile. Bundle files
++// that are declared but missing on disk are silently omitted.
++COMPONENT_EXPORT(BROWSER)
++const std::vector<base::FilePath>& GetSelectedFontFilePaths();
++
++// HTTP Accept-Language header value, e.g. "en-US,en;q=0.9,ja;q=0.8".
++// Empty when the bundle is not active.
++COMPONENT_EXPORT(BROWSER)
++const std::string& GetBundleAcceptLanguage();
++
++// navigator.languages in preference order, e.g. {"en-US", "en", "ja"}.
++// Empty when the bundle is not active.
++COMPONENT_EXPORT(BROWSER)
++const std::vector<std::string>& GetBundleLanguagesList();
++
++}  // namespace browser
++
++#endif  // COMPONENTS_BROWSER_FONT_BUNDLES_H_
+diff --git a/content/browser/browser_main_runner_impl.cc b/content/browser/browser_main_runner_impl.cc
+index db7fc14a7f..e2729d7ee3 100644
+--- a/content/browser/browser_main_runner_impl.cc
++++ b/content/browser/browser_main_runner_impl.cc
+@@ -12,6 +12,7 @@
+ #include "base/command_line.h"
+ #include "base/debug/debugger.h"
+ #include "base/debug/leak_annotations.h"
++#include "base/functional/bind.h"
+ #include "base/metrics/histogram_macros.h"
+ #include "base/no_destructor.h"
+ #include "base/run_loop.h"
+@@ -36,7 +37,9 @@
+ #if BUILDFLAG(IS_WIN)
+ #include "base/win/win_util.h"
+ #include "base/win/windows_version.h"
++#include "components/browser/font_bundles.h"
+ #include "ui/base/win/scoped_ole_initializer.h"
++#include "ui/gfx/win/direct_write.h"
+ #endif
+ 
+ namespace content {
+@@ -94,6 +97,16 @@ int BrowserMainRunnerImpl::Initialize(MainFunctionParams parameters) {
+     // (Text Services Framework) module can interact with the message pump
+     // on Windows 8 Metro mode.
+     ole_initializer_ = std::make_unique<ui::ScopedOleInitializer>();
++
++    // browser: register the font bundle provider before gfx::InitializeFonts()
++    // creates the DirectWrite factory. Every consumer of the browser process
++    // factory (the font data service, the DirectWrite Mojo proxy, the font
++    // picker and queryLocalFonts) then sees the bundle as the system
++    // collection.
++    gfx::win::SetFilteredFontPathsProvider(
++        base::BindRepeating([]() -> std::vector<base::FilePath> {
++          return browser::GetSelectedFontFilePaths();
++        }));
+ #endif  // BUILDFLAG(IS_WIN)
+ 
+     gfx::InitializeFonts();
+diff --git a/ui/gfx/win/direct_write.cc b/ui/gfx/win/direct_write.cc
+index 83a95525a4..a29ddaf751 100644
+--- a/ui/gfx/win/direct_write.cc
++++ b/ui/gfx/win/direct_write.cc
+@@ -12,10 +12,15 @@
+ 
+ #include <string>
+ #include <string_view>
++#include <vector>
+ 
+ #include "base/debug/alias.h"
++#include "base/functional/callback.h"
++#include "base/no_destructor.h"
+ #include "base/notreached.h"
+ #include "base/strings/utf_string_conversions.h"
++#include "base/synchronization/lock.h"
++#include "base/thread_annotations.h"
+ #include "base/trace_event/trace_event.h"
+ #include "skia/ext/font_utils.h"
+ #include "third_party/skia/include/core/SkFontMgr.h"
+@@ -33,6 +38,489 @@ IDWriteFactory* g_direct_write_factory = nullptr;
+ // font. Usually this is the Ahem.ttf font. Leaked at shutdown.
+ std::vector<base::FilePath>* g_sideloaded_fonts = nullptr;
+ 
++// browser: font bundle support. When the registered provider returns a
++// non-empty path list, CreateDWriteFactory() wraps the real IDWriteFactory in
++// a FilteredDWriteFactory whose system-font queries serve a collection built
++// from those paths.
++FilteredFontPathsProvider& GetFilteredFontPathsProvider() {
++  static base::NoDestructor<FilteredFontPathsProvider> provider;
++  return *provider;
++}
++
++// Builds a collection containing only the fonts at |paths|, without the
++// system fonts merged in. Returns null on failure.
++Microsoft::WRL::ComPtr<IDWriteFontCollection1> BuildFilteredFontCollection(
++    IDWriteFactory3* factory,
++    const std::vector<base::FilePath>& paths) {
++  Microsoft::WRL::ComPtr<IDWriteFontSetBuilder> set_builder;
++  HRESULT hr = factory->CreateFontSetBuilder(&set_builder);
++  if (FAILED(hr)) {
++    return nullptr;
++  }
++  for (const base::FilePath& path : paths) {
++    Microsoft::WRL::ComPtr<IDWriteFontFile> file;
++    if (FAILED(factory->CreateFontFileReference(path.value().c_str(), nullptr,
++                                                &file))) {
++      continue;
++    }
++    BOOL supported = FALSE;
++    DWRITE_FONT_FILE_TYPE file_type;
++    UINT32 n_fonts = 0;
++    if (FAILED(file->Analyze(&supported, &file_type, nullptr, &n_fonts)) ||
++        !supported) {
++      continue;
++    }
++    for (UINT32 i = 0; i < n_fonts; ++i) {
++      Microsoft::WRL::ComPtr<IDWriteFontFaceReference> face;
++      if (FAILED(factory->CreateFontFaceReference(
++              file.Get(), i, DWRITE_FONT_SIMULATIONS_NONE, &face))) {
++        continue;
++      }
++      set_builder->AddFontFaceReference(face.Get());
++    }
++  }
++  Microsoft::WRL::ComPtr<IDWriteFontSet> set;
++  if (FAILED(set_builder->CreateFontSet(&set))) {
++    return nullptr;
++  }
++  Microsoft::WRL::ComPtr<IDWriteFontCollection1> collection;
++  if (FAILED(
++          factory->CreateFontCollectionFromFontSet(set.Get(), &collection))) {
++    return nullptr;
++  }
++  return collection;
++}
++
++// Builds a fallback that only maps to families present in |collection|: a
++// single mapping over all of Unicode lists every family name, and DirectWrite
++// picks the first one supporting the character.
++Microsoft::WRL::ComPtr<IDWriteFontFallback> BuildFilteredFontFallback(
++    IDWriteFactory2* factory2,
++    IDWriteFontCollection* collection) {
++  if (!factory2 || !collection) {
++    return nullptr;
++  }
++  Microsoft::WRL::ComPtr<IDWriteFontFallbackBuilder> builder;
++  if (FAILED(factory2->CreateFontFallbackBuilder(&builder))) {
++    return nullptr;
++  }
++  UINT32 family_count = collection->GetFontFamilyCount();
++  std::vector<std::wstring> family_name_storage;
++  std::vector<const WCHAR*> family_name_ptrs;
++  family_name_storage.reserve(family_count);
++  family_name_ptrs.reserve(family_count);
++  for (UINT32 i = 0; i < family_count; ++i) {
++    Microsoft::WRL::ComPtr<IDWriteFontFamily> family;
++    if (FAILED(collection->GetFontFamily(i, &family))) {
++      continue;
++    }
++    Microsoft::WRL::ComPtr<IDWriteLocalizedStrings> names;
++    if (FAILED(family->GetFamilyNames(&names))) {
++      continue;
++    }
++    UINT32 len = 0;
++    if (FAILED(names->GetStringLength(0, &len))) {
++      continue;
++    }
++    std::wstring name(len + 1, L'\0');
++    if (FAILED(names->GetString(0, name.data(), len + 1))) {
++      continue;
++    }
++    name.resize(len);
++    family_name_storage.push_back(std::move(name));
++    family_name_ptrs.push_back(family_name_storage.back().c_str());
++  }
++  DWRITE_UNICODE_RANGE range{0x0000, 0x10FFFF};
++  HRESULT hr = builder->AddMapping(
++      &range, 1, family_name_ptrs.data(),
++      static_cast<UINT32>(family_name_ptrs.size()), collection,
++      /*localeName=*/nullptr, /*baseFamilyName=*/nullptr, /*scale=*/1.0f);
++  if (FAILED(hr)) {
++    return nullptr;
++  }
++  Microsoft::WRL::ComPtr<IDWriteFontFallback> fallback;
++  if (FAILED(builder->CreateFontFallback(&fallback))) {
++    return nullptr;
++  }
++  return fallback;
++}
++
++// Forwards every IDWriteFactory3 method to an inner factory except the
++// system-font accessors, which serve a collection built from bundle paths. The
++// collection is built lazily on the first such call.
++class FilteredDWriteFactory
++    : public Microsoft::WRL::RuntimeClass<
++          Microsoft::WRL::RuntimeClassFlags<Microsoft::WRL::ClassicCom>,
++          Microsoft::WRL::ChainInterfaces<IDWriteFactory3,
++                                          IDWriteFactory2,
++                                          IDWriteFactory1,
++                                          IDWriteFactory>> {
++ public:
++  FilteredDWriteFactory() = default;
++  ~FilteredDWriteFactory() override = default;
++
++  HRESULT RuntimeClassInitialize(Microsoft::WRL::ComPtr<IDWriteFactory3> inner,
++                                 std::vector<base::FilePath> paths) {
++    if (!inner) {
++      return E_INVALIDARG;
++    }
++    inner_ = std::move(inner);
++    paths_ = std::move(paths);
++    return S_OK;
++  }
++
++  // System-font accessors, served from the filtered collection.
++
++  HRESULT STDMETHODCALLTYPE
++  GetSystemFontCollection(IDWriteFontCollection** collection,
++                          BOOL check_for_updates) override {
++    base::AutoLock locked(build_lock_);
++    EnsureBuilt();
++    if (!filtered_collection_) {
++      return E_FAIL;
++    }
++    return filtered_collection_.CopyTo(collection);
++  }
++
++  HRESULT STDMETHODCALLTYPE
++  GetSystemFontCollection(BOOL include_downloadable,
++                          IDWriteFontCollection1** collection,
++                          BOOL check_for_updates) override {
++    base::AutoLock locked(build_lock_);
++    EnsureBuilt();
++    if (!filtered_collection_) {
++      return E_FAIL;
++    }
++    return filtered_collection_.CopyTo(collection);
++  }
++
++  HRESULT STDMETHODCALLTYPE GetSystemFontSet(IDWriteFontSet** set) override {
++    base::AutoLock locked(build_lock_);
++    EnsureBuilt();
++    if (!filtered_set_) {
++      return E_FAIL;
++    }
++    return filtered_set_.CopyTo(set);
++  }
++
++  HRESULT STDMETHODCALLTYPE
++  GetSystemFontFallback(IDWriteFontFallback** fallback) override {
++    base::AutoLock locked(build_lock_);
++    EnsureBuilt();
++    if (filtered_fallback_) {
++      return filtered_fallback_.CopyTo(fallback);
++    }
++    // Without a filtered fallback the system one exposes system fonts for
++    // character fallback, but keeps text rendering working.
++    return inner_->GetSystemFontFallback(fallback);
++  }
++
++  // Everything below forwards to |inner_|.
++
++  // IDWriteFactory:
++
++  HRESULT STDMETHODCALLTYPE
++  CreateCustomFontCollection(IDWriteFontCollectionLoader* loader,
++                             const void* key,
++                             UINT32 key_size,
++                             IDWriteFontCollection** collection) override {
++    return inner_->CreateCustomFontCollection(loader, key, key_size,
++                                              collection);
++  }
++  HRESULT STDMETHODCALLTYPE
++  RegisterFontCollectionLoader(IDWriteFontCollectionLoader* loader) override {
++    return inner_->RegisterFontCollectionLoader(loader);
++  }
++  HRESULT STDMETHODCALLTYPE
++  UnregisterFontCollectionLoader(IDWriteFontCollectionLoader* loader) override {
++    return inner_->UnregisterFontCollectionLoader(loader);
++  }
++  HRESULT STDMETHODCALLTYPE
++  CreateFontFileReference(const WCHAR* file_path,
++                          const FILETIME* last_write_time,
++                          IDWriteFontFile** file) override {
++    return inner_->CreateFontFileReference(file_path, last_write_time, file);
++  }
++  HRESULT STDMETHODCALLTYPE
++  CreateCustomFontFileReference(const void* ref_key,
++                                UINT32 ref_key_size,
++                                IDWriteFontFileLoader* loader,
++                                IDWriteFontFile** file) override {
++    return inner_->CreateCustomFontFileReference(ref_key, ref_key_size, loader,
++                                                 file);
++  }
++  HRESULT STDMETHODCALLTYPE CreateFontFace(DWRITE_FONT_FACE_TYPE type,
++                                           UINT32 num_files,
++                                           IDWriteFontFile* const* files,
++                                           UINT32 index,
++                                           DWRITE_FONT_SIMULATIONS simulations,
++                                           IDWriteFontFace** face) override {
++    return inner_->CreateFontFace(type, num_files, files, index, simulations,
++                                  face);
++  }
++  HRESULT STDMETHODCALLTYPE
++  CreateRenderingParams(IDWriteRenderingParams** params) override {
++    return inner_->CreateRenderingParams(params);
++  }
++  HRESULT STDMETHODCALLTYPE
++  CreateMonitorRenderingParams(HMONITOR monitor,
++                               IDWriteRenderingParams** params) override {
++    return inner_->CreateMonitorRenderingParams(monitor, params);
++  }
++  HRESULT STDMETHODCALLTYPE
++  CreateCustomRenderingParams(FLOAT gamma,
++                              FLOAT enhanced_contrast,
++                              FLOAT clear_type_level,
++                              DWRITE_PIXEL_GEOMETRY pixel_geometry,
++                              DWRITE_RENDERING_MODE rendering_mode,
++                              IDWriteRenderingParams** params) override {
++    return inner_->CreateCustomRenderingParams(gamma, enhanced_contrast,
++                                               clear_type_level, pixel_geometry,
++                                               rendering_mode, params);
++  }
++  HRESULT STDMETHODCALLTYPE
++  RegisterFontFileLoader(IDWriteFontFileLoader* loader) override {
++    return inner_->RegisterFontFileLoader(loader);
++  }
++  HRESULT STDMETHODCALLTYPE
++  UnregisterFontFileLoader(IDWriteFontFileLoader* loader) override {
++    return inner_->UnregisterFontFileLoader(loader);
++  }
++  HRESULT STDMETHODCALLTYPE
++  CreateTextFormat(const WCHAR* family,
++                   IDWriteFontCollection* collection,
++                   DWRITE_FONT_WEIGHT weight,
++                   DWRITE_FONT_STYLE style,
++                   DWRITE_FONT_STRETCH stretch,
++                   FLOAT font_size,
++                   const WCHAR* locale,
++                   IDWriteTextFormat** text_format) override {
++    return inner_->CreateTextFormat(family, collection, weight, style, stretch,
++                                    font_size, locale, text_format);
++  }
++  HRESULT STDMETHODCALLTYPE
++  CreateTypography(IDWriteTypography** typography) override {
++    return inner_->CreateTypography(typography);
++  }
++  HRESULT STDMETHODCALLTYPE
++  GetGdiInterop(IDWriteGdiInterop** gdi_interop) override {
++    return inner_->GetGdiInterop(gdi_interop);
++  }
++  HRESULT STDMETHODCALLTYPE
++  CreateTextLayout(const WCHAR* text,
++                   UINT32 text_length,
++                   IDWriteTextFormat* format,
++                   FLOAT max_width,
++                   FLOAT max_height,
++                   IDWriteTextLayout** layout) override {
++    return inner_->CreateTextLayout(text, text_length, format, max_width,
++                                    max_height, layout);
++  }
++  HRESULT STDMETHODCALLTYPE
++  CreateGdiCompatibleTextLayout(const WCHAR* text,
++                                UINT32 text_length,
++                                IDWriteTextFormat* format,
++                                FLOAT layout_width,
++                                FLOAT layout_height,
++                                FLOAT pixels_per_dip,
++                                const DWRITE_MATRIX* transform,
++                                BOOL use_gdi_natural,
++                                IDWriteTextLayout** layout) override {
++    return inner_->CreateGdiCompatibleTextLayout(
++        text, text_length, format, layout_width, layout_height, pixels_per_dip,
++        transform, use_gdi_natural, layout);
++  }
++  HRESULT STDMETHODCALLTYPE
++  CreateEllipsisTrimmingSign(IDWriteTextFormat* format,
++                             IDWriteInlineObject** trimming_sign) override {
++    return inner_->CreateEllipsisTrimmingSign(format, trimming_sign);
++  }
++  HRESULT STDMETHODCALLTYPE
++  CreateTextAnalyzer(IDWriteTextAnalyzer** analyzer) override {
++    return inner_->CreateTextAnalyzer(analyzer);
++  }
++  HRESULT STDMETHODCALLTYPE
++  CreateNumberSubstitution(DWRITE_NUMBER_SUBSTITUTION_METHOD method,
++                           const WCHAR* locale,
++                           BOOL ignore_user_override,
++                           IDWriteNumberSubstitution** substitution) override {
++    return inner_->CreateNumberSubstitution(method, locale,
++                                            ignore_user_override, substitution);
++  }
++  HRESULT STDMETHODCALLTYPE
++  CreateGlyphRunAnalysis(const DWRITE_GLYPH_RUN* glyph_run,
++                         FLOAT pixels_per_dip,
++                         const DWRITE_MATRIX* transform,
++                         DWRITE_RENDERING_MODE rendering_mode,
++                         DWRITE_MEASURING_MODE measuring_mode,
++                         FLOAT baseline_origin_x,
++                         FLOAT baseline_origin_y,
++                         IDWriteGlyphRunAnalysis** analysis) override {
++    return inner_->CreateGlyphRunAnalysis(
++        glyph_run, pixels_per_dip, transform, rendering_mode, measuring_mode,
++        baseline_origin_x, baseline_origin_y, analysis);
++  }
++
++  // IDWriteFactory1:
++
++  HRESULT STDMETHODCALLTYPE
++  GetEudcFontCollection(IDWriteFontCollection** collection,
++                        BOOL check_for_updates) override {
++    return inner_->GetEudcFontCollection(collection, check_for_updates);
++  }
++  HRESULT STDMETHODCALLTYPE
++  CreateCustomRenderingParams(FLOAT gamma,
++                              FLOAT enhanced_contrast,
++                              FLOAT enhanced_contrast_grayscale,
++                              FLOAT clear_type_level,
++                              DWRITE_PIXEL_GEOMETRY pixel_geometry,
++                              DWRITE_RENDERING_MODE rendering_mode,
++                              IDWriteRenderingParams1** params) override {
++    return inner_->CreateCustomRenderingParams(
++        gamma, enhanced_contrast, enhanced_contrast_grayscale, clear_type_level,
++        pixel_geometry, rendering_mode, params);
++  }
++
++  // IDWriteFactory2:
++
++  HRESULT STDMETHODCALLTYPE
++  CreateFontFallbackBuilder(IDWriteFontFallbackBuilder** builder) override {
++    return inner_->CreateFontFallbackBuilder(builder);
++  }
++  HRESULT STDMETHODCALLTYPE
++  TranslateColorGlyphRun(FLOAT x,
++                         FLOAT y,
++                         const DWRITE_GLYPH_RUN* glyph_run,
++                         const DWRITE_GLYPH_RUN_DESCRIPTION* description,
++                         DWRITE_MEASURING_MODE measuring_mode,
++                         const DWRITE_MATRIX* transform,
++                         UINT32 palette_index,
++                         IDWriteColorGlyphRunEnumerator** enumerator) override {
++    return inner_->TranslateColorGlyphRun(x, y, glyph_run, description,
++                                          measuring_mode, transform,
++                                          palette_index, enumerator);
++  }
++  HRESULT STDMETHODCALLTYPE
++  CreateCustomRenderingParams(FLOAT gamma,
++                              FLOAT enhanced_contrast,
++                              FLOAT grayscale_enhanced_contrast,
++                              FLOAT clear_type_level,
++                              DWRITE_PIXEL_GEOMETRY pixel_geometry,
++                              DWRITE_RENDERING_MODE rendering_mode,
++                              DWRITE_GRID_FIT_MODE grid_fit_mode,
++                              IDWriteRenderingParams2** params) override {
++    return inner_->CreateCustomRenderingParams(
++        gamma, enhanced_contrast, grayscale_enhanced_contrast, clear_type_level,
++        pixel_geometry, rendering_mode, grid_fit_mode, params);
++  }
++  HRESULT STDMETHODCALLTYPE
++  CreateGlyphRunAnalysis(const DWRITE_GLYPH_RUN* glyph_run,
++                         const DWRITE_MATRIX* transform,
++                         DWRITE_RENDERING_MODE rendering_mode,
++                         DWRITE_MEASURING_MODE measuring_mode,
++                         DWRITE_GRID_FIT_MODE grid_fit_mode,
++                         DWRITE_TEXT_ANTIALIAS_MODE antialias_mode,
++                         FLOAT baseline_origin_x,
++                         FLOAT baseline_origin_y,
++                         IDWriteGlyphRunAnalysis** analysis) override {
++    return inner_->CreateGlyphRunAnalysis(
++        glyph_run, transform, rendering_mode, measuring_mode, grid_fit_mode,
++        antialias_mode, baseline_origin_x, baseline_origin_y, analysis);
++  }
++
++  // IDWriteFactory3:
++
++  HRESULT STDMETHODCALLTYPE
++  CreateGlyphRunAnalysis(const DWRITE_GLYPH_RUN* glyph_run,
++                         const DWRITE_MATRIX* transform,
++                         DWRITE_RENDERING_MODE1 rendering_mode,
++                         DWRITE_MEASURING_MODE measuring_mode,
++                         DWRITE_GRID_FIT_MODE grid_fit_mode,
++                         DWRITE_TEXT_ANTIALIAS_MODE antialias_mode,
++                         FLOAT baseline_origin_x,
++                         FLOAT baseline_origin_y,
++                         IDWriteGlyphRunAnalysis** analysis) override {
++    return inner_->CreateGlyphRunAnalysis(
++        glyph_run, transform, rendering_mode, measuring_mode, grid_fit_mode,
++        antialias_mode, baseline_origin_x, baseline_origin_y, analysis);
++  }
++  HRESULT STDMETHODCALLTYPE
++  CreateCustomRenderingParams(FLOAT gamma,
++                              FLOAT enhanced_contrast,
++                              FLOAT grayscale_enhanced_contrast,
++                              FLOAT clear_type_level,
++                              DWRITE_PIXEL_GEOMETRY pixel_geometry,
++                              DWRITE_RENDERING_MODE1 rendering_mode,
++                              DWRITE_GRID_FIT_MODE grid_fit_mode,
++                              IDWriteRenderingParams3** params) override {
++    return inner_->CreateCustomRenderingParams(
++        gamma, enhanced_contrast, grayscale_enhanced_contrast, clear_type_level,
++        pixel_geometry, rendering_mode, grid_fit_mode, params);
++  }
++  HRESULT STDMETHODCALLTYPE
++  CreateFontFaceReference(const WCHAR* file_path,
++                          const FILETIME* last_write_time,
++                          UINT32 face_index,
++                          DWRITE_FONT_SIMULATIONS simulations,
++                          IDWriteFontFaceReference** reference) override {
++    return inner_->CreateFontFaceReference(file_path, last_write_time,
++                                           face_index, simulations, reference);
++  }
++  HRESULT STDMETHODCALLTYPE
++  CreateFontFaceReference(IDWriteFontFile* file,
++                          UINT32 face_index,
++                          DWRITE_FONT_SIMULATIONS simulations,
++                          IDWriteFontFaceReference** reference) override {
++    return inner_->CreateFontFaceReference(file, face_index, simulations,
++                                           reference);
++  }
++  HRESULT STDMETHODCALLTYPE
++  CreateFontSetBuilder(IDWriteFontSetBuilder** builder) override {
++    return inner_->CreateFontSetBuilder(builder);
++  }
++  HRESULT STDMETHODCALLTYPE CreateFontCollectionFromFontSet(
++      IDWriteFontSet* font_set,
++      IDWriteFontCollection1** collection) override {
++    return inner_->CreateFontCollectionFromFontSet(font_set, collection);
++  }
++  HRESULT STDMETHODCALLTYPE
++  GetFontDownloadQueue(IDWriteFontDownloadQueue** queue) override {
++    return inner_->GetFontDownloadQueue(queue);
++  }
++
++ private:
++  void EnsureBuilt() EXCLUSIVE_LOCKS_REQUIRED(build_lock_) {
++    if (built_) {
++      return;
++    }
++    built_ = true;
++    filtered_collection_ = BuildFilteredFontCollection(inner_.Get(), paths_);
++    if (filtered_collection_) {
++      filtered_collection_->GetFontSet(&filtered_set_);
++    }
++    Microsoft::WRL::ComPtr<IDWriteFactory2> inner2;
++    inner_.As(&inner2);
++    if (inner2) {
++      Microsoft::WRL::ComPtr<IDWriteFontCollection> base_collection;
++      if (filtered_collection_) {
++        filtered_collection_.As(&base_collection);
++      }
++      filtered_fallback_ =
++          BuildFilteredFontFallback(inner2.Get(), base_collection.Get());
++    }
++  }
++
++  Microsoft::WRL::ComPtr<IDWriteFactory3> inner_;
++  std::vector<base::FilePath> paths_;
++  base::Lock build_lock_;
++  bool built_ GUARDED_BY(build_lock_) = false;
++  Microsoft::WRL::ComPtr<IDWriteFontCollection1> filtered_collection_
++      GUARDED_BY(build_lock_);
++  Microsoft::WRL::ComPtr<IDWriteFontSet> filtered_set_ GUARDED_BY(build_lock_);
++  Microsoft::WRL::ComPtr<IDWriteFontFallback> filtered_fallback_
++      GUARDED_BY(build_lock_);
++};
++
+ bool GetFontCollection(Microsoft::WRL::ComPtr<IDWriteFactory>& factory,
+                        IDWriteFontCollection** collection) {
+   if (!g_sideloaded_fonts) {
+@@ -128,6 +616,11 @@ const std::vector<base::FilePath>* GetSideloadedFontsForTesting() {
+   return g_sideloaded_fonts;
+ }
+ 
++// browser: see the header comment.
++void SetFilteredFontPathsProvider(FilteredFontPathsProvider provider) {
++  GetFilteredFontPathsProvider() = std::move(provider);
++}
++
+ void CreateDWriteFactory(IDWriteFactory** factory) {
+   Microsoft::WRL::ComPtr<IUnknown> factory_unknown;
+   HRESULT hr =
+@@ -137,6 +630,25 @@ void CreateDWriteFactory(IDWriteFactory** factory) {
+     base::debug::Alias(&hr);
+     NOTREACHED();
+   }
++
++  // browser: wrap the factory when a font bundle is active, so every caller
++  // of CreateDWriteFactory() sees the filtered system collection.
++  const FilteredFontPathsProvider& provider = GetFilteredFontPathsProvider();
++  if (provider) {
++    std::vector<base::FilePath> paths = provider.Run();
++    if (!paths.empty()) {
++      Microsoft::WRL::ComPtr<IDWriteFactory3> inner3;
++      if (SUCCEEDED(factory_unknown.As(&inner3)) && inner3) {
++        Microsoft::WRL::ComPtr<FilteredDWriteFactory> wrapper;
++        if (SUCCEEDED(Microsoft::WRL::MakeAndInitialize<FilteredDWriteFactory>(
++                &wrapper, std::move(inner3), paths))) {
++          wrapper.CopyTo(factory);
++          return;
++        }
++      }
++    }
++  }
++
+   factory_unknown.CopyTo(factory);
+ }
+ 
+diff --git a/ui/gfx/win/direct_write.h b/ui/gfx/win/direct_write.h
+index 7d3911af5c..23a8779642 100644
+--- a/ui/gfx/win/direct_write.h
++++ b/ui/gfx/win/direct_write.h
+@@ -13,6 +13,7 @@
+ 
+ #include "base/component_export.h"
+ #include "base/files/file_path.h"
++#include "base/functional/callback.h"
+ 
+ namespace gfx {
+ namespace win {
+@@ -22,6 +23,17 @@ COMPONENT_EXPORT(GFX) void SideLoadFontForTesting(base::FilePath path);
+ COMPONENT_EXPORT(GFX)
+ const std::vector<base::FilePath>* GetSideloadedFontsForTesting();
+ 
++// browser: registers a provider of font file paths that replace the system
++// font collection. When the provider returns a non-empty list,
++// CreateDWriteFactory() wraps the real IDWriteFactory so that
++// GetSystemFontCollection, GetSystemFontSet and GetSystemFontFallback serve a
++// collection built from those paths. Must be set before the first
++// CreateDWriteFactory() call.
++using FilteredFontPathsProvider =
++    base::RepeatingCallback<std::vector<base::FilePath>()>;
++COMPONENT_EXPORT(GFX)
++void SetFilteredFontPathsProvider(FilteredFontPathsProvider provider);
++
+ COMPONENT_EXPORT(GFX) void InitializeDirectWrite();
+ 
+ // Creates a DirectWrite factory.

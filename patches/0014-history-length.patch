@@ -1,0 +1,73 @@
+From a740fd7582c749999cd1b38636e39b1973aca4a7 Mon Sep 17 00:00:00 2001
+From: Leo Rodarte <leorodarte07@gmail.com>
+Date: Sat, 19 Sep 2026 23:45:23 -0400
+Subject: [PATCH 14/41] history-length
+
+history.length spoof.
+---
+ .../blink/renderer/core/frame/history.cc      | 37 ++++++++++++++++++-
+ 1 file changed, 36 insertions(+), 1 deletion(-)
+
+diff --git a/third_party/blink/renderer/core/frame/history.cc b/third_party/blink/renderer/core/frame/history.cc
+index ff39560e4b..12d03eb12b 100644
+--- a/third_party/blink/renderer/core/frame/history.cc
++++ b/third_party/blink/renderer/core/frame/history.cc
+@@ -27,7 +27,10 @@
+ 
+ #include <optional>
+ 
++#include "base/strings/string_number_conversions.h"
+ #include "base/time/time.h"
++#include "components/browser/browser_switches.h"
++#include "components/browser/switch_resolver.h"
+ #include "third_party/blink/public/common/scheduler/task_attribution_id.h"
+ #include "third_party/blink/public/mojom/use_counter/metrics/web_feature.mojom-shared.h"
+ #include "third_party/blink/renderer/bindings/core/v8/to_v8_traits.h"
+@@ -56,6 +59,35 @@
+ 
+ namespace blink {
+ 
++namespace {
++
++// browser: the spoofed history.length, 0 when not spoofed (the current page
++// always counts, so 0 is never a valid spoofed length). Cached so per-call
++// cost matches stock, where BackForwardLength() is a field read.
++unsigned CachedSpoofedHistoryLength() {
++  static const unsigned value =
++      browser::ResolveSwitch<unsigned>(
++          ::switches::kFingerprintHistoryLength,
++          [](const std::string& v) -> std::optional<unsigned> {
++            unsigned parsed = 0;
++            if (!base::StringToUint(v, &parsed)) {
++              return std::nullopt;
++            }
++            return parsed;
++          },
++          [](int32_t seed) -> unsigned {
++            // Uniform in [1, 5].
++            return 1u + browser::DeterministicBucket(
++                            seed, browser::kSaltHistoryLength, 5);
++          },
++          /*fallback_when_absent=*/0u,
++          /*inherit_from_master_seed=*/false)
++          .value;
++  return value;
++}
++
++}  // namespace
++
+ History::History(LocalDOMWindow* window)
+     : ExecutionContextClient(window), last_state_object_requested_(nullptr) {}
+ 
+@@ -72,7 +104,10 @@ unsigned History::length(ExceptionState& exception_state) const {
+     return 0;
+   }
+ 
+-  return DomWindow()->GetFrame()->Client()->BackForwardLength();
++  // browser: the stock value is read first so per-call timing matches stock.
++  const unsigned real = DomWindow()->GetFrame()->Client()->BackForwardLength();
++  const unsigned spoof = CachedSpoofedHistoryLength();
++  return spoof ? spoof : real;
+ }
+ 
+ ScriptValue History::state(ScriptState* script_state,

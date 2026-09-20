@@ -1,0 +1,464 @@
+From e0469c9482598995de555403dc751eb93cdb5f5b Mon Sep 17 00:00:00 2001
+From: Leo Rodarte <leorodarte07@gmail.com>
+Date: Sat, 19 Sep 2026 23:46:20 -0400
+Subject: [PATCH 38/41] browser-settings
+
+chrome://browser-settings page for the persisted fingerprint seed, with its
+WebUI config registration and BUILD.gn dep.
+---
+ chrome/browser/prefs/BUILD.gn                 |   1 +
+ chrome/browser/prefs/browser_prefs.cc         |   4 +
+ chrome/browser/ui/webui/BUILD.gn              |   1 +
+ .../ui/webui/browser_settings/BUILD.gn        |  21 ++
+ .../browser_settings/browser_settings_ui.cc   | 272 ++++++++++++++++++
+ .../browser_settings/browser_settings_ui.h    |  41 +++
+ .../browser/ui/webui/chrome_web_ui_configs.cc |   3 +
+ components/browser/pref_names.h               |  17 ++
+ 8 files changed, 360 insertions(+)
+ create mode 100644 chrome/browser/ui/webui/browser_settings/BUILD.gn
+ create mode 100644 chrome/browser/ui/webui/browser_settings/browser_settings_ui.cc
+ create mode 100644 chrome/browser/ui/webui/browser_settings/browser_settings_ui.h
+ create mode 100644 components/browser/pref_names.h
+
+diff --git a/chrome/browser/prefs/BUILD.gn b/chrome/browser/prefs/BUILD.gn
+index 3b46ea7613..7867923825 100644
+--- a/chrome/browser/prefs/BUILD.gn
++++ b/chrome/browser/prefs/BUILD.gn
+@@ -135,6 +135,7 @@ source_set("impl") {
+     "//components/blocked_content",
+     "//components/bookmarks/common",
+     "//components/breadcrumbs/core:status",
++    "//components/browser:browser_switches",
+     "//components/browser_sync:switches",
+     "//components/browsing_data/core",
+     "//components/certificate_transparency",
+diff --git a/chrome/browser/prefs/browser_prefs.cc b/chrome/browser/prefs/browser_prefs.cc
+index df914c2053..807c1b1178 100644
+--- a/chrome/browser/prefs/browser_prefs.cc
++++ b/chrome/browser/prefs/browser_prefs.cc
+@@ -112,6 +112,7 @@
+ #include "components/autofill/core/common/autofill_prefs.h"
+ #include "components/blocked_content/safe_browsing_triggered_popup_blocker.h"
+ #include "components/breadcrumbs/core/breadcrumbs_status.h"
++#include "components/browser/pref_names.h"
+ #include "components/browsing_data/core/pref_names.h"
+ #include "components/certificate_transparency/pref_names.h"
+ #include "components/collaboration/public/pref_names.h"
+@@ -1460,6 +1461,9 @@ void RegisterLocalState(PrefRegistrySimple* registry) {
+   metrics::RegisterDemographicsLocalStatePrefs(registry);
+   metrics::TabStatsTracker::RegisterPrefs(registry);
+   network_time::NetworkTimeTracker::RegisterPrefs(registry);
++  // browser: the fingerprint seed chrome://browser-settings persists;
++  // ChromeMainDelegate applies it at startup.
++  registry->RegisterStringPref(browser::prefs::kFingerprintSeed, "");
+   omnibox::RegisterLocalStatePrefs(registry);
+ #if !BUILDFLAG(IS_ANDROID)
+   omnibox_everywhere::prefs::RegisterLocalStatePrefs(registry);
+diff --git a/chrome/browser/ui/webui/BUILD.gn b/chrome/browser/ui/webui/BUILD.gn
+index 9ba5323722..9b1273389b 100644
+--- a/chrome/browser/ui/webui/BUILD.gn
++++ b/chrome/browser/ui/webui/BUILD.gn
+@@ -65,6 +65,7 @@ source_set("configs") {
+     "//chrome/browser/ui/webui/actor_internals",
+     "//chrome/browser/ui/webui/autofill_and_password_manager_internals",
+     "//chrome/browser/ui/webui/bluetooth_internals",
++    "//chrome/browser/ui/webui/browser_settings",
+     "//chrome/browser/ui/webui/chrome_urls",
+     "//chrome/browser/ui/webui/commerce:commerce_internals_ui_config",
+     "//chrome/browser/ui/webui/components",
+diff --git a/chrome/browser/ui/webui/browser_settings/BUILD.gn b/chrome/browser/ui/webui/browser_settings/BUILD.gn
+new file mode 100644
+index 0000000000..814ace9669
+--- /dev/null
++++ b/chrome/browser/ui/webui/browser_settings/BUILD.gn
+@@ -0,0 +1,21 @@
++# Copyright 2026 The browser Authors
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++
++source_set("browser_settings") {
++  sources = [
++    "browser_settings_ui.cc",
++    "browser_settings_ui.h",
++  ]
++
++  public_deps = [ "//content/public/browser" ]
++
++  deps = [
++    "//base",
++    "//chrome/browser:browser_process_impl",
++    "//chrome/browser/profiles:profile",
++    "//components/browser:browser_switches",
++    "//components/prefs",
++    "//services/network/public/mojom",
++  ]
++}
+diff --git a/chrome/browser/ui/webui/browser_settings/browser_settings_ui.cc b/chrome/browser/ui/webui/browser_settings/browser_settings_ui.cc
+new file mode 100644
+index 0000000000..ad919ce022
+--- /dev/null
++++ b/chrome/browser/ui/webui/browser_settings/browser_settings_ui.cc
+@@ -0,0 +1,272 @@
++// Copyright 2026 The browser Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/ui/webui/browser_settings/browser_settings_ui.h"
++
++#include <string>
++#include <string_view>
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "base/memory/ref_counted_memory.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/values.h"
++#include "chrome/browser/browser_process.h"
++#include "chrome/browser/profiles/profile.h"
++#include "components/browser/pref_names.h"
++#include "components/prefs/pref_service.h"
++#include "content/public/browser/web_ui.h"
++#include "content/public/browser/web_ui_data_source.h"
++#include "content/public/browser/web_ui_message_handler.h"
++#include "services/network/public/mojom/content_security_policy.mojom.h"
++
++namespace browser {
++namespace {
++
++constexpr char kMainHtml[] = R"HTML(<!doctype html>
++<html dir="ltr" lang="en">
++<head>
++  <meta charset="utf-8">
++  <meta name="color-scheme" content="light dark">
++  <title>Anti-Fingerprint Settings</title>
++  <base href="chrome://browser-settings/">
++  <link rel="stylesheet" href="chrome://resources/css/text_defaults.css">
++  <link rel="stylesheet" href="seed.css">
++  <script type="module" src="seed.js"></script>
++</head>
++<body>
++  <div id="outer">
++    <h1>Anti-Fingerprint settings</h1>
++    <section>
++      <h2>Fingerprint seed</h2>
++      <p class="desc">
++        Sets the fingerprint identity applied on every launch, no matter how the
++        browser is opened (a clicked link, a shortcut, or as your default
++        browser). Changes take effect the next time you start the browser.
++      </p>
++      <div class="option">
++        <label><input type="radio" name="mode" value="off">
++          <b>Off</b> &mdash; no spoofing (standard Chromium fingerprint)</label>
++      </div>
++      <div class="option">
++        <label><input type="radio" name="mode" value="auto">
++          <b>Auto</b> &mdash; a fresh random identity each launch</label>
++      </div>
++      <div class="option">
++        <label><input type="radio" name="mode" value="seed">
++          <b>Fixed seed</b> &mdash; a stable identity from a number you choose</label>
++        <input type="number" id="seedValue" min="0" step="1"
++               placeholder="e.g. 12345" disabled>
++      </div>
++      <div class="actions">
++        <button id="save">Save</button>
++        <span id="status" role="status" aria-live="polite"></span>
++      </div>
++    </section>
++  </div>
++</body>
++</html>
++)HTML";
++
++constexpr char kMainCss[] = R"CSS(
++html {
++  --google-grey-200-rgb: 232, 234, 237;
++  --google-grey-200: rgb(var(--google-grey-200-rgb));
++  --google-grey-700: rgb(95, 99, 104);
++  --google-grey-900-rgb: 32, 33, 36;
++  --google-grey-900: rgb(var(--google-grey-900-rgb));
++  --google-blue-300: rgb(138, 180, 248);
++  --google-blue-600: rgb(26, 115, 232);
++  --primary-color: var(--google-grey-900);
++  --secondary-color: var(--google-grey-700);
++  --accent-color: var(--google-blue-600);
++  --background-color: white;
++  background: var(--background-color);
++}
++@media (prefers-color-scheme: dark) {
++  html {
++    --primary-color: var(--google-grey-200);
++    --secondary-color: rgba(var(--google-grey-200-rgb), .7);
++    --accent-color: var(--google-blue-300);
++    --background-color: var(--google-grey-900);
++    background: var(--background-color);
++  }
++}
++body { color: var(--primary-color); font-size: 100%; margin: 0; }
++#outer {
++  margin-inline: auto;
++  margin-top: 16px;
++  min-width: 480px;
++  width: 60%;
++  max-width: 760px;
++}
++h1 { font-size: 1.5em; font-weight: 500; }
++h2 { font-size: 1.1em; font-weight: 500; margin-top: 1.5em; }
++.desc { color: var(--secondary-color); font-size: .9em; max-width: 62ch; }
++.option { margin: .55em 0; }
++.option label { cursor: pointer; }
++#seedValue {
++  color: var(--primary-color);
++  background: transparent;
++  border: 1px solid var(--secondary-color);
++  border-radius: 4px;
++  display: block;
++  font: inherit;
++  margin-top: .35em;
++  margin-inline-start: 1.9em;
++  padding: 4px 6px;
++}
++#seedValue:disabled { opacity: .45; }
++.actions { align-items: center; display: flex; gap: 12px; margin-top: 1.6em; }
++button {
++  background: var(--accent-color);
++  border: none;
++  border-radius: 4px;
++  color: white;
++  cursor: pointer;
++  font: inherit;
++  font-weight: 500;
++  padding: 8px 18px;
++}
++button:hover { filter: brightness(1.05); }
++#status { color: var(--secondary-color); font-size: .9em; }
++)CSS";
++
++constexpr char kMainJs[] = R"JS(
++import {sendWithPromise} from 'chrome://resources/js/cr.js';
++
++const modeRadios = () =>
++    Array.from(document.querySelectorAll('input[name="mode"]'));
++const seedInput = document.getElementById('seedValue');
++const statusEl = document.getElementById('status');
++
++function selectedMode() {
++  const sel = modeRadios().find(r => r.checked);
++  return sel ? sel.value : 'off';
++}
++
++function applyMode(mode) {
++  for (const r of modeRadios()) {
++    r.checked = (r.value === mode);
++  }
++  seedInput.disabled = (mode !== 'seed');
++}
++
++function render(seed) {
++  if (seed === 'auto') {
++    applyMode('auto');
++    seedInput.value = '';
++  } else if (seed && /^[0-9]+$/.test(seed)) {
++    applyMode('seed');
++    seedInput.value = seed;
++  } else {
++    applyMode('off');
++    seedInput.value = '';
++  }
++  statusEl.textContent = '';
++}
++
++for (const r of modeRadios()) {
++  r.addEventListener('change', () => {
++    seedInput.disabled = (selectedMode() !== 'seed');
++    statusEl.textContent = '';
++  });
++}
++
++document.getElementById('save').addEventListener('click', async () => {
++  const mode = selectedMode();
++  let value = '';
++  if (mode === 'auto') {
++    value = 'auto';
++  } else if (mode === 'seed') {
++    value = seedInput.value.trim();
++  }
++  const saved = await sendWithPromise('setSeed', value);
++  render(saved);
++  statusEl.textContent = 'Saved. Restart the browser to apply.';
++});
++
++sendWithPromise('getSeed').then(render);
++)JS";
++
++bool ShouldHandleRequest(const std::string& path) {
++  return path.empty() || path == "seed.css" || path == "seed.js";
++}
++
++void HandleRequest(const std::string& path,
++                   content::WebUIDataSource::GotDataCallback callback) {
++  std::string_view body = kMainHtml;
++  if (path == "seed.css") {
++    body = kMainCss;
++  } else if (path == "seed.js") {
++    body = kMainJs;
++  }
++  std::move(callback).Run(
++      base::MakeRefCounted<base::RefCountedString>(std::string(body)));
++}
++
++class BrowserSettingsHandler : public content::WebUIMessageHandler {
++ public:
++  BrowserSettingsHandler() = default;
++  BrowserSettingsHandler(const BrowserSettingsHandler&) = delete;
++  BrowserSettingsHandler& operator=(const BrowserSettingsHandler&) = delete;
++  ~BrowserSettingsHandler() override = default;
++
++  // content::WebUIMessageHandler:
++  void RegisterMessages() override {
++    web_ui()->RegisterMessageCallback(
++        "getSeed", base::BindRepeating(&BrowserSettingsHandler::HandleGetSeed,
++                                       base::Unretained(this)));
++    web_ui()->RegisterMessageCallback(
++        "setSeed", base::BindRepeating(&BrowserSettingsHandler::HandleSetSeed,
++                                       base::Unretained(this)));
++  }
++
++ private:
++  void HandleGetSeed(const base::ListValue& args) {
++    AllowJavascript();
++    ResolveJavascriptCallback(
++        args[0], base::Value(g_browser_process->local_state()->GetString(
++                     prefs::kFingerprintSeed)));
++  }
++
++  void HandleSetSeed(const base::ListValue& args) {
++    AllowJavascript();
++    const std::string& requested = args[1].GetString();
++    // Normalize to "auto", a non-negative base-10 integer, or "" (off).
++    std::string normalized;
++    if (requested == "auto") {
++      normalized = "auto";
++    } else if (!requested.empty()) {
++      int64_t parsed = 0;
++      if (base::StringToInt64(requested, &parsed) && parsed >= 0) {
++        normalized = base::NumberToString(parsed);
++      }
++    }
++    g_browser_process->local_state()->SetString(prefs::kFingerprintSeed,
++                                                normalized);
++    ResolveJavascriptCallback(args[0], base::Value(normalized));
++  }
++};
++
++}  // namespace
++
++BrowserSettingsUI::BrowserSettingsUI(content::WebUI* web_ui)
++    : content::WebUIController(web_ui) {
++  content::WebUIDataSource* source = content::WebUIDataSource::CreateAndAdd(
++      Profile::FromWebUI(web_ui), kChromeUIBrowserSettingsHost);
++  source->OverrideContentSecurityPolicy(
++      network::mojom::CSPDirectiveName::ScriptSrc,
++      "script-src chrome://resources 'self';");
++  source->OverrideContentSecurityPolicy(
++      network::mojom::CSPDirectiveName::StyleSrc,
++      "style-src chrome://resources 'self';");
++  source->SetRequestFilter(base::BindRepeating(&ShouldHandleRequest),
++                           base::BindRepeating(&HandleRequest));
++  web_ui->AddMessageHandler(std::make_unique<BrowserSettingsHandler>());
++}
++
++BrowserSettingsUI::~BrowserSettingsUI() = default;
++
++}  // namespace browser
+diff --git a/chrome/browser/ui/webui/browser_settings/browser_settings_ui.h b/chrome/browser/ui/webui/browser_settings/browser_settings_ui.h
+new file mode 100644
+index 0000000000..dbd12f3240
+--- /dev/null
++++ b/chrome/browser/ui/webui/browser_settings/browser_settings_ui.h
+@@ -0,0 +1,41 @@
++// Copyright 2026 The browser Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_WEBUI_BROWSER_SETTINGS_BROWSER_SETTINGS_UI_H_
++#define CHROME_BROWSER_UI_WEBUI_BROWSER_SETTINGS_BROWSER_SETTINGS_UI_H_
++
++#include "content/public/browser/web_ui_controller.h"
++#include "content/public/browser/webui_config.h"
++#include "content/public/common/url_constants.h"
++
++namespace content {
++class WebUI;
++}  // namespace content
++
++namespace browser {
++
++// chrome://browser-settings
++inline constexpr char kChromeUIBrowserSettingsHost[] = "browser-settings";
++
++// A small trusted settings page for the persisted fingerprint seed, stored in
++// Local State ("browser.fingerprint_seed") and applied on every launch.
++class BrowserSettingsUI : public content::WebUIController {
++ public:
++  explicit BrowserSettingsUI(content::WebUI* web_ui);
++  BrowserSettingsUI(const BrowserSettingsUI&) = delete;
++  BrowserSettingsUI& operator=(const BrowserSettingsUI&) = delete;
++  ~BrowserSettingsUI() override;
++};
++
++class BrowserSettingsUIConfig
++    : public content::DefaultWebUIConfig<BrowserSettingsUI> {
++ public:
++  BrowserSettingsUIConfig()
++      : DefaultWebUIConfig(content::kChromeUIScheme,
++                           kChromeUIBrowserSettingsHost) {}
++};
++
++}  // namespace browser
++
++#endif  // CHROME_BROWSER_UI_WEBUI_BROWSER_SETTINGS_BROWSER_SETTINGS_UI_H_
+diff --git a/chrome/browser/ui/webui/chrome_web_ui_configs.cc b/chrome/browser/ui/webui/chrome_web_ui_configs.cc
+index 8e1786d0f6..264155e36b 100644
+--- a/chrome/browser/ui/webui/chrome_web_ui_configs.cc
++++ b/chrome/browser/ui/webui/chrome_web_ui_configs.cc
+@@ -17,6 +17,7 @@
+ #include "chrome/browser/ui/webui/autofill_and_password_manager_internals/autofill_internals_ui.h"
+ #include "chrome/browser/ui/webui/autofill_and_password_manager_internals/password_manager_internals_ui.h"
+ #include "chrome/browser/ui/webui/bluetooth_internals/bluetooth_internals_ui.h"
++#include "chrome/browser/ui/webui/browser_settings/browser_settings_ui.h"
+ #include "chrome/browser/ui/webui/chrome_finds_internals/chrome_finds_internals_ui.h"
+ #include "chrome/browser/ui/webui/chrome_urls/chrome_urls_ui.h"
+ #include "chrome/browser/ui/webui/commerce/commerce_internals_ui_config.h"
+@@ -292,6 +293,8 @@ void RegisterChromeWebUIConfigs() {
+   map.AddWebUIConfig(std::make_unique<MetricsInternalsUIConfig>());
+   map.AddWebUIConfig(std::make_unique<NetExportUIConfig>());
+   map.AddWebUIConfig(std::make_unique<NetInternalsUIConfig>());
++  // browser: chrome://browser-settings, the persisted fingerprint seed page.
++  map.AddWebUIConfig(std::make_unique<browser::BrowserSettingsUIConfig>());
+   map.AddWebUIConfig(std::make_unique<notebooks::NotebooksInternalsUIConfig>());
+   map.AddWebUIConfig(std::make_unique<NTPTilesInternalsUIConfig>());
+   map.AddWebUIConfig(std::make_unique<OmniboxUIConfig>());
+diff --git a/components/browser/pref_names.h b/components/browser/pref_names.h
+new file mode 100644
+index 0000000000..4b3042ff36
+--- /dev/null
++++ b/components/browser/pref_names.h
+@@ -0,0 +1,17 @@
++// Copyright 2026 The browser Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_BROWSER_PREF_NAMES_H_
++#define COMPONENTS_BROWSER_PREF_NAMES_H_
++
++namespace browser::prefs {
++
++// Local State. The fingerprint seed chrome://browser-settings persists: "",
++// "auto" or a non-negative integer. ChromeMainDelegate turns it into
++// --fingerprint-seed at startup unless the switch is already present.
++inline constexpr char kFingerprintSeed[] = "browser.fingerprint_seed";
++
++}  // namespace browser::prefs
++
++#endif  // COMPONENTS_BROWSER_PREF_NAMES_H_

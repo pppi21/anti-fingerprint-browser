@@ -1,0 +1,1379 @@
+From 465f167d137697c5001eac59e7d81e418157e365 Mon Sep 17 00:00:00 2001
+From: Leo Rodarte <leorodarte07@gmail.com>
+Date: Sat, 19 Sep 2026 23:45:52 -0400
+Subject: [PATCH 28/41] keyboard-typing
+
+CDP human keyboard-typing session (Input.dispatchKeystrokes).
+
+Riders (one file, one commit): input_handler.{cc,h} and Input.pdl also carry
+the Input.dispatchMousePath dispatch, and input_handler the cursor-overlay
+member. protocol_config.json also registers dispatchMousePath and the Page
+agent-snapshot commands. content/browser/BUILD.gn also lists the
+cdp_cursor_overlay sources and the browser_switches/buildflags deps.
+---
+ content/browser/BUILD.gn                      |   5 +
+ .../devtools/protocol/input_handler.cc        | 230 +++++++
+ .../browser/devtools/protocol/input_handler.h |  41 ++
+ .../protocol/keyboard_typing_session.cc       | 634 ++++++++++++++++++
+ .../protocol/keyboard_typing_session.h        | 165 +++++
+ content/browser/devtools/protocol_config.json |   6 +-
+ .../devtools_protocol/domains/Input.pdl       |  60 ++
+ 7 files changed, 1138 insertions(+), 3 deletions(-)
+ create mode 100644 content/browser/devtools/protocol/keyboard_typing_session.cc
+ create mode 100644 content/browser/devtools/protocol/keyboard_typing_session.h
+
+diff --git a/content/browser/BUILD.gn b/content/browser/BUILD.gn
+index 3cb70c3ea7..f78809d0d8 100644
+--- a/content/browser/BUILD.gn
++++ b/content/browser/BUILD.gn
+@@ -146,6 +146,7 @@ source_set("browser") {
+     "//cc/mojo_embedder",
+     "//cc/paint",
+     "//components/back_forward_cache:enum",
++    "//components/browser:browser_switches",
+     "//components/browsing_data/core:cookie_or_cache_deletion_choice",
+     "//components/cbor",
+     "//components/discardable_memory/common",
+@@ -779,6 +780,8 @@ source_set("browser") {
+     "device_posture/device_posture_provider_impl.h",
+     "devtools/browser_devtools_agent_host.cc",
+     "devtools/browser_devtools_agent_host.h",
++    "devtools/cdp_cursor_overlay.cc",
++    "devtools/cdp_cursor_overlay.h",
+     "devtools/cross_thread_protocol_callback.h",
+     "devtools/dedicated_worker_devtools_agent_host.cc",
+     "devtools/dedicated_worker_devtools_agent_host.h",
+@@ -861,6 +864,8 @@ source_set("browser") {
+     "devtools/protocol/hidden_target_manager.h",
+     "devtools/protocol/input_handler.cc",
+     "devtools/protocol/input_handler.h",
++    "devtools/protocol/keyboard_typing_session.cc",
++    "devtools/protocol/keyboard_typing_session.h",
+     "devtools/protocol/inspector_handler.cc",
+     "devtools/protocol/inspector_handler.h",
+     "devtools/protocol/io_handler.cc",
+diff --git a/content/browser/devtools/protocol/input_handler.cc b/content/browser/devtools/protocol/input_handler.cc
+index b92fdbe057..163d9172f6 100644
+--- a/content/browser/devtools/protocol/input_handler.cc
++++ b/content/browser/devtools/protocol/input_handler.cc
+@@ -6,13 +6,17 @@
+ 
+ #include <stddef.h>
+ 
++#include <algorithm>
++#include <iterator>
+ #include <memory>
++#include <string_view>
+ #include <tuple>
+ #include <utility>
+ #include <vector>
+ 
+ #include "base/check.h"
+ #include "base/check_deref.h"
++#include "base/command_line.h"
+ #include "base/functional/bind.h"
+ #include "base/functional/callback.h"
+ #include "base/functional/callback_helpers.h"
+@@ -23,8 +27,10 @@
+ #include "base/task/single_thread_task_runner.h"
+ #include "base/trace_event/trace_event.h"
+ #include "base/types/expected.h"
++#include "components/browser/browser_switches.h"
+ #include "components/input/render_widget_host_input_event_router.h"
+ #include "content/browser/devtools/devtools_agent_host_impl.h"
++#include "content/browser/devtools/protocol/keyboard_typing_session.h"
+ #include "content/browser/devtools/protocol/native_input_event_builder.h"
+ #include "content/browser/devtools/protocol/protocol.h"
+ #include "content/browser/renderer_host/data_transfer_util.h"
+@@ -33,6 +39,8 @@
+ #include "content/browser/renderer_host/render_widget_host_impl.h"
+ #include "content/browser/renderer_host/render_widget_host_view_base.h"
+ #include "content/browser/web_contents/web_contents_impl.h"
++#include "content/common/input/synthetic_mouse_path_gesture.h"
++#include "content/common/input/synthetic_mouse_path_gesture_params.h"
+ #include "content/common/input/synthetic_pinch_gesture.h"
+ #include "content/common/input/synthetic_pinch_gesture_params.h"
+ #include "content/common/input/synthetic_pointer_action.h"
+@@ -1155,10 +1163,25 @@ void InputHandler::SetRenderer(int process_host_id,
+     return;
+   ClearInputState();
+ 
++  // browser: the cursor overlay follows the widget host.
++  if (cursor_overlay_) {
++    cursor_overlay_->Detach();
++  }
++
+   auto* old_web_contents = WebContentsImpl::FromRenderFrameHostImpl(host_);
+   host_ = frame_host;
+   web_contents_ = WebContentsImpl::FromRenderFrameHostImpl(host_);
+ 
++  if (host_ && host_->GetRenderWidgetHost()) {
++    if (!cursor_overlay_ && base::CommandLine::ForCurrentProcess()->HasSwitch(
++                                switches::kShowCdpCursor)) {
++      cursor_overlay_ = std::make_unique<CdpCursorOverlay>();
++    }
++    if (cursor_overlay_) {
++      cursor_overlay_->AttachToHost(host_->GetRenderWidgetHost());
++    }
++  }
++
+   if (ignore_input_events_ && old_web_contents != web_contents_) {
+     if (web_contents_) {
+       scoped_ignore_input_events_ =
+@@ -1175,6 +1198,7 @@ void InputHandler::Wire(UberDispatcher* dispatcher) {
+ }
+ 
+ Response InputHandler::Disable() {
++  cursor_overlay_.reset();  // browser
+   ClearInputState();
+   scoped_ignore_input_events_.reset();
+   ignore_input_events_ = false;
+@@ -1278,6 +1302,113 @@ void InputHandler::DispatchKeyEvent(
+       ->InjectKeyboardEvent(event, std::move(commands), std::move(callback));
+ }
+ 
++// browser: Input.dispatchKeystrokes.
++void InputHandler::DispatchKeystrokes(
++    const std::string& text,
++    std::optional<double> speed_multiplier,
++    std::optional<int> keystroke_delay_min,
++    std::optional<int> keystroke_delay_max,
++    std::optional<int> key_hold_min,
++    std::optional<int> key_hold_max,
++    std::optional<bool> context_aware,
++    std::optional<double> thinking_pause_probability,
++    std::optional<int> thinking_pause_min,
++    std::optional<int> thinking_pause_max,
++    std::optional<double> typo_probability,
++    std::optional<double> seed,
++    std::unique_ptr<DispatchKeystrokesCallback> callback) {
++  if (text.empty()) {
++    callback->sendSuccess();
++    return;
++  }
++  if (!host_ || !host_->GetRenderWidgetHost()) {
++    callback->sendFailure(Response::InternalError());
++    return;
++  }
++
++  RenderWidgetHostImpl* widget_host = host_->GetRenderWidgetHost();
++  if (!host_->GetParent() && widget_host->delegate()) {
++    RenderWidgetHostImpl* target_host =
++        widget_host->delegate()->GetFocusedRenderWidgetHost(widget_host);
++    if (target_host) {
++      widget_host = target_host;
++    }
++  }
++
++  KeyboardTypingSession::Params params;
++  params.text = text;
++  if (speed_multiplier.has_value() && speed_multiplier.value() > 0.0) {
++    params.speed_multiplier = speed_multiplier.value();
++  }
++  if (keystroke_delay_min.has_value()) {
++    params.keystroke_delay_min_ms = std::max(1, keystroke_delay_min.value());
++  }
++  if (keystroke_delay_max.has_value()) {
++    params.keystroke_delay_max_ms = std::max(1, keystroke_delay_max.value());
++  }
++  if (params.keystroke_delay_max_ms < params.keystroke_delay_min_ms) {
++    params.keystroke_delay_max_ms = params.keystroke_delay_min_ms;
++  }
++  if (key_hold_min.has_value()) {
++    params.key_hold_min_ms = std::max(0, key_hold_min.value());
++  }
++  if (key_hold_max.has_value()) {
++    params.key_hold_max_ms = std::max(0, key_hold_max.value());
++  }
++  if (params.key_hold_max_ms < params.key_hold_min_ms) {
++    params.key_hold_max_ms = params.key_hold_min_ms;
++  }
++  if (context_aware.has_value()) {
++    params.context_aware = context_aware.value();
++  }
++  if (thinking_pause_probability.has_value()) {
++    params.thinking_pause_probability =
++        std::clamp(thinking_pause_probability.value(), 0.0, 1.0);
++  }
++  if (thinking_pause_min.has_value()) {
++    params.thinking_pause_min_ms = std::max(0, thinking_pause_min.value());
++  }
++  if (thinking_pause_max.has_value()) {
++    params.thinking_pause_max_ms = std::max(0, thinking_pause_max.value());
++  }
++  if (params.thinking_pause_max_ms < params.thinking_pause_min_ms) {
++    params.thinking_pause_max_ms = params.thinking_pause_min_ms;
++  }
++  if (typo_probability.has_value()) {
++    params.typo_probability = std::clamp(typo_probability.value(), 0.0, 1.0);
++  }
++  // The protocol number is a double; its 53-bit mantissa is plenty for an
++  // mt19937_64 seed. Without a seed, the microsecond clock makes each call's
++  // schedule distinct.
++  params.seed =
++      seed.has_value()
++          ? static_cast<uint64_t>(seed.value())
++          : static_cast<uint64_t>(
++                base::TimeTicks::Now().since_origin().InMicroseconds());
++
++  // A session already running on this handler is cancelled; its destructor
++  // fails that session's CDP callback.
++  active_typing_session_.reset();
++  active_typing_session_ = std::make_unique<KeyboardTypingSession>(
++      widget_host->GetWeakPtr(), std::move(params),
++      base::BindOnce(&InputHandler::OnKeystrokeSessionFinished,
++                     weak_factory_.GetWeakPtr(), std::move(callback)));
++  active_typing_session_->Start();
++}
++
++void InputHandler::OnKeystrokeSessionFinished(
++    std::unique_ptr<DispatchKeystrokesCallback> callback,
++    bool success) {
++  // active_typing_session_ is left alone: when a session finishes
++  // synchronously inside Start(), a re-entrant DispatchKeystrokes may already
++  // own a newer session, and resetting here would destroy it.
++  if (success) {
++    callback->sendSuccess();
++  } else {
++    callback->sendFailure(Response::ServerError("Typing session aborted"));
++  }
++}
++
+ void InputHandler::InsertText(const std::string& text,
+                               std::unique_ptr<InsertTextCallback> callback) {
+   std::u16string text16 = base::UTF8ToUTF16(text);
+@@ -1376,6 +1507,15 @@ void InputHandler::DispatchMouseEvent(
+     std::optional<double> delta_y,
+     std::optional<std::string> pointer_type,
+     std::unique_ptr<DispatchMouseEventCallback> callback) {
++  // browser: this path bypasses the event router, so the cursor overlay is
++  // told directly.
++  if (cursor_overlay_) {
++    const float scale = ScaleFactor();
++    cursor_overlay_->UpdatePosition(
++        static_cast<float>(x * scale), static_cast<float>(y * scale),
++        event_type == Input::DispatchMouseEvent::TypeEnum::MousePressed);
++  }
++
+   base::expected<std::unique_ptr<blink::WebMouseEvent>, protocol::Response>
+       maybe_event = CreateWebMouseEvent(
+           event_type, x, y, ScaleFactor(), std::move(modifiers),
+@@ -2304,11 +2444,101 @@ void InputHandler::SynthesizeTapGesture(
+   }
+ }
+ 
++// browser: Input.dispatchMousePath.
++void InputHandler::DispatchMousePath(
++    std::unique_ptr<Array<Input::MousePathPoint>> path,
++    int polling_rate_hz,
++    std::optional<std::string> button,
++    std::unique_ptr<DispatchMousePathCallback> callback) {
++  if (!path || path->empty()) {
++    callback->sendFailure(
++        Response::InvalidParams("'path' must be a non-empty array"));
++    return;
++  }
++  if (polling_rate_hz < 1 || polling_rate_hz > 10000) {
++    callback->sendFailure(
++        Response::InvalidParams("'pollingRateHz' must be between 1 and 10000"));
++    return;
++  }
++  RenderWidgetHostViewBase* root_view = GetRootView();
++  if (!host_ || !host_->GetRenderWidgetHost() || !root_view) {
++    callback->sendFailure(Response::InternalError());
++    return;
++  }
++
++  // A move without a held button is a hover whatever the caller intended:
++  // no drag starts and no pointer capture is granted, so a native control
++  // such as <input type=range> stays where the press landed. A hand-written
++  // mousemove listener keeps its own is-down flag and reacts anyway, which
++  // is why a hover reads as working until it meets a real control.
++  struct ButtonName {
++    std::string_view name;
++    SyntheticPointerActionParams::Button button;
++  };
++  static constexpr ButtonName kButtons[] = {
++      {"none", SyntheticPointerActionParams::Button::NO_BUTTON},
++      {"left", SyntheticPointerActionParams::Button::LEFT},
++      {"middle", SyntheticPointerActionParams::Button::MIDDLE},
++      {"right", SyntheticPointerActionParams::Button::RIGHT},
++      {"back", SyntheticPointerActionParams::Button::BACK},
++      {"forward", SyntheticPointerActionParams::Button::FORWARD},
++  };
++  const std::string held = button.value_or("none");
++  const auto* named = std::ranges::find(kButtons, held, &ButtonName::name);
++  if (named == std::end(kButtons)) {
++    callback->sendFailure(
++        Response::InvalidParams("'button' must be one of none, left, middle, "
++                                "right, back, forward"));
++    return;
++  }
++
++  SyntheticMousePathGestureParams params;
++  params.button = named->button;
++  // Like synthesizePinch/Scroll/TapGesture, the gesture is marked as coming
++  // from the debugger so it dispatches straight to the target and skips
++  // SyntheticGestureController's visibility gate. Without that the gesture is
++  // deferred whenever the root widget reads as hidden, which is common for an
++  // automation window behind another one, and the call hangs until the
++  // client times out. The kFromDebugger modifier is browser-side only: the
++  // renderer never reads it, so isTrusted and routing are unaffected.
++  params.from_devtools_debugger = true;
++  params.gesture_source_type = content::mojom::GestureSourceType::kMouseInput;
++  params.polling_interval = base::Milliseconds(1000.0 / polling_rate_hz);
++  const float scale = ScaleFactor();
++  for (const auto& point : *path) {
++    params.positions.push_back({static_cast<float>(point->GetX() * scale),
++                                static_cast<float>(point->GetY() * scale)});
++  }
++
++  // The CDP callback resolves once the pointer-move events are dispatched,
++  // not after the WaitForTargetAck round trip the default QueueSyntheticGesture
++  // path adds. That round trip lags by seconds on busy or occluded pages,
++  // stalling every path after its motion has finished. A following click goes
++  // through Input.dispatchMouseEvent, which hit-tests afresh at the press
++  // coordinates and does not depend on this ack.
++  root_view->host()->QueueSyntheticGestureCompleteImmediately(
++      std::make_unique<SyntheticMousePathGesture>(params),
++      base::BindOnce(&InputHandler::OnMousePathFinished,
++                     weak_factory_.GetWeakPtr(), std::move(callback)));
++}
++
++void InputHandler::OnMousePathFinished(
++    std::unique_ptr<DispatchMousePathCallback> callback,
++    SyntheticGesture::Result result) {
++  if (result == SyntheticGesture::GESTURE_FINISHED) {
++    callback->sendSuccess();
++  } else {
++    callback->sendFailure(Response::ServerError("Mouse path gesture aborted"));
++  }
++}
++
+ void InputHandler::ClearInputState() {
+   while (!injectors_.empty())
+     (*injectors_.begin())->Cleanup();
+   // TODO(dgozman): cleanup touch callbacks as well?
+   pointer_ids_.clear();
++  // browser: a pending typing session's destructor fails its CDP callback.
++  active_typing_session_.reset();
+ }
+ 
+ bool InputHandler::PointIsWithinContents(gfx::PointF point) const {
+diff --git a/content/browser/devtools/protocol/input_handler.h b/content/browser/devtools/protocol/input_handler.h
+index 4c25a8c1c2..87bfd3dc00 100644
+--- a/content/browser/devtools/protocol/input_handler.h
++++ b/content/browser/devtools/protocol/input_handler.h
+@@ -16,10 +16,12 @@
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/raw_ref.h"
+ #include "base/memory/weak_ptr.h"
++#include "content/browser/devtools/cdp_cursor_overlay.h"
+ #include "content/browser/devtools/protocol/devtools_domain_handler.h"
+ #include "content/browser/devtools/protocol/input.h"
+ #include "content/browser/renderer_host/render_widget_host_view_base.h"
+ #include "content/common/input/synthetic_gesture.h"
++#include "content/common/input/synthetic_mouse_path_gesture_params.h"
+ #include "content/common/input/synthetic_pointer_action_list_params.h"
+ #include "content/common/input/synthetic_smooth_scroll_gesture_params.h"
+ #include "content/public/browser/render_widget_host.h"
+@@ -31,6 +33,7 @@
+ 
+ namespace content {
+ class DevToolsAgentHostImpl;
++class KeyboardTypingSession;
+ class RenderFrameHostImpl;
+ class RenderWidgetHostImpl;
+ class SyntheticPointerDriver;
+@@ -52,6 +55,10 @@ class InputHandler : public DevToolsDomainHandler, public Input::Backend {
+ 
+   static std::vector<InputHandler*> ForAgentHost(DevToolsAgentHostImpl* host);
+ 
++  // browser: the --show-cdp-cursor overlay, if any; PageHandler composites
++  // it onto screencast frames.
++  CdpCursorOverlay* cursor_overlay() const { return cursor_overlay_.get(); }
++
+   void Wire(UberDispatcher* dispatcher) override;
+   void SetRenderer(int process_host_id,
+                    RenderFrameHostImpl* frame_host) override;
+@@ -95,6 +102,22 @@ class InputHandler : public DevToolsDomainHandler, public Input::Backend {
+       std::unique_ptr<Array<std::string>> commands,
+       std::unique_ptr<DispatchKeyEventCallback> callback) override;
+ 
++  // browser: Input.dispatchKeystrokes and Input.dispatchMousePath.
++  void DispatchKeystrokes(
++      const std::string& text,
++      std::optional<double> speed_multiplier,
++      std::optional<int> keystroke_delay_min,
++      std::optional<int> keystroke_delay_max,
++      std::optional<int> key_hold_min,
++      std::optional<int> key_hold_max,
++      std::optional<bool> context_aware,
++      std::optional<double> thinking_pause_probability,
++      std::optional<int> thinking_pause_min,
++      std::optional<int> thinking_pause_max,
++      std::optional<double> typo_probability,
++      std::optional<double> seed,
++      std::unique_ptr<DispatchKeystrokesCallback> callback) override;
++
+   void InsertText(const std::string& text,
+                   std::unique_ptr<InsertTextCallback> callback) override;
+ 
+@@ -179,6 +202,12 @@ class InputHandler : public DevToolsDomainHandler, public Input::Backend {
+       std::optional<std::string> interaction_marker_name,
+       std::unique_ptr<SynthesizeScrollGestureCallback> callback) override;
+ 
++  void DispatchMousePath(
++      std::unique_ptr<Array<Input::MousePathPoint>> path,
++      int polling_rate_hz,
++      std::optional<std::string> button,
++      std::unique_ptr<DispatchMousePathCallback> callback) override;
++
+   void SynthesizeTapGesture(
+       double x,
+       double y,
+@@ -337,6 +366,13 @@ class InputHandler : public DevToolsDomainHandler, public Input::Backend {
+       std::unique_ptr<SynthesizeScrollGestureCallback> callback,
+       SyntheticGesture::Result result);
+ 
++  // browser: completion of the mouse path and of the typing session.
++  void OnMousePathFinished(std::unique_ptr<DispatchMousePathCallback> callback,
++                           SyntheticGesture::Result result);
++  void OnKeystrokeSessionFinished(
++      std::unique_ptr<DispatchKeystrokesCallback> callback,
++      bool success);
++
+   void HandleMouseEvent(std::unique_ptr<blink::WebMouseEvent> event,
+                         std::unique_ptr<DispatchMouseEventCallback> callback);
+ 
+@@ -365,6 +401,11 @@ class InputHandler : public DevToolsDomainHandler, public Input::Backend {
+   std::set<int> pointer_ids_;
+   std::unique_ptr<SyntheticPointerDriver> synthetic_pointer_driver_;
+   base::flat_map<blink::PointerId, blink::WebTouchPoint> touch_points_;
++  // browser: see cursor_overlay(). At most one typing session runs at a
++  // time; a new request cancels the previous one, which then fails its own
++  // CDP callback from the session destructor.
++  std::unique_ptr<CdpCursorOverlay> cursor_overlay_;
++  std::unique_ptr<KeyboardTypingSession> active_typing_session_;
+   base::WeakPtrFactory<InputHandler> weak_factory_{this};
+ };
+ 
+diff --git a/content/browser/devtools/protocol/keyboard_typing_session.cc b/content/browser/devtools/protocol/keyboard_typing_session.cc
+new file mode 100644
+index 0000000000..77540da9ab
+--- /dev/null
++++ b/content/browser/devtools/protocol/keyboard_typing_session.cc
+@@ -0,0 +1,634 @@
++// Copyright 2026 The browser Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "content/browser/devtools/protocol/keyboard_typing_session.h"
++
++#include <algorithm>
++#include <array>
++#include <cmath>
++#include <string_view>
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "base/strings/string_util.h"
++#include "base/strings/utf_string_conversions.h"
++#include "components/input/native_web_keyboard_event.h"
++#include "content/browser/renderer_host/render_widget_host_impl.h"
++#include "third_party/blink/public/common/input/web_input_event.h"
++#include "third_party/blink/public/common/input/web_keyboard_event.h"
++#include "ui/events/keycodes/dom/keycode_converter.h"
++#include "ui/latency/latency_info.h"
++
++namespace content {
++
++namespace {
++
++// CDP modifier bits, as in Input.dispatchKeyEvent.modifiers, and the
++// WebInputEvent modifier each one maps to.
++struct ModifierBit {
++  int cdp_bit;
++  int blink_modifier;
++};
++constexpr ModifierBit kModifierBits[] = {
++    {1, blink::WebInputEvent::kAltKey},
++    {2, blink::WebInputEvent::kControlKey},
++    {4, blink::WebInputEvent::kMetaKey},
++    {8, blink::WebInputEvent::kShiftKey},
++};
++constexpr int kModShift = 8;
++
++// Events whose scheduled time has arrived within this slack are dispatched
++// in the same task instead of arming a zero-delay timer for each, which
++// keeps the sequence tight when the per-key gap is below timer resolution.
++constexpr base::TimeDelta kBatchDispatchSlack = base::Microseconds(500);
++
++// Typo corrections fire backspaces faster than normal keystrokes and bracket
++// the burst with realization / recovery pauses, so the rhythm changes the way
++// it does for a real typist.
++constexpr int kBackspaceMinMs = 50;
++constexpr int kBackspaceMaxMs = 100;
++constexpr int kRealizePauseMinMs = 200;
++constexpr int kRealizePauseMaxMs = 400;
++constexpr int kPostCorrectionMinMs = 150;
++constexpr int kPostCorrectionMaxMs = 300;
++
++// Common English bigrams are typed faster than baseline.
++constexpr std::string_view kCommonBigrams[] = {
++    "th", "he", "in", "er", "an", "re", "on", "at", "en", "nd",
++    "ti", "es", "or", "te", "of", "ed", "is", "it", "al", "ar",
++    "st", "to", "nt", "ng", "se", "ha", "as", "ou", "io", "le"};
++
++bool IsCommonBigram(char32_t prev, char32_t curr) {
++  if (prev > 0x7F || curr > 0x7F) {
++    return false;
++  }
++  const char a = base::ToLowerASCII(static_cast<char>(prev));
++  const char b = base::ToLowerASCII(static_cast<char>(curr));
++  for (std::string_view bigram : kCommonBigrams) {
++    if (bigram[0] == a && bigram[1] == b) {
++      return true;
++    }
++  }
++  return false;
++}
++
++bool IsAsciiPunctuation(char32_t c) {
++  return c == U'.' || c == U',' || c == U'!' || c == U'?' || c == U';' ||
++         c == U':' || c == U'\'' || c == U'"' || c == U'-' || c == U'(' ||
++         c == U')';
++}
++
++// QWERTY neighbours of the alphanumeric block. Keys outside it never get
++// adjacent-key typos, though they can still get doubled / omission typos.
++struct AdjacencyEntry {
++  char32_t key;
++  std::string_view adjacent;
++};
++constexpr AdjacencyEntry kAdjacency[] = {
++    {U'q', "wa"},     {U'w', "qeasd"},  {U'e', "wrsdf"},  {U'r', "etdfg"},
++    {U't', "ryfgh"},  {U'y', "tughj"},  {U'u', "yihjk"},  {U'i', "uojkl"},
++    {U'o', "ipkl"},   {U'p', "ol"},     {U'a', "qwsz"},   {U's', "awedzx"},
++    {U'd', "serfxc"}, {U'f', "drtgcv"}, {U'g', "ftyhvb"}, {U'h', "gyujbn"},
++    {U'j', "huiknm"}, {U'k', "jiolm"},  {U'l', "kop"},    {U'z', "asx"},
++    {U'x', "zsdc"},   {U'c', "xdfv"},   {U'v', "cfgb"},   {U'b', "vghn"},
++    {U'n', "bhjm"},   {U'm', "njk"},    {U'1', "2q"},     {U'2', "13qw"},
++    {U'3', "24we"},   {U'4', "35er"},   {U'5', "46rt"},   {U'6', "57ty"},
++    {U'7', "68yu"},   {U'8', "79ui"},   {U'9', "80io"},   {U'0', "9op"},
++};
++
++std::string_view LookupAdjacent(char32_t c) {
++  for (const AdjacencyEntry& entry : kAdjacency) {
++    if (entry.key == c) {
++      return entry.adjacent;
++    }
++  }
++  return {};
++}
++
++// The shifted symbols on the digit row, indexed by digit.
++constexpr std::string_view kShiftedDigits = ")!@#$%^&*(";
++
++// Returns the digit under a shifted digit-row symbol, or 0.
++char UnshiftDigitSymbol(char32_t c) {
++  const size_t index = c <= 0x7F ? kShiftedDigits.find(static_cast<char>(c))
++                                 : std::string_view::npos;
++  return index == std::string_view::npos ? 0 : static_cast<char>('0' + index);
++}
++
++struct KeyMapping {
++  std::string key;
++  std::string code;
++  int windows_vkey = 0;
++  bool needs_shift = false;
++  std::u16string text;  // the event's 'text' field
++};
++
++// Punctuation keys as (unshifted, shifted, code, virtual key).
++struct PunctuationKey {
++  char32_t plain;
++  char32_t shifted;
++  std::string_view code;
++  int windows_vkey;
++};
++constexpr PunctuationKey kPunctuationKeys[] = {
++    {U'-', U'_', "Minus", 189},       {U'=', U'+', "Equal", 187},
++    {U'[', U'{', "BracketLeft", 219}, {U']', U'}', "BracketRight", 221},
++    {U'\\', U'|', "Backslash", 220},  {U';', U':', "Semicolon", 186},
++    {U'\'', U'"', "Quote", 222},      {U',', U'<', "Comma", 188},
++    {U'.', U'>', "Period", 190},      {U'/', U'?', "Slash", 191},
++    {U'`', U'~', "Backquote", 192},
++};
++
++// Maps a single ASCII char to its key event fields. Returns false for chars
++// without a known mapping.
++bool BuildKeyMapping(char32_t c, KeyMapping* out) {
++  if (c == U'\n' || c == U'\r') {
++    *out = {"Enter", "Enter", 13, false, u"\r"};
++    return true;
++  }
++  if (c == U'\t') {
++    *out = {"Tab", "Tab", 9, false, u"\t"};
++    return true;
++  }
++  if (c == U' ') {
++    *out = {" ", "Space", 32, false, u" "};
++    return true;
++  }
++  const std::string key(1, static_cast<char>(c));
++  const std::u16string text(1, static_cast<char16_t>(c));
++  if (c >= U'a' && c <= U'z') {
++    const char upper = static_cast<char>('A' + (c - U'a'));
++    *out = {key, std::string("Key") + upper, upper, false, text};
++    return true;
++  }
++  if (c >= U'A' && c <= U'Z') {
++    *out = {key, std::string("Key") + static_cast<char>(c), static_cast<int>(c),
++            true, text};
++    return true;
++  }
++  if (c >= U'0' && c <= U'9') {
++    *out = {key, std::string("Digit") + static_cast<char>(c),
++            static_cast<int>(c), false, text};
++    return true;
++  }
++  if (const char digit = UnshiftDigitSymbol(c)) {
++    *out = {key, std::string("Digit") + digit, digit, true, text};
++    return true;
++  }
++  for (const PunctuationKey& punct : kPunctuationKeys) {
++    if (c == punct.plain || c == punct.shifted) {
++      *out = {key, std::string(punct.code), punct.windows_vkey,
++              c == punct.shifted, text};
++      return true;
++    }
++  }
++  return false;
++}
++
++// Decodes UTF-8 into UTF-32 codepoints. Invalid sequences become U+FFFD, so
++// the schedule generator never sees them.
++std::vector<char32_t> DecodeUtf8(const std::string& text) {
++  const std::u16string u16 = base::UTF8ToUTF16(text);
++  std::vector<char32_t> out;
++  out.reserve(u16.size());
++  for (size_t i = 0; i < u16.size(); ++i) {
++    const char16_t c = u16[i];
++    if (c >= 0xD800 && c <= 0xDBFF && i + 1 < u16.size()) {
++      const char16_t lo = u16[i + 1];
++      if (lo >= 0xDC00 && lo <= 0xDFFF) {
++        out.push_back(0x10000 + ((c - 0xD800) << 10) + (lo - 0xDC00));
++        ++i;
++        continue;
++      }
++    }
++    out.push_back(c);
++  }
++  return out;
++}
++
++// Newlines, control chars and non-ASCII never get typos.
++bool IsTypoEligible(char32_t c) {
++  return c >= 0x20 && c < 0x7F;
++}
++
++}  // namespace
++
++KeyboardTypingSession::KeyboardTypingSession(
++    base::WeakPtr<RenderWidgetHostImpl> widget_host,
++    Params params,
++    CompletionCallback callback)
++    : widget_host_(std::move(widget_host)),
++      params_(std::move(params)),
++      callback_(std::move(callback)),
++      rng_(params_.seed) {
++  // The caller clamps the multiplier, but a non-positive value would collapse
++  // every interval, so it is checked again here.
++  if (params_.speed_multiplier <= 0.0) {
++    params_.speed_multiplier = 1.0;
++  }
++  const double inverse = 1.0 / params_.speed_multiplier;
++  auto scale = [inverse](int ms) {
++    return std::max(1, static_cast<int>(std::round(ms * inverse)));
++  };
++  scaled_keystroke_min_ms_ = scale(params_.keystroke_delay_min_ms);
++  scaled_keystroke_max_ms_ =
++      std::max(scaled_keystroke_min_ms_, scale(params_.keystroke_delay_max_ms));
++  scaled_hold_min_ms_ = scale(params_.key_hold_min_ms);
++  scaled_hold_max_ms_ =
++      std::max(scaled_hold_min_ms_, scale(params_.key_hold_max_ms));
++  scaled_thinking_min_ms_ = scale(params_.thinking_pause_min_ms);
++  scaled_thinking_max_ms_ =
++      std::max(scaled_thinking_min_ms_, scale(params_.thinking_pause_max_ms));
++}
++
++KeyboardTypingSession::~KeyboardTypingSession() {
++  if (callback_) {
++    std::move(callback_).Run(false);
++  }
++}
++
++void KeyboardTypingSession::Start() {
++  if (started_) {
++    return;
++  }
++  started_ = true;
++  codepoints_ = DecodeUtf8(params_.text);
++  schedule_.reserve(codepoints_.size() * 3);
++  BuildSchedule();
++
++  if (schedule_.empty()) {
++    Finish(true);
++    return;
++  }
++  dispatch_start_ = base::TimeTicks::Now();
++  DispatchPending();
++}
++
++void KeyboardTypingSession::BuildSchedule() {
++  intended_index_ = 0;
++  cursor_time_ = base::TimeDelta();
++  last_typed_char_ = 0;
++
++  while (intended_index_ < codepoints_.size()) {
++    const char32_t c = codepoints_[intended_index_];
++
++    // A thinking pause may fire before any key, including the first.
++    if (Bernoulli(params_.thinking_pause_probability)) {
++      AdvanceMs(RandInt(scaled_thinking_min_ms_, scaled_thinking_max_ms_));
++    }
++
++    // No inter-key delay before the first key or right after a backspace
++    // burst, where the post-correction pause covers the gap.
++    if (last_typed_char_ != 0) {
++      AdvanceInterKeyDelay(c);
++    }
++
++    // An injected typo consumes intended_index_ itself.
++    if (Bernoulli(params_.typo_probability) && MaybeInjectTypo(c)) {
++      continue;
++    }
++
++    EmitChar(c);
++    intended_index_++;
++  }
++}
++
++void KeyboardTypingSession::EmitChar(char32_t c) {
++  KeyMapping mapping;
++  if (BuildKeyMapping(c, &mapping)) {
++    AppendKeyEvents(mapping.key, mapping.code, mapping.windows_vkey,
++                    mapping.needs_shift ? kModShift : 0, mapping.text);
++    last_typed_char_ = c;
++    return;
++  }
++  // A char outside the static map is dispatched as a keyDown carrying only
++  // the 'text' field, which the DOM routes through the input method path.
++  std::u16string text16;
++  if (c < 0x10000) {
++    text16.push_back(static_cast<char16_t>(c));
++  } else {
++    const char32_t v = c - 0x10000;
++    text16.push_back(static_cast<char16_t>(0xD800 + (v >> 10)));
++    text16.push_back(static_cast<char16_t>(0xDC00 + (v & 0x3FF)));
++  }
++  AppendKeyEvents(/*key=*/std::string(text16.begin(), text16.end()),
++                  /*code=*/"", /*windows_vkey=*/0, /*modifiers=*/0, text16);
++  last_typed_char_ = c;
++}
++
++void KeyboardTypingSession::EmitBackspace() {
++  AppendKeyEvents("Backspace", "Backspace", 8, 0, std::u16string());
++  // A backspace must not anchor a bigram with the next intended char.
++  last_typed_char_ = 0;
++}
++
++size_t KeyboardTypingSession::TypeChunk(size_t start, int max_chars) {
++  size_t position = start;
++  for (int typed = 0; typed < max_chars && position < codepoints_.size();
++       ++typed, ++position) {
++    AdvanceInterKeyDelay(codepoints_[position]);
++    EmitChar(codepoints_[position]);
++  }
++  return position;
++}
++
++void KeyboardTypingSession::EmitBackspaceBurst(int count) {
++  for (int k = 0; k < count; k++) {
++    if (k > 0) {
++      AdvanceMs(RandInt(kBackspaceMinMs, kBackspaceMaxMs));
++    }
++    EmitBackspace();
++  }
++}
++
++void KeyboardTypingSession::RetypeRange(size_t from, size_t to) {
++  for (size_t k = from; k < to; k++) {
++    if (k > from) {
++      AdvanceInterKeyDelay(codepoints_[k]);
++    }
++    EmitChar(codepoints_[k]);
++  }
++}
++
++void KeyboardTypingSession::AppendKeyEvents(const std::string& key,
++                                            const std::string& code,
++                                            int windows_vkey,
++                                            int modifiers,
++                                            const std::u16string& text) {
++  schedule_.push_back({cursor_time_, /*is_key_up=*/false, key, code,
++                       windows_vkey, modifiers, text});
++  cursor_time_ +=
++      base::Milliseconds(RandInt(scaled_hold_min_ms_, scaled_hold_max_ms_));
++  // The keyUp carries no text; the keyDown inserted it.
++  schedule_.push_back({cursor_time_, /*is_key_up=*/true, key, code,
++                       windows_vkey, modifiers, std::u16string()});
++}
++
++void KeyboardTypingSession::AdvanceInterKeyDelay(char32_t next_char) {
++  int min_ms = scaled_keystroke_min_ms_;
++  int max_ms = scaled_keystroke_max_ms_;
++  if (params_.context_aware && last_typed_char_ != 0) {
++    double multiplier = 1.0;
++    if (IsCommonBigram(last_typed_char_, next_char)) {
++      multiplier = 0.7;
++    } else if (last_typed_char_ == next_char) {
++      multiplier = 0.8;
++    } else if (last_typed_char_ == U' ' ||
++               IsAsciiPunctuation(last_typed_char_)) {
++      multiplier = 1.2;
++    }
++    min_ms = std::max(1, static_cast<int>(min_ms * multiplier));
++    max_ms = std::max(min_ms, static_cast<int>(max_ms * multiplier));
++  }
++  AdvanceMs(RandInt(min_ms, max_ms));
++}
++
++void KeyboardTypingSession::AdvanceMs(int ms) {
++  if (ms <= 0) {
++    return;
++  }
++  cursor_time_ += base::Milliseconds(ms);
++}
++
++bool KeyboardTypingSession::MaybeInjectTypo(char32_t intended_char) {
++  if (!IsTypoEligible(intended_char)) {
++    return false;
++  }
++  // Every correction pattern detects the mistake a few chars later, so the
++  // last char of the input never gets a typo.
++  if (intended_index_ + 1 >= codepoints_.size()) {
++    return false;
++  }
++
++  const double roll = RandDouble();
++  if (roll < 0.70) {
++    // Adjacent typo, falling through to the other kinds when the char has no
++    // neighbour in the QWERTY map.
++    if (const char32_t wrong = PickAdjacent(intended_char)) {
++      InjectAdjacentTypo(wrong);
++      return true;
++    }
++  }
++  if (roll < 0.90) {
++    InjectDoubledTypo(intended_char);
++    return true;
++  }
++  InjectOmissionTypo(intended_char);
++  return true;
++}
++
++char32_t KeyboardTypingSession::PickAdjacent(char32_t c) {
++  // The neighbour keeps the source char's shift state: 'A' typos to 'S' or
++  // 'Q', not 's', and '@' to '!' or '#'. Adjacency is looked up on the
++  // unshifted form and the shift re-applied afterwards.
++  char32_t lookup = c;
++  bool to_upper = false;
++  bool was_shifted_digit = false;
++  if (c >= U'A' && c <= U'Z') {
++    lookup = U'a' + (c - U'A');
++    to_upper = true;
++  } else if (const char digit = UnshiftDigitSymbol(c)) {
++    lookup = digit;
++    was_shifted_digit = true;
++  }
++  const std::string_view adjacent = LookupAdjacent(lookup);
++  if (adjacent.empty()) {
++    return 0;
++  }
++  std::uniform_int_distribution<size_t> dist(0, adjacent.size() - 1);
++  const char picked = adjacent[dist(rng_)];
++
++  if (to_upper && picked >= 'a' && picked <= 'z') {
++    return picked - 'a' + 'A';
++  }
++  // A digit neighbour of a shifted symbol maps back to its shifted form; a
++  // letter neighbour stays lowercase, which is a valid typo of its own.
++  if (was_shifted_digit && picked >= '0' && picked <= '9') {
++    return kShiftedDigits[picked - '0'];
++  }
++  return picked;
++}
++
++void KeyboardTypingSession::InjectAdjacentTypo(char32_t wrong_char) {
++  // BuildSchedule already added the inter-key delay for this slot, computed
++  // for the intended char; the wrong key is adjacent, so it is close enough.
++  EmitChar(wrong_char);
++
++  // Keep typing 1..4 intended chars before noticing, as a typist would.
++  size_t position = intended_index_ + 1;
++  const size_t end = TypeChunk(position, RandInt(1, 4));
++  const int typed_after = static_cast<int>(end - position);
++
++  AdvanceMs(RandInt(kRealizePauseMinMs, kRealizePauseMaxMs));
++  // Delete the chars typed after the typo, then the typo itself.
++  EmitBackspaceBurst(typed_after + 1);
++
++  // Recover and re-type [intended_index_, end). The recovery pause covers
++  // the first gap, and the corrected pass never gets a second typo.
++  AdvanceMs(RandInt(kPostCorrectionMinMs, kPostCorrectionMaxMs));
++  RetypeRange(intended_index_, end);
++  intended_index_ = end;
++}
++
++void KeyboardTypingSession::InjectDoubledTypo(char32_t intended_char) {
++  // The char is typed correctly, then again by accident.
++  EmitChar(intended_char);
++  AdvanceInterKeyDelay(intended_char);  // a (c, c) bigram, so fast
++  EmitChar(intended_char);
++
++  const size_t position = intended_index_ + 1;
++  const size_t end = TypeChunk(position, RandInt(1, 4));
++  const int typed_after = static_cast<int>(end - position);
++
++  AdvanceMs(RandInt(kRealizePauseMinMs, kRealizePauseMaxMs));
++  // Delete the duplicate and everything typed after it.
++  EmitBackspaceBurst(typed_after + 1);
++
++  // The correct char is still in the field; re-type only what followed.
++  AdvanceMs(RandInt(kPostCorrectionMinMs, kPostCorrectionMaxMs));
++  RetypeRange(position, end);
++  intended_index_ = end;
++}
++
++void KeyboardTypingSession::InjectOmissionTypo(char32_t intended_char) {
++  // BuildSchedule already added the inter-key delay for intended_char's
++  // slot; the first char after the omission takes that slot, so it gets no
++  // delay of its own.
++  size_t position = intended_index_ + 1;
++  if (position >= codepoints_.size()) {
++    EmitChar(intended_char);
++    intended_index_++;
++    return;
++  }
++  EmitChar(codepoints_[position]);
++  position++;
++  int typed_after = 1;
++  const int detect_target = RandInt(1, 4);
++  while (typed_after < detect_target && position < codepoints_.size()) {
++    AdvanceInterKeyDelay(codepoints_[position]);
++    EmitChar(codepoints_[position]);
++    position++;
++    typed_after++;
++  }
++
++  AdvanceMs(RandInt(kRealizePauseMinMs, kRealizePauseMaxMs));
++  // Only the chars typed after the omission are deleted; the omitted char
++  // was never typed.
++  EmitBackspaceBurst(typed_after);
++
++  // Re-type the omitted char and everything just deleted.
++  AdvanceMs(RandInt(kPostCorrectionMinMs, kPostCorrectionMaxMs));
++  RetypeRange(intended_index_, position);
++  intended_index_ = position;
++}
++
++void KeyboardTypingSession::DispatchPending() {
++  if (!widget_host_) {
++    Finish(false);
++    return;
++  }
++  if (next_index_ >= schedule_.size()) {
++    Finish(true);
++    return;
++  }
++
++  const base::TimeDelta elapsed = base::TimeTicks::Now() - dispatch_start_;
++
++  // Focus the widget, as dispatchKeyEvent does on every call. Cheap when
++  // already focused.
++  widget_host_->Focus();
++
++  while (next_index_ < schedule_.size()) {
++    const ScheduledEvent& ev = schedule_[next_index_];
++    if (ev.time_offset > elapsed + kBatchDispatchSlack) {
++      break;
++    }
++
++    // kKeyDown is what the dispatchKeyEvent path uses for "keyDown": the
++    // renderer generates both the raw key event and the char event from it.
++    const blink::WebInputEvent::Type type =
++        ev.is_key_up ? blink::WebInputEvent::Type::kKeyUp
++                     : blink::WebInputEvent::Type::kKeyDown;
++    int blink_modifiers = blink::WebInputEvent::kFromDebugger;
++    for (const ModifierBit& bit : kModifierBits) {
++      if (ev.modifiers & bit.cdp_bit) {
++        blink_modifiers |= bit.blink_modifier;
++      }
++    }
++
++    input::NativeWebKeyboardEvent event(type, blink_modifiers,
++                                        dispatch_start_ + ev.time_offset);
++    event.windows_key_code = ev.windows_vkey;
++    event.native_key_code = ev.windows_vkey;
++    event.skip_if_unhandled = true;
++    if (!ev.code.empty()) {
++      event.dom_code =
++          static_cast<int>(ui::KeycodeConverter::CodeStringToDomCode(ev.code));
++    }
++    if (!ev.key.empty()) {
++      event.dom_key =
++          static_cast<int>(ui::KeycodeConverter::KeyStringToDomKey(ev.key));
++    }
++    if (!ev.text.empty() &&
++        ev.text.size() < blink::WebKeyboardEvent::kTextLengthCap) {
++      // unmodified_text mirrors text, as for any non-modifier key.
++      std::ranges::copy(ev.text, event.text.begin());
++      std::ranges::copy(ev.text, event.unmodified_text.begin());
++    }
++
++    // The InputInjector path is bypassed: no per-event ack is needed, since
++    // the CDP callback fires once at the end of the session.
++    const base::WeakPtr<KeyboardTypingSession> weak_this =
++        weak_factory_.GetWeakPtr();
++    widget_host_->ForwardKeyboardEventWithCommands(
++        event, ui::LatencyInfo(), std::vector<blink::mojom::EditCommandPtr>());
++    // Dispatch may destroy the session (e.g. Ctrl+W).
++    if (!weak_this) {
++      return;
++    }
++    next_index_++;
++  }
++
++  if (next_index_ >= schedule_.size()) {
++    Finish(true);
++    return;
++  }
++  const base::TimeDelta wait =
++      std::max(schedule_[next_index_].time_offset - elapsed, base::TimeDelta());
++  timer_.Start(FROM_HERE, wait,
++               base::BindOnce(&KeyboardTypingSession::DispatchPending,
++                              weak_factory_.GetWeakPtr()));
++}
++
++void KeyboardTypingSession::Finish(bool success) {
++  timer_.Stop();
++  if (callback_) {
++    std::move(callback_).Run(success);
++  }
++}
++
++int KeyboardTypingSession::RandInt(int min_inclusive, int max_inclusive) {
++  if (max_inclusive <= min_inclusive) {
++    return min_inclusive;
++  }
++  std::uniform_int_distribution<int> dist(min_inclusive, max_inclusive);
++  return dist(rng_);
++}
++
++double KeyboardTypingSession::RandDouble() {
++  std::uniform_real_distribution<double> dist(0.0, 1.0);
++  return dist(rng_);
++}
++
++bool KeyboardTypingSession::Bernoulli(double p) {
++  if (p <= 0.0) {
++    return false;
++  }
++  if (p >= 1.0) {
++    return true;
++  }
++  return RandDouble() < p;
++}
++
++}  // namespace content
+diff --git a/content/browser/devtools/protocol/keyboard_typing_session.h b/content/browser/devtools/protocol/keyboard_typing_session.h
+new file mode 100644
+index 0000000000..458792f796
+--- /dev/null
++++ b/content/browser/devtools/protocol/keyboard_typing_session.h
+@@ -0,0 +1,165 @@
++// Copyright 2026 The browser Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CONTENT_BROWSER_DEVTOOLS_PROTOCOL_KEYBOARD_TYPING_SESSION_H_
++#define CONTENT_BROWSER_DEVTOOLS_PROTOCOL_KEYBOARD_TYPING_SESSION_H_
++
++#include <cstdint>
++#include <random>
++#include <string>
++#include <vector>
++
++#include "base/functional/callback.h"
++#include "base/memory/weak_ptr.h"
++#include "base/time/time.h"
++#include "base/timer/timer.h"
++
++namespace content {
++
++class RenderWidgetHostImpl;
++
++// Drives the typing animation behind Input.dispatchKeystrokes. The session
++// precomputes the full event schedule from the input text, including any
++// injected typos and their corrections, then walks it on the UI thread with a
++// base::OneShotTimer, dispatching keyDown / keyUp events straight to
++// RenderWidgetHostImpl::ForwardKeyboardEventWithCommands.
++//
++// Dispatching from the browser process is the point: with one
++// Input.dispatchKeyEvent per key, every keystroke pays a serialization and
++// ack round trip, which caps the achievable typing rate.
++//
++// One session serves one CDP call. InputHandler owns it; destroying it
++// mid-stream stops the timer and runs the completion callback with
++// success=false, which fails the CDP call.
++class KeyboardTypingSession {
++ public:
++  struct Params {
++    // UTF-8 text to type. '\n' maps to Enter.
++    std::string text;
++    // Divides every time interval (delays, holds, pauses). 1.0 is the
++    // baseline; larger values type faster.
++    double speed_multiplier = 1.0;
++    // Inter-keystroke delay range in ms, before speed scaling.
++    int keystroke_delay_min_ms = 60;
++    int keystroke_delay_max_ms = 260;
++    // Key hold range in ms between keyDown and keyUp.
++    int key_hold_min_ms = 20;
++    int key_hold_max_ms = 55;
++    // Whether bigram / repeat / punctuation timing adjustments apply.
++    bool context_aware = true;
++    // Per-character probability of a "thinking pause" before the key.
++    double thinking_pause_probability = 0.0;
++    int thinking_pause_min_ms = 300;
++    int thinking_pause_max_ms = 800;
++    // Per-character probability of injecting a typo. 0 disables typos.
++    double typo_probability = 0.0;
++    // RNG seed. The same seed, params and text give the same schedule.
++    uint64_t seed = 0;
++  };
++
++  // Runs once, with success=true when the schedule completed and false when
++  // the session aborted (widget destroyed mid-stream, session cancelled).
++  using CompletionCallback = base::OnceCallback<void(bool success)>;
++
++  KeyboardTypingSession(base::WeakPtr<RenderWidgetHostImpl> widget_host,
++                        Params params,
++                        CompletionCallback callback);
++
++  KeyboardTypingSession(const KeyboardTypingSession&) = delete;
++  KeyboardTypingSession& operator=(const KeyboardTypingSession&) = delete;
++
++  // Runs the completion callback with success=false if it has not fired.
++  ~KeyboardTypingSession();
++
++  // Begins dispatching. Must be called exactly once. The session may finish
++  // synchronously inside this call if the schedule is empty.
++  void Start();
++
++ private:
++  struct ScheduledEvent {
++    base::TimeDelta time_offset;  // from session start
++    bool is_key_up = false;
++    std::string key;   // DOM 'key' string, e.g. "a", "Backspace"
++    std::string code;  // DOM 'code' string, e.g. "KeyA"
++    int windows_vkey = 0;
++    int modifiers = 0;    // CDP modifier bits: alt=1, ctrl=2, meta=4, shift=8
++    std::u16string text;  // only set for the keyDown of printable chars
++  };
++
++  // Schedule generation, run from Start().
++  void BuildSchedule();
++  void EmitChar(char32_t c);
++  void EmitBackspace();
++  void AppendKeyEvents(const std::string& key,
++                       const std::string& code,
++                       int windows_vkey,
++                       int modifiers,
++                       const std::u16string& text);
++  // Adds the inter-key delay between the previous key and the next keyDown.
++  void AdvanceInterKeyDelay(char32_t next_char);
++  void AdvanceMs(int ms);
++  // Types up to `max_chars` codepoints from `start`, each after an inter-key
++  // delay, stopping at the end of the input. Returns the position after the
++  // last typed codepoint.
++  size_t TypeChunk(size_t start, int max_chars);
++  // Emits `count` backspaces with fast inter-key gaps.
++  void EmitBackspaceBurst(int count);
++  // Re-types the codepoints in [from, to) without an inter-key delay before
++  // the first one; the caller's recovery pause covers that gap.
++  void RetypeRange(size_t from, size_t to);
++
++  // Typo injection. Each moves intended_index_ past the consumed characters.
++  // MaybeInjectTypo returns true when a typo was injected, in which case the
++  // caller skips its own emit.
++  bool MaybeInjectTypo(char32_t intended_char);
++  void InjectAdjacentTypo(char32_t wrong_char);
++  void InjectDoubledTypo(char32_t intended_char);
++  void InjectOmissionTypo(char32_t intended_char);
++  // Picks a QWERTY neighbour of `c`, keeping its shift state. Returns 0 when
++  // no adjacency is known.
++  char32_t PickAdjacent(char32_t c);
++
++  // Dispatch loop, run from the timer.
++  void DispatchPending();
++  void Finish(bool success);
++
++  int RandInt(int min_inclusive, int max_inclusive);
++  double RandDouble();  // [0.0, 1.0)
++  bool Bernoulli(double p);
++
++  base::WeakPtr<RenderWidgetHostImpl> widget_host_;
++  Params params_;
++  CompletionCallback callback_;
++
++  std::mt19937_64 rng_;
++  std::vector<ScheduledEvent> schedule_;
++  size_t next_index_ = 0;
++
++  // params_.text decoded to UTF-32, one entry per codepoint. Drives schedule
++  // generation only.
++  std::vector<char32_t> codepoints_;
++  // Position in codepoints_ currently being scheduled.
++  size_t intended_index_ = 0;
++  // The previously typed char, typos included, for the context-aware bigram
++  // timing. Zero before the first key and after a backspace burst.
++  char32_t last_typed_char_ = 0;
++  // Cursor in the schedule timeline: the next appended event fires here.
++  base::TimeDelta cursor_time_;
++  // Speed-scaled versions of the params_ time ranges.
++  int scaled_keystroke_min_ms_ = 1;
++  int scaled_keystroke_max_ms_ = 1;
++  int scaled_hold_min_ms_ = 0;
++  int scaled_hold_max_ms_ = 0;
++  int scaled_thinking_min_ms_ = 0;
++  int scaled_thinking_max_ms_ = 0;
++
++  base::TimeTicks dispatch_start_;
++  base::OneShotTimer timer_;
++  bool started_ = false;
++  base::WeakPtrFactory<KeyboardTypingSession> weak_factory_{this};
++};
++
++}  // namespace content
++
++#endif  // CONTENT_BROWSER_DEVTOOLS_PROTOCOL_KEYBOARD_TYPING_SESSION_H_
+diff --git a/content/browser/devtools/protocol_config.json b/content/browser/devtools/protocol_config.json
+index 8a0121200f..3616df4b9d 100644
+--- a/content/browser/devtools/protocol_config.json
++++ b/content/browser/devtools/protocol_config.json
+@@ -76,7 +76,7 @@
+             },
+             {
+                 "domain": "Input",
+-                "async": ["dispatchKeyEvent", "insertText", "imeSetComposition", "dispatchMouseEvent", "dispatchDragEvent", "dispatchTouchEvent", "cancelDragging", "synthesizePinchGesture", "synthesizeScrollGesture", "synthesizeTapGesture"]
++                "async": ["dispatchKeyEvent", "dispatchKeystrokes", "insertText", "imeSetComposition", "dispatchMouseEvent", "dispatchMousePath", "dispatchDragEvent", "dispatchTouchEvent", "cancelDragging", "synthesizePinchGesture", "synthesizeScrollGesture", "synthesizeTapGesture"]
+             },
+             {
+                 "domain": "Inspector"
+@@ -155,14 +155,14 @@
+             },
+             {
+                 "domain": "Page",
+-                "include": ["enable", "disable", "reload", "navigate", "stopLoading", "getNavigationHistory", "navigateToHistoryEntry", "resetNavigationHistory", "captureScreenshot",
++                "include": ["enable", "disable", "reload", "navigate", "stopLoading", "getNavigationHistory", "navigateToHistoryEntry", "resetNavigationHistory", "captureScreenshot", "captureAgentSnapshot", "resolveAgentNode",
+                     "startScreencast", "stopScreencast", "startScreenRecording", "stopScreenRecording", "screencastFrameAck", "handleJavaScriptDialog", "setColorPickerEnabled",
+                     "bringToFront", "setDownloadBehavior", "getAppManifest", "crash", "close", "setWebLifecycleState", "captureSnapshot", "getInstallabilityErrors", "getManifestIcons", "setBypassCSP", "getAppId", "addCompilationCache", "setPrerenderingAllowed", "getAnnotatedPageContent",
+                     "addScriptToEvaluateOnNewDocument", "removeScriptToEvaluateOnNewDocument", "addScriptToEvaluateOnLoad", "removeScriptToEvaluateOnLoad"],
+                 "include_events": ["frameDetached", "colorPicked", "interstitialShown", "interstitialHidden", "javascriptDialogOpening",
+                      "javascriptDialogClosed", "downloadWillBegin", "downloadProgress", "screencastVisibilityChanged", "screencastFrame",
+                      "backForwardCacheNotUsed", "frameStartedLoading", "frameStoppedLoading", "frameStartedNavigating"],
+-                "async": ["captureScreenshot", "navigate", "getAppManifest", "reload", "captureSnapshot", "getInstallabilityErrors", "getManifestIcons", "getAppId", "getAnnotatedPageContent", "stopScreenRecording"]
++                "async": ["captureScreenshot", "captureAgentSnapshot", "resolveAgentNode", "navigate", "getAppManifest", "reload", "captureSnapshot", "getInstallabilityErrors", "getManifestIcons", "getAppId", "getAnnotatedPageContent", "stopScreenRecording"]
+             },
+             {
+                 "domain": "Preload",
+diff --git a/third_party/blink/public/devtools_protocol/domains/Input.pdl b/third_party/blink/public/devtools_protocol/domains/Input.pdl
+index 815bf7c414..7f47629ee8 100644
+--- a/third_party/blink/public/devtools_protocol/domains/Input.pdl
++++ b/third_party/blink/public/devtools_protocol/domains/Input.pdl
+@@ -138,6 +138,43 @@ domain Input
+       # See https://source.chromium.org/chromium/chromium/src/+/main:third_party/blink/renderer/core/editing/commands/editor_command_names.h for valid command names.
+       experimental optional array of string commands
+ 
++  # Types a string with realistic timing and optional typos and corrections.
++  # One call replaces a per-key dispatchKeyEvent loop, so per-key round-trip
++  # latency cannot limit the typing rate. Scheduling and dispatch happen in
++  # the browser process; the call returns once the full schedule has run.
++  experimental command dispatchKeystrokes
++    parameters
++      # Text to type. May contain '\n' (mapped to Enter). Non-ASCII chars
++      # are dispatched as text-only key events with no virtual key code.
++      string text
++      # Multiplies all time intervals (> 0). 1.0 is baseline typing speed;
++      # values > 1 type faster. Default 1.0.
++      optional number speedMultiplier
++      # Inter-keystroke delay range (ms), before speed scaling. Defaults
++      # are 60 / 260.
++      optional integer keystrokeDelayMin
++      optional integer keystrokeDelayMax
++      # Key hold duration range (ms) between keyDown and keyUp. Real
++      # hardware holds keys for ~30-50ms; the default range mirrors that.
++      optional integer keyHoldMin
++      optional integer keyHoldMax
++      # When true, applies bigram / repeat / punctuation timing
++      # adjustments (common English bigrams 30% faster, repeats 20% faster,
++      # post-space/punctuation 20% slower). Default true.
++      optional boolean contextAware
++      # Per-character chance of a "thinking pause" before the keystroke.
++      # Default 0 (no pauses).
++      optional number thinkingPauseProbability
++      optional integer thinkingPauseMin
++      optional integer thinkingPauseMax
++      # Per-character chance of injecting a typo + correction sequence.
++      # Default 0 (no typos). Realistic values are around 0.01 - 0.03.
++      optional number typoProbability
++      # RNG seed for deterministic typo placement. Same seed + same params
++      # + same text produces the same event schedule. Default: a fresh
++      # time-derived seed each call.
++      optional number seed
++
+   # This method emulates inserting text that doesn't come from a key press,
+   # for example an emoji keyboard or an IME.
+   experimental command insertText
+@@ -206,6 +243,29 @@ domain Input
+         mouse
+         pen
+ 
++  # A point along a mouse movement path.
++  experimental type MousePathPoint extends object
++    properties
++      # X coordinate relative to the main frame's viewport in CSS pixels.
++      number x
++      # Y coordinate relative to the main frame's viewport in CSS pixels.
++      number y
++
++  # Dispatches mouseMoved events along a path at a fixed polling rate, as a
++  # synthetic gesture targeted at the frame under each point.
++  experimental command dispatchMousePath
++    parameters
++      # Array of positions to move through in sequence.
++      array of MousePathPoint path
++      # Hardware polling rate in Hz (e.g. 125, 500, 1000). Events are dispatched
++      # at a fixed interval of 1000/pollingRateHz milliseconds.
++      integer pollingRateHz
++      # Button held for the duration of the path (default "none"). Without a
++      # held button the moves are hovers: no drag starts and no pointer
++      # capture is granted, so a native control stays where the press landed.
++      # Set this to drag along the path.
++      optional MouseButton button
++
+   # Dispatches a touch event to the page.
+   command dispatchTouchEvent
+     parameters

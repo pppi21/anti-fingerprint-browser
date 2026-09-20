@@ -1,0 +1,172 @@
+From bd938b253fa025bbc39d77beac6dbf3d7acb89b7 Mon Sep 17 00:00:00 2001
+From: Leo Rodarte <leorodarte07@gmail.com>
+Date: Sat, 19 Sep 2026 23:45:19 -0400
+Subject: [PATCH 11/41] battery
+
+Battery status spoof.
+---
+ .../blink/renderer/modules/battery/BUILD.gn   |   5 +-
+ .../modules/battery/battery_manager.cc        | 112 +++++++++++++++++-
+ 2 files changed, 112 insertions(+), 5 deletions(-)
+
+diff --git a/third_party/blink/renderer/modules/battery/BUILD.gn b/third_party/blink/renderer/modules/battery/BUILD.gn
+index a648fb3384..f010e1e95d 100644
+--- a/third_party/blink/renderer/modules/battery/BUILD.gn
++++ b/third_party/blink/renderer/modules/battery/BUILD.gn
+@@ -13,5 +13,8 @@ blink_modules_sources("battery") {
+     "battery_status.h",
+   ]
+ 
+-  deps = [ "//services/service_manager/public/cpp" ]
++  deps = [
++    "//components/browser:browser_switches",
++    "//services/service_manager/public/cpp",
++  ]
+ }
+diff --git a/third_party/blink/renderer/modules/battery/battery_manager.cc b/third_party/blink/renderer/modules/battery/battery_manager.cc
+index 51cdc75cee..4be982de47 100644
+--- a/third_party/blink/renderer/modules/battery/battery_manager.cc
++++ b/third_party/blink/renderer/modules/battery/battery_manager.cc
+@@ -4,6 +4,15 @@
+ 
+ #include "third_party/blink/renderer/modules/battery/battery_manager.h"
+ 
++#include <limits>
++#include <optional>
++
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_split.h"
++#include "base/strings/string_util.h"
++#include "components/browser/browser_switches.h"
++#include "components/browser/fingerprint_pool.h"
++#include "components/browser/switch_resolver.h"
+ #include "third_party/blink/public/mojom/frame/lifecycle.mojom-blink.h"
+ #include "third_party/blink/renderer/core/dom/dom_exception.h"
+ #include "third_party/blink/renderer/core/dom/events/event.h"
+@@ -14,6 +23,94 @@
+ #include "third_party/blink/renderer/core/frame/web_feature.h"
+ #include "third_party/blink/renderer/modules/battery/battery_dispatcher.h"
+ 
++namespace {
++
++// browser: the battery status reported to pages, resolved once per process
++// from --fingerprint-battery ("charging,level,chargingTime,dischargingTime",
++// "auto", "seed:<N>" or inherited from --fingerprint-seed).
++struct BatteryOverride {
++  bool active = false;
++  bool charging = false;
++  double level = 0;
++  double charging_time = 0;
++  double discharging_time = 0;
++};
++
++constexpr double kInfinity = std::numeric_limits<double>::infinity();
++
++bool ParseSeconds(const std::string& value, double* out) {
++  if (base::EqualsCaseInsensitiveASCII(value, "infinity")) {
++    *out = kInfinity;
++    return true;
++  }
++  return base::StringToDouble(value, out);
++}
++
++std::optional<BatteryOverride> ParseExplicitBattery(const std::string& value) {
++  std::vector<std::string> parts = base::SplitString(
++      value, ",", base::TRIM_WHITESPACE, base::SPLIT_WANT_NONEMPTY);
++  if (parts.size() != 4) {
++    return std::nullopt;
++  }
++  BatteryOverride result;
++  result.active = true;
++  result.charging =
++      base::EqualsCaseInsensitiveASCII(parts[0], "true") || parts[0] == "1";
++  if (!base::StringToDouble(parts[1], &result.level) ||
++      !ParseSeconds(parts[2], &result.charging_time) ||
++      !ParseSeconds(parts[3], &result.discharging_time)) {
++    return std::nullopt;
++  }
++  return result;
++}
++
++// Desktops are always plugged in and full; laptops sample a charge state,
++// level and time from the seed.
++BatteryOverride DeriveBatteryFromSeed(int32_t seed) {
++  const browser::FingerprintProfile* profile = browser::ProfileForSeed(seed);
++  if (!profile || profile->device_type.empty()) {
++    return BatteryOverride();
++  }
++  if (profile->device_type == "desktop") {
++    return {true, /*charging=*/true, /*level=*/1.0, /*charging_time=*/0.0,
++            kInfinity};
++  }
++
++  // Laptop: 70% charging.
++  const bool charging = browser::DeterministicBucket(
++                            seed, browser::kSaltBatteryCharging, 100) < 70;
++  if (charging) {
++    // Level in [0.5, 1.0] in 0.01 steps; a full battery has no charging time.
++    const double level = 0.5 + browser::DeterministicBucket(
++                                   seed, browser::kSaltBatteryLevel, 51) *
++                                   0.01;
++    const double charging_time =
++        level >= 1.0 ? 0.0
++                     : browser::DeterministicBucket(
++                           seed, browser::kSaltBatteryTime, 3601);
++    return {true, true, level, charging_time, kInfinity};
++  }
++  // Laptop on battery: level in [0.2, 0.95], discharging in [1800, 28800).
++  const double level =
++      0.2 +
++      browser::DeterministicBucket(seed, browser::kSaltBatteryLevel, 76) * 0.01;
++  const double discharging_time =
++      1800 +
++      browser::DeterministicBucket(seed, browser::kSaltBatteryTime, 27001);
++  return {true, false, level, kInfinity, discharging_time};
++}
++
++const BatteryOverride& GetBatteryOverride() {
++  static const BatteryOverride resolved =
++      browser::ResolveSwitch<BatteryOverride>(
++          switches::kFingerprintBattery, ParseExplicitBattery,
++          DeriveBatteryFromSeed, BatteryOverride())
++          .value;
++  return resolved;
++}
++
++}  // namespace
++
+ namespace blink {
+ 
+ const char BatteryManager::kSupplementName[] = "BatteryManager";
+@@ -79,20 +176,27 @@ ScriptPromise<BatteryManager> BatteryManager::StartRequest(
+   return battery_property_->Promise(script_state->World());
+ }
+ 
++// browser: the spoofed status replaces the real one in the four getters.
+ bool BatteryManager::charging() {
+-  return battery_status_.Charging();
++  const BatteryOverride& spoof = GetBatteryOverride();
++  return spoof.active ? spoof.charging : battery_status_.Charging();
+ }
+ 
+ double BatteryManager::chargingTime() {
+-  return battery_status_.charging_time().InSecondsF();
++  const BatteryOverride& spoof = GetBatteryOverride();
++  return spoof.active ? spoof.charging_time
++                      : battery_status_.charging_time().InSecondsF();
+ }
+ 
+ double BatteryManager::dischargingTime() {
+-  return battery_status_.discharging_time().InSecondsF();
++  const BatteryOverride& spoof = GetBatteryOverride();
++  return spoof.active ? spoof.discharging_time
++                      : battery_status_.discharging_time().InSecondsF();
+ }
+ 
+ double BatteryManager::level() {
+-  return battery_status_.Level();
++  const BatteryOverride& spoof = GetBatteryOverride();
++  return spoof.active ? spoof.level : battery_status_.Level();
+ }
+ 
+ void BatteryManager::DidUpdateData() {

@@ -1,0 +1,60 @@
+From 2041991887fbd5ff9a99f0b76ec706247c9a4764 Mon Sep 17 00:00:00 2001
+From: Leo Rodarte <leorodarte07@gmail.com>
+Date: Sat, 19 Sep 2026 23:45:39 -0400
+Subject: [PATCH 22/41] version-blocklist
+
+Runtime-feature version blocklist parity.
+---
+ content/child/runtime_features.cc | 25 +++++--------------------
+ 1 file changed, 5 insertions(+), 20 deletions(-)
+
+diff --git a/content/child/runtime_features.cc b/content/child/runtime_features.cc
+index 95b2766f0a..78f328b438 100644
+--- a/content/child/runtime_features.cc
++++ b/content/child/runtime_features.cc
+@@ -14,7 +14,6 @@
+ #include "base/memory/raw_ref.h"
+ #include "base/metrics/field_trial.h"
+ #include "base/metrics/field_trial_params.h"
+-#include "base/strings/string_number_conversions.h"
+ #include "base/strings/string_util.h"
+ #include "build/build_config.h"
+ #include "cc/base/features.h"
+@@ -372,9 +371,9 @@ void SetRuntimeFeaturesFromCommandLine(const base::CommandLine& command_line) {
+       {wrf::EnableTimerThrottlingForBackgroundTabs,
+        switches::kDisableBackgroundTimerThrottling, false},
+       // End of Stable Features
+-      {wrf::EnableAutomationControlled, switches::kEnableAutomation, true},
+-      {wrf::EnableAutomationControlled, switches::kHeadless, true},
+-      {wrf::EnableAutomationControlled, switches::kRemoteDebuggingPipe, true},
++      // browser: AutomationControlled is never enabled from the command
++      // line (--enable-automation, --headless, --remote-debugging-pipe), so
++      // navigator.webdriver stays false.
+       {wrf::EnableFileSystem, switches::kDisableFileSystem, false},
+       {wrf::EnableNetInfoDownlinkMax,
+        switches::kEnableNetworkInformationDownlinkMax, true},
+@@ -415,22 +414,8 @@ void SetRuntimeFeaturesFromCommandLine(const base::CommandLine& command_line) {
+     }
+   }
+ 
+-  // Set EnableAutomationControlled if the caller passes
+-  // --remote-debugging-port=0 on the command line. This means
+-  // the caller has requested an ephemeral port which is how ChromeDriver
+-  // launches the browser by default.
+-  // If the caller provides a specific port number, this is
+-  // more likely for attaching a debugger, so we should leave
+-  // EnableAutomationControlled unset to ensure the browser behaves as it does
+-  // when not under automation control.
+-  if (command_line.HasSwitch(switches::kRemoteDebuggingPort)) {
+-    std::string port_str =
+-        command_line.GetSwitchValueASCII(::switches::kRemoteDebuggingPort);
+-    int port;
+-    if (base::StringToInt(port_str, &port) && port == 0) {
+-      WebRuntimeFeatures::EnableAutomationControlled(true);
+-    }
+-  }
++  // browser: --remote-debugging-port=0, ChromeDriver's default, does not
++  // enable AutomationControlled either.
+ }
+ 
+ // Sets blink runtime features that depend on a combination

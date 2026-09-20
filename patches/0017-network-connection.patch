@@ -1,0 +1,364 @@
+From 4378450a4561f1ef4905d643735921aa20765fe5 Mon Sep 17 00:00:00 2001
+From: Leo Rodarte <leorodarte07@gmail.com>
+Date: Sat, 19 Sep 2026 23:45:29 -0400
+Subject: [PATCH 17/41] network-connection
+
+NetInfo/connection + client-hints override.
+---
+ components/browser/connection_override.cc     | 76 +++++++++++++++
+ components/browser/connection_override.h      | 35 +++++++
+ content/browser/client_hints/client_hints.cc  | 33 +++++++
+ .../blink/renderer/modules/netinfo/BUILD.gn   |  1 +
+ .../modules/netinfo/network_information.cc    | 95 +++++++++++++++++++
+ 5 files changed, 240 insertions(+)
+ create mode 100644 components/browser/connection_override.cc
+ create mode 100644 components/browser/connection_override.h
+
+diff --git a/components/browser/connection_override.cc b/components/browser/connection_override.cc
+new file mode 100644
+index 0000000000..93671c6979
+--- /dev/null
++++ b/components/browser/connection_override.cc
+@@ -0,0 +1,76 @@
++// Copyright 2026 The browser Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/browser/connection_override.h"
++
++#include <optional>
++#include <string>
++#include <vector>
++
++#include "base/no_destructor.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_split.h"
++#include "base/strings/string_util.h"
++#include "components/browser/browser_switches.h"
++#include "components/browser/switch_resolver.h"
++
++namespace browser {
++
++namespace {
++
++std::optional<ConnectionOverride> ParseExplicit(const std::string& value) {
++  std::vector<std::string> parts = base::SplitString(
++      value, ",", base::TRIM_WHITESPACE, base::SPLIT_WANT_NONEMPTY);
++  if (parts.size() != 5) {
++    return std::nullopt;
++  }
++  ConnectionOverride result;
++  result.active = true;
++  result.effective_type = parts[0];
++  unsigned rtt_ms = 0;
++  if (!base::StringToDouble(parts[1], &result.downlink_mbps) ||
++      !base::StringToUint(parts[2], &rtt_ms)) {
++    return std::nullopt;
++  }
++  result.rtt_ms = rtt_ms;
++  result.save_data = base::EqualsCaseInsensitiveASCII(parts[3], "true");
++  result.connection_type = parts[4];
++  return result;
++}
++
++// 65% wifi, 35% ethernet, each with its own plausible downlink and RTT
++// range. effectiveType is always "4g", as modern broadband presents to the
++// API, and saveData is always false.
++ConnectionOverride DeriveFromSeed(int32_t seed) {
++  const bool is_wifi = DeterministicBucket(seed, kSaltConnectionType, 100) < 65;
++
++  // Downlink in Mbps: wifi [15, 50), ethernet [50, 100), on a 100-step grid.
++  const double downlink_base = is_wifi ? 15.0 : 50.0;
++  const double downlink_range = is_wifi ? 35.0 : 50.0;
++  const double downlink_mbps =
++      downlink_base + DeterministicBucket(seed, kSaltConnectionDownlink, 100) *
++                          (downlink_range / 100.0);
++
++  // RTT in ms: wifi [50, 150), ethernet [20, 80).
++  const uint32_t rtt_base = is_wifi ? 50u : 20u;
++  const uint32_t rtt_range = is_wifi ? 100u : 60u;
++  const uint32_t rtt_ms =
++      rtt_base + DeterministicBucket(seed, kSaltConnectionRtt, rtt_range);
++
++  return ConnectionOverride{true,   "4g",  downlink_mbps,
++                            rtt_ms, false, is_wifi ? "wifi" : "ethernet"};
++}
++
++}  // namespace
++
++const ConnectionOverride& GetConnectionOverride() {
++  static const base::NoDestructor<ConnectionOverride> resolved(
++      ResolveSwitch<ConnectionOverride>(switches::kFingerprintConnection,
++                                        ParseExplicit, DeriveFromSeed,
++                                        ConnectionOverride())
++          .value);
++  return *resolved;
++}
++
++}  // namespace browser
+diff --git a/components/browser/connection_override.h b/components/browser/connection_override.h
+new file mode 100644
+index 0000000000..a940d5bfce
+--- /dev/null
++++ b/components/browser/connection_override.h
+@@ -0,0 +1,35 @@
++// Copyright 2026 The browser Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_BROWSER_CONNECTION_OVERRIDE_H_
++#define COMPONENTS_BROWSER_CONNECTION_OVERRIDE_H_
++
++#include <cstdint>
++#include <string>
++
++#include "base/component_export.h"
++
++namespace browser {
++
++// The network conditions reported to pages, shared by navigator.connection
++// in the renderer and by the Downlink, RTT and ECT client hints in the
++// browser so the two agree. Resolved once per process from
++// --fingerprint-connection ("effectiveType,downlink,rtt,saveData,type",
++// e.g. "4g,10,50,false,wifi"; "auto", "seed:<N>" or inherited from
++// --fingerprint-seed; see switch_resolver.h). `active` is false when nothing
++// is spoofed and callers keep the stock NetworkQualityEstimator path.
++struct ConnectionOverride {
++  bool active = false;
++  std::string effective_type;  // "slow-2g", "2g", "3g" or "4g"
++  double downlink_mbps = 0.0;
++  uint32_t rtt_ms = 0;
++  bool save_data = false;
++  std::string connection_type;  // "wifi", "ethernet", "cellular", ...
++};
++
++COMPONENT_EXPORT(BROWSER) const ConnectionOverride& GetConnectionOverride();
++
++}  // namespace browser
++
++#endif  // COMPONENTS_BROWSER_CONNECTION_OVERRIDE_H_
+diff --git a/content/browser/client_hints/client_hints.cc b/content/browser/client_hints/client_hints.cc
+index ca7e3fd77f..61c43a63ba 100644
+--- a/content/browser/client_hints/client_hints.cc
++++ b/content/browser/client_hints/client_hints.cc
+@@ -20,6 +20,7 @@
+ #include "base/strings/string_util.h"
+ #include "base/time/time.h"
+ #include "build/build_config.h"
++#include "components/browser/connection_override.h"
+ #include "content/browser/devtools/devtools_instrumentation.h"
+ #include "content/browser/preloading/prerender/prerender_host.h"
+ #include "content/browser/renderer_host/frame_tree.h"
+@@ -387,6 +388,17 @@ void AddRttHeader(net::HttpRequestHeaders* headers,
+                   const GURL& url) {
+   DCHECK(headers);
+ 
++  // browser: the RTT hint follows --fingerprint-connection, like
++  // navigator.connection.rtt in the renderer; this HTTP path reads the
++  // NetworkQualityEstimator directly and would otherwise leak the real RTT.
++  if (const browser::ConnectionOverride& spoof =
++          browser::GetConnectionOverride();
++      spoof.active) {
++    SetHeaderToInt(headers, WebClientHintsType::kRtt_DEPRECATED,
++                   static_cast<int>(spoof.rtt_ms));
++    return;
++  }
++
+   std::optional<net::EffectiveConnectionType> web_holdback_ect =
+       GetWebHoldbackEffectiveConnectionType();
+ 
+@@ -408,6 +420,16 @@ void AddDownlinkHeader(net::HttpRequestHeaders* headers,
+                        network::NetworkQualityTracker* network_quality_tracker,
+                        const GURL& url) {
+   DCHECK(headers);
++
++  // browser: see AddRttHeader.
++  if (const browser::ConnectionOverride& spoof =
++          browser::GetConnectionOverride();
++      spoof.active) {
++    SetHeaderToDouble(headers, WebClientHintsType::kDownlink_DEPRECATED,
++                      spoof.downlink_mbps);
++    return;
++  }
++
+   std::optional<net::EffectiveConnectionType> web_holdback_ect =
+       GetWebHoldbackEffectiveConnectionType();
+ 
+@@ -435,6 +457,17 @@ void AddEctHeader(net::HttpRequestHeaders* headers,
+                   const GURL& url) {
+   DCHECK(headers);
+ 
++  // browser: see AddRttHeader. The effective type is passed through: the
++  // switch takes the spec's strings, which are the ones in
++  // network::kWebEffectiveConnectionTypeMapping.
++  if (const browser::ConnectionOverride& spoof =
++          browser::GetConnectionOverride();
++      spoof.active) {
++    SetHeaderToString(headers, WebClientHintsType::kEct_DEPRECATED,
++                      spoof.effective_type);
++    return;
++  }
++
+   std::optional<net::EffectiveConnectionType> web_holdback_ect =
+       GetWebHoldbackEffectiveConnectionType();
+ 
+diff --git a/third_party/blink/renderer/modules/netinfo/BUILD.gn b/third_party/blink/renderer/modules/netinfo/BUILD.gn
+index 30e5c847ca..2c04c8ee99 100644
+--- a/third_party/blink/renderer/modules/netinfo/BUILD.gn
++++ b/third_party/blink/renderer/modules/netinfo/BUILD.gn
+@@ -9,4 +9,5 @@ blink_modules_sources("netinfo") {
+     "network_information.cc",
+     "network_information.h",
+   ]
++  deps = [ "//components/browser:browser_switches" ]
+ }
+diff --git a/third_party/blink/renderer/modules/netinfo/network_information.cc b/third_party/blink/renderer/modules/netinfo/network_information.cc
+index 976a3c8c36..009cc8106b 100644
+--- a/third_party/blink/renderer/modules/netinfo/network_information.cc
++++ b/third_party/blink/renderer/modules/netinfo/network_information.cc
+@@ -5,8 +5,11 @@
+ #include "third_party/blink/renderer/modules/netinfo/network_information.h"
+ 
+ #include <algorithm>
++#include <optional>
++#include <string_view>
+ 
+ #include "base/time/time.h"
++#include "components/browser/connection_override.h"
+ #include "third_party/blink/public/mojom/devtools/console_message.mojom-blink.h"
+ #include "third_party/blink/public/platform/task_type.h"
+ #include "third_party/blink/renderer/bindings/modules/v8/v8_connection_type.h"
+@@ -73,6 +76,69 @@ String GetConsoleLogStringForWebHoldback() {
+          "and so may be inaccurate";
+ }
+ 
++// browser: the spoofed navigator.connection values, mapped once from the
++// shared override (components/browser/connection_override.h) to the V8
++// enums and cached so the getters cost a field read, as in stock.
++struct ConnectionOverride {
++  V8ConnectionType::Enum connection_type;
++  V8EffectiveConnectionType::Enum effective_type;
++  double downlink_mbps;
++  uint32_t rtt_ms;
++  bool save_data;
++};
++
++struct EffectiveTypeName {
++  std::string_view name;
++  V8EffectiveConnectionType::Enum type;
++};
++constexpr EffectiveTypeName kEffectiveTypeNames[] = {
++    {"slow-2g", V8EffectiveConnectionType::Enum::kSlow2G},
++    {"2g", V8EffectiveConnectionType::Enum::k2G},
++    {"3g", V8EffectiveConnectionType::Enum::k3G},
++    {"4g", V8EffectiveConnectionType::Enum::k4G},
++};
++
++struct ConnectionTypeName {
++  std::string_view name;
++  V8ConnectionType::Enum type;
++};
++constexpr ConnectionTypeName kConnectionTypeNames[] = {
++    {"wifi", V8ConnectionType::Enum::kWifi},
++    {"ethernet", V8ConnectionType::Enum::kEthernet},
++    {"cellular", V8ConnectionType::Enum::kCellular},
++    {"bluetooth", V8ConnectionType::Enum::kBluetooth},
++    {"wimax", V8ConnectionType::Enum::kWimax},
++    {"none", V8ConnectionType::Enum::kNone},
++};
++
++const std::optional<ConnectionOverride>& CachedConnectionOverride() {
++  static const std::optional<ConnectionOverride> spoof =
++      []() -> std::optional<ConnectionOverride> {
++    const browser::ConnectionOverride& raw = browser::GetConnectionOverride();
++    if (!raw.active) {
++      return std::nullopt;
++    }
++    ConnectionOverride result;
++    result.effective_type = V8EffectiveConnectionType::Enum::k4G;
++    for (const EffectiveTypeName& entry : kEffectiveTypeNames) {
++      if (raw.effective_type == entry.name) {
++        result.effective_type = entry.type;
++      }
++    }
++    result.connection_type = V8ConnectionType::Enum::kUnknown;
++    for (const ConnectionTypeName& entry : kConnectionTypeNames) {
++      if (raw.connection_type == entry.name) {
++        result.connection_type = entry.type;
++      }
++    }
++    result.downlink_mbps = raw.downlink_mbps;
++    result.rtt_ms = raw.rtt_ms;
++    result.save_data = raw.save_data;
++    return result;
++  }();
++  return spoof;
++}
++
+ }  // namespace
+ 
+ NetworkInformation::~NetworkInformation() {
+@@ -84,6 +150,12 @@ bool NetworkInformation::IsObserving() const {
+ }
+ 
+ V8ConnectionType NetworkInformation::type() const {
++  // browser
++  if (const std::optional<ConnectionOverride>& spoof =
++          CachedConnectionOverride()) {
++    return V8ConnectionType(spoof->connection_type);
++  }
++
+   if (RuntimeEnabledFeatures::NetInfoConstantTypeEnabled()) {
+     return V8ConnectionType(V8ConnectionType::Enum::kUnknown);
+   }
+@@ -111,6 +183,12 @@ double NetworkInformation::downlinkMax() const {
+ }
+ 
+ V8EffectiveConnectionType NetworkInformation::effectiveType() {
++  // browser
++  if (const std::optional<ConnectionOverride>& spoof =
++          CachedConnectionOverride()) {
++    return V8EffectiveConnectionType(spoof->effective_type);
++  }
++
+   MaybeShowWebHoldbackConsoleMsg();
+   std::optional<WebEffectiveConnectionType> override_ect =
+       GetNetworkStateNotifier().GetWebHoldbackEffectiveType();
+@@ -132,6 +210,12 @@ V8EffectiveConnectionType NetworkInformation::effectiveType() {
+ }
+ 
+ uint32_t NetworkInformation::rtt() {
++  // browser: rounded like the real value.
++  if (const std::optional<ConnectionOverride>& spoof =
++          CachedConnectionOverride()) {
++    return GetNetworkStateNotifier().RoundRtt(
++        Host(), base::Milliseconds(spoof->rtt_ms));
++  }
+   MaybeShowWebHoldbackConsoleMsg();
+   std::optional<base::TimeDelta> override_rtt =
+       GetNetworkStateNotifier().GetWebHoldbackHttpRtt();
+@@ -148,6 +232,11 @@ uint32_t NetworkInformation::rtt() {
+ }
+ 
+ double NetworkInformation::downlink() {
++  // browser: rounded like the real value.
++  if (const std::optional<ConnectionOverride>& spoof =
++          CachedConnectionOverride()) {
++    return GetNetworkStateNotifier().RoundMbps(Host(), spoof->downlink_mbps);
++  }
+   MaybeShowWebHoldbackConsoleMsg();
+   std::optional<double> override_downlink_mbps =
+       GetNetworkStateNotifier().GetWebHoldbackDownlinkThroughputMbps();
+@@ -165,6 +254,12 @@ double NetworkInformation::downlink() {
+ }
+ 
+ bool NetworkInformation::saveData() const {
++  // browser
++  if (const std::optional<ConnectionOverride>& spoof =
++          CachedConnectionOverride()) {
++    return spoof->save_data;
++  }
++
+   bool save_data =
+       IsObserving() ? save_data_ : GetNetworkStateNotifier().SaveDataEnabled();
+ 

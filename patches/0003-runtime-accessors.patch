@@ -1,0 +1,277 @@
+From 49d13be6aee6ea66503d0a1023c606fa6910ea5d Mon Sep 17 00:00:00 2001
+From: Leo Rodarte <leorodarte07@gmail.com>
+Date: Sat, 19 Sep 2026 23:44:58 -0400
+Subject: [PATCH 03/41] runtime-accessors
+
+browser runtime accessors.
+---
+ components/browser/browser_runtime.cc | 194 ++++++++++++++++++++++++++
+ components/browser/browser_runtime.h  |  58 ++++++++
+ 2 files changed, 252 insertions(+)
+ create mode 100644 components/browser/browser_runtime.cc
+ create mode 100644 components/browser/browser_runtime.h
+
+diff --git a/components/browser/browser_runtime.cc b/components/browser/browser_runtime.cc
+new file mode 100644
+index 0000000000..50d180d6b0
+--- /dev/null
++++ b/components/browser/browser_runtime.cc
+@@ -0,0 +1,194 @@
++// Copyright 2026 The browser Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/browser/browser_runtime.h"
++
++#include <optional>
++#include <string>
++#include <string_view>
++#include <utility>
++
++#include "base/command_line.h"
++#include "base/functional/function_ref.h"
++#include "base/no_destructor.h"
++#include "base/strings/strcat.h"
++#include "base/strings/string_util.h"
++#include "base/version_info/version_info_values.h"
++#include "components/browser/browser_switches.h"
++#include "components/browser/fingerprint_pool.h"
++#include "components/browser/switch_resolver.h"
++#include "components/browser/webgpu_identity.h"
++
++namespace browser {
++
++namespace {
++
++// Explicit values of the string switches are taken verbatim.
++std::optional<std::string> Verbatim(const std::string& value) {
++  return value;
++}
++
++std::string ResolveStringSwitch(
++    const char* switch_name,
++    base::FunctionRef<std::string(int32_t seed)> derive_from_seed) {
++  return ResolveSwitch<std::string>(switch_name, Verbatim, derive_from_seed,
++                                    std::string())
++      .value;
++}
++
++// The WebGPU identity implied by the profile picked for `seed`, or nullopt
++// when the profile's renderer is not an ANGLE string with a known vendor.
++std::optional<WebgpuIdentity> WebgpuIdentityForSeed(int32_t seed) {
++  const FingerprintProfile* profile = ProfileForSeed(seed);
++  if (!profile) {
++    return std::nullopt;
++  }
++  return DeriveWebgpuFromRenderer(profile->gpu_renderer);
++}
++
++}  // namespace
++
++const std::string& SpoofedGpuRenderer() {
++  static const base::NoDestructor<std::string> value(
++      ResolveStringSwitch(switches::kFingerprintGpuRenderer, [](int32_t seed) {
++        const FingerprintProfile* profile = ProfileForSeed(seed);
++        return profile ? profile->gpu_renderer : std::string();
++      }));
++  return *value;
++}
++
++const std::string& SpoofedGpuVendor() {
++  static const base::NoDestructor<std::string> value(
++      ResolveStringSwitch(switches::kFingerprintGpuVendor, [](int32_t seed) {
++        const FingerprintProfile* profile = ProfileForSeed(seed);
++        return profile ? profile->gpu_vendor : std::string();
++      }));
++  return *value;
++}
++
++const std::string& SpoofedGpuVendorLower() {
++  static const base::NoDestructor<std::string> value(
++      base::ToLowerASCII(SpoofedGpuVendor()));
++  return *value;
++}
++
++int SpoofedMaxVertexUniformVectors() {
++  const std::string& vendor = SpoofedGpuVendorLower();
++  if (vendor.empty()) {
++    return 0;
++  }
++  return vendor.find("nvidia") != std::string::npos ? 4095 : 4096;
++}
++
++const std::string& SpoofedWebgpuVendor() {
++  static const base::NoDestructor<std::string> value(
++      ResolveStringSwitch(switches::kFingerprintWebgpuVendor, [](int32_t seed) {
++        const std::optional<WebgpuIdentity> id = WebgpuIdentityForSeed(seed);
++        return id ? id->vendor : std::string();
++      }));
++  return *value;
++}
++
++const std::string& SpoofedWebgpuArchitecture() {
++  static const base::NoDestructor<std::string> value(ResolveStringSwitch(
++      switches::kFingerprintWebgpuArchitecture, [](int32_t seed) {
++        const std::optional<WebgpuIdentity> id = WebgpuIdentityForSeed(seed);
++        return id ? id->architecture : std::string();
++      }));
++  return *value;
++}
++
++const std::string& SpoofedBrand() {
++  static const base::NoDestructor<std::string> value(
++      ResolveStringSwitch(switches::kFingerprintBrand,
++                          [](int32_t) { return std::string("Chrome"); }));
++  return *value;
++}
++
++const std::string& SpoofedBrandVersion() {
++  static const base::NoDestructor<std::string> value(
++      ResolveStringSwitch(switches::kFingerprintBrandVersion, [](int32_t) {
++        constexpr std::string_view kVersion = PRODUCT_VERSION;
++        return std::string(kVersion.substr(0, kVersion.find('.')));
++      }));
++  return *value;
++}
++
++const std::string& SpoofedBrandVersionLong() {
++  static const base::NoDestructor<std::string> value(ResolveStringSwitch(
++      switches::kFingerprintBrandVersionLong,
++      [](int32_t) { return std::string(PRODUCT_VERSION); }));
++  return *value;
++}
++
++bool BrandSpoofActive() {
++  static const bool active = !SpoofedBrand().empty() ||
++                             !SpoofedBrandVersion().empty() ||
++                             !SpoofedBrandVersionLong().empty();
++  return active;
++}
++
++void MaybeExpandBrowserDefaults() {
++  base::CommandLine* cl = base::CommandLine::ForCurrentProcess();
++  // Child processes carry --type=<process type>; they receive features
++  // through FeatureList propagation rather than by re-expansion here.
++  if (cl->HasSwitch("type") || cl->HasSwitch(switches::kUseChromiumDefaults)) {
++    return;
++  }
++
++  // Presence-only switches. Only the ones the user has not set are added.
++  static constexpr const char* const kPresenceOnly[] = {
++      "no-first-run",
++      "no-default-browser-check",
++      "no-pings",
++      "disable-background-networking",
++      "disable-client-side-phishing-detection",
++      "disable-sync",
++      "disable-domain-reliability",
++      "disable-breakpad",
++      "disable-field-trial-config",
++      "metrics-recording-only",
++      "disable-default-apps",
++      "disable-prompt-on-repost",
++      "disable-search-engine-choice-screen",
++      "disable-password-generation",
++      "no-service-autorun",
++      "use-mock-keychain",
++      "hide-crash-restore-bubble",
++  };
++  for (const char* name : kPresenceOnly) {
++    if (!cl->HasSwitch(name)) {
++      cl->AppendSwitch(name);
++    }
++  }
++
++  // Value switches. An empty value disables the URL for the first two.
++  static constexpr std::pair<const char*, const char*> kKeyValue[] = {
++      {"connectivity-check-url", ""},
++      {"variations-server-url", ""},
++      {"password-store", "basic"},
++  };
++  for (const auto& [name, value] : kKeyValue) {
++    if (!cl->HasSwitch(name)) {
++      cl->AppendSwitchASCII(name, value);
++    }
++  }
++
++  // --disable-features is merged: AppendSwitchASCII replaces the value, so
++  // the existing list is read first. No --enable-features are bundled; MV2
++  // extension support comes from the ungoogled-chromium
++  // extensions-manifestv2 patch.
++  static constexpr std::string_view kBundledDisable =
++      "OptimizationHints,CertificateTransparencyComponentUpdater,"
++      "AutofillServerCommunication,SafeBrowsing,PasswordLeakDetection,"
++      "InterestFeedContentSuggestions,CrashReporting,"
++      "DestroyProfileOnBrowserClose,LensOverlay,ServiceWorkerPaymentApps";
++  const std::string existing = cl->GetSwitchValueASCII("disable-features");
++  cl->AppendSwitchASCII("disable-features",
++                        existing.empty()
++                            ? std::string(kBundledDisable)
++                            : base::StrCat({existing, ",", kBundledDisable}));
++}
++
++}  // namespace browser
+diff --git a/components/browser/browser_runtime.h b/components/browser/browser_runtime.h
+new file mode 100644
+index 0000000000..e8e2e89c23
+--- /dev/null
++++ b/components/browser/browser_runtime.h
+@@ -0,0 +1,58 @@
++// Copyright 2026 The browser Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_BROWSER_BROWSER_RUNTIME_H_
++#define COMPONENTS_BROWSER_BROWSER_RUNTIME_H_
++
++#include <string>
++
++#include "base/component_export.h"
++
++namespace browser {
++
++// Cached accessors for the string-valued spoof switches. The first call
++// resolves the switch (see switch_resolver.h) and caches the result for the
++// process lifetime; later calls are a pointer dereference. Each returns an
++// empty string when the switch is absent, so call sites branch on
++// `!value.empty()`.
++
++// WebGL vendor / renderer strings. The lowercase vendor is precomputed for
++// the vendor-match call sites.
++COMPONENT_EXPORT(BROWSER) const std::string& SpoofedGpuRenderer();
++COMPONENT_EXPORT(BROWSER) const std::string& SpoofedGpuVendor();
++COMPONENT_EXPORT(BROWSER) const std::string& SpoofedGpuVendorLower();
++
++// MAX_VERTEX_UNIFORM_VECTORS to report through WebGL while a GPU vendor
++// spoof is active: 4095 for NVIDIA (its drivers reserve one vector) and
++// 4096 for every other vendor; 0 when no vendor is spoofed. The
++// *_UNIFORM_COMPONENTS variants are this value times four.
++COMPONENT_EXPORT(BROWSER) int SpoofedMaxVertexUniformVectors();
++
++// WebGPU adapter.info tokens. Derived values come from the active profile's
++// ANGLE renderer string (see webgpu_identity.h).
++COMPONENT_EXPORT(BROWSER) const std::string& SpoofedWebgpuVendor();
++COMPONENT_EXPORT(BROWSER) const std::string& SpoofedWebgpuArchitecture();
++
++// Brand and version. An explicit switch value is returned verbatim; the
++// derived forms are "Chrome", the major component of PRODUCT_VERSION and
++// the full PRODUCT_VERSION respectively.
++COMPONENT_EXPORT(BROWSER) const std::string& SpoofedBrand();
++COMPONENT_EXPORT(BROWSER) const std::string& SpoofedBrandVersion();
++COMPONENT_EXPORT(BROWSER) const std::string& SpoofedBrandVersionLong();
++
++// True when any of the three brand accessors is non-empty. Cached so hot
++// paths (e.g. mediaCapabilities.decodingInfo) pay a single bool load.
++COMPONENT_EXPORT(BROWSER) bool BrandSpoofActive();
++
++// Browser process only. Unless --use-chromium-defaults is present, appends
++// the preset of telemetry-off switches and privacy-positive feature flags
++// to the current command line. User-supplied switches are never
++// overwritten, and --disable-features is merged with any existing value.
++// Must run before FeatureList initialization; the hook site is
++// ChromeMainDelegate::BasicStartupComplete.
++COMPONENT_EXPORT(BROWSER) void MaybeExpandBrowserDefaults();
++
++}  // namespace browser
++
++#endif  // COMPONENTS_BROWSER_BROWSER_RUNTIME_H_

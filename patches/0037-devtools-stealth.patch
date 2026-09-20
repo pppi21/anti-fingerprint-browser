@@ -1,0 +1,40 @@
+From 8dd5489c3777ab23e0cd3398d1b764e6b8b1c7e5 Mon Sep 17 00:00:00 2001
+From: Leo Rodarte <leorodarte07@gmail.com>
+Date: Sat, 19 Sep 2026 23:46:17 -0400
+Subject: [PATCH 37/41] devtools-stealth
+
+Suppress the "controlled by automated test software" infobar, whose
+~30 px innerHeight delta is detectable from JavaScript.
+---
+ .../chrome_devtools_manager_delegate.cc        | 18 +++++-------------
+ 1 file changed, 5 insertions(+), 13 deletions(-)
+
+diff --git a/chrome/browser/devtools/chrome_devtools_manager_delegate.cc b/chrome/browser/devtools/chrome_devtools_manager_delegate.cc
+index d1b45e8064..92706e3c42 100644
+--- a/chrome/browser/devtools/chrome_devtools_manager_delegate.cc
++++ b/chrome/browser/devtools/chrome_devtools_manager_delegate.cc
+@@ -542,19 +542,11 @@ void ChromeDevToolsManagerDelegate::AcceptDebugging(AcceptCallback callback) {
+   DevToolsConnectionDialog::Show(last_active, std::move(wrapped_callback));
+ }
+ 
+-void ChromeDevToolsManagerDelegate::SetActiveWebSocketConnections(
+-    size_t count) {
+-  if (count == 0 && infobar_) {
+-    // We need to reset the pointer to the infobar before closing it because
+-    // closing the infobar deletes it.
+-    auto* infobar = infobar_.get();
+-    infobar_ = nullptr;
+-    infobar->Close();
+-  } else if (count > 0 && !infobar_) {
+-    auto delegate = std::make_unique<DevToolsRemoteServerInfobarDelegate>();
+-    delegate->AddObserver(this);
+-    infobar_ = GlobalConfirmInfoBar::Show(std::move(delegate));
+-  }
++void ChromeDevToolsManagerDelegate::SetActiveWebSocketConnections(size_t) {
++  // browser: the "controlled by automated test software" infobar is never
++  // shown. It shrinks window.innerHeight by about 30 px while a CDP client
++  // is attached, which JavaScript can see as an unusual outerHeight minus
++  // innerHeight delta.
+ }
+ 
+ void ChromeDevToolsManagerDelegate::OnAccept() {

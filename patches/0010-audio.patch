@@ -1,0 +1,211 @@
+From f0585958a185e511b548149a88ad580b4e3882db Mon Sep 17 00:00:00 2001
+From: Leo Rodarte <leorodarte07@gmail.com>
+Date: Sat, 19 Sep 2026 23:45:17 -0400
+Subject: [PATCH 10/41] audio
+
+AudioContext override incl. maxChannelCount.
+---
+ components/browser/audio_override.cc          | 65 +++++++++++++++++++
+ components/browser/audio_override.h           | 31 +++++++++
+ .../blink/renderer/modules/webaudio/BUILD.gn  |  1 +
+ .../modules/webaudio/audio_context.cc         | 17 ++++-
+ .../webaudio/audio_destination_node.cc        |  6 +-
+ 5 files changed, 117 insertions(+), 3 deletions(-)
+ create mode 100644 components/browser/audio_override.cc
+ create mode 100644 components/browser/audio_override.h
+
+diff --git a/components/browser/audio_override.cc b/components/browser/audio_override.cc
+new file mode 100644
+index 0000000000..ece9d39c68
+--- /dev/null
++++ b/components/browser/audio_override.cc
+@@ -0,0 +1,65 @@
++// Copyright 2026 The browser Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/browser/audio_override.h"
++
++#include <optional>
++#include <string>
++#include <vector>
++
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_split.h"
++#include "components/browser/browser_switches.h"
++#include "components/browser/fingerprint_pool.h"
++#include "components/browser/switch_resolver.h"
++
++namespace browser {
++
++namespace {
++
++constexpr AudioOverride kInactive;
++
++// "sampleRate,baseLatency,outputLatency,maxChannelCount".
++std::optional<AudioOverride> ParseExplicit(const std::string& value) {
++  std::vector<std::string> parts = base::SplitString(
++      value, ",", base::TRIM_WHITESPACE, base::SPLIT_WANT_NONEMPTY);
++  if (parts.size() != 4) {
++    return std::nullopt;
++  }
++  double sample_rate = 0.0;
++  double base_latency = 0.0;
++  double output_latency = 0.0;
++  unsigned max_channel_count = 0;
++  if (!base::StringToDouble(parts[0], &sample_rate) ||
++      !base::StringToDouble(parts[1], &base_latency) ||
++      !base::StringToDouble(parts[2], &output_latency) ||
++      !base::StringToUint(parts[3], &max_channel_count)) {
++    return std::nullopt;
++  }
++  return AudioOverride{true, static_cast<float>(sample_rate), base_latency,
++                       output_latency, max_channel_count};
++}
++
++AudioOverride DeriveFromSeed(int32_t seed) {
++  const FingerprintProfile* profile = ProfileForSeed(seed);
++  if (!profile) {
++    return kInactive;
++  }
++  return AudioOverride{true, static_cast<float>(profile->audio_sample_rate),
++                       profile->audio_base_latency,
++                       profile->audio_output_latency,
++                       static_cast<uint32_t>(profile->audio_max_channel_count)};
++}
++
++}  // namespace
++
++const AudioOverride& GetAudioOverride() {
++  static const AudioOverride resolved =
++      ResolveSwitch<AudioOverride>(switches::kFingerprintAudioContext,
++                                   ParseExplicit, DeriveFromSeed, kInactive)
++          .value;
++  return resolved;
++}
++
++}  // namespace browser
+diff --git a/components/browser/audio_override.h b/components/browser/audio_override.h
+new file mode 100644
+index 0000000000..8749f8a618
+--- /dev/null
++++ b/components/browser/audio_override.h
+@@ -0,0 +1,31 @@
++// Copyright 2026 The browser Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_BROWSER_AUDIO_OVERRIDE_H_
++#define COMPONENTS_BROWSER_AUDIO_OVERRIDE_H_
++
++#include <cstdint>
++
++#include "base/component_export.h"
++
++namespace browser {
++
++// The AudioContext properties reported to pages: sampleRate, baseLatency,
++// outputLatency and destination.maxChannelCount. Resolved once per process
++// from --fingerprint-audio-context (explicit, "auto", "seed:<N>" or inherited
++// from --fingerprint-seed; see switch_resolver.h); `active` is false when
++// nothing is spoofed.
++struct AudioOverride {
++  bool active = false;
++  float sample_rate = 0.0f;
++  double base_latency = 0.0;
++  double output_latency = 0.0;
++  uint32_t max_channel_count = 0;
++};
++
++COMPONENT_EXPORT(BROWSER) const AudioOverride& GetAudioOverride();
++
++}  // namespace browser
++
++#endif  // COMPONENTS_BROWSER_AUDIO_OVERRIDE_H_
+diff --git a/third_party/blink/renderer/modules/webaudio/BUILD.gn b/third_party/blink/renderer/modules/webaudio/BUILD.gn
+index 723759fed6..7f25267f0c 100644
+--- a/third_party/blink/renderer/modules/webaudio/BUILD.gn
++++ b/third_party/blink/renderer/modules/webaudio/BUILD.gn
+@@ -188,6 +188,7 @@ blink_modules_sources("webaudio") {
+     sources += [ "cpu/arm/oscillator_kernel_neon.cc" ]
+   }
+   deps = [
++    "//components/browser:browser_switches",
+     "//services/metrics/public/cpp:ukm_builders",
+     "//third_party/blink/renderer/modules/mediastream",
+     "//third_party/blink/renderer/modules/peerconnection",
+diff --git a/third_party/blink/renderer/modules/webaudio/audio_context.cc b/third_party/blink/renderer/modules/webaudio/audio_context.cc
+index 9136c6e6c1..f62f8e8ee4 100644
+--- a/third_party/blink/renderer/modules/webaudio/audio_context.cc
++++ b/third_party/blink/renderer/modules/webaudio/audio_context.cc
+@@ -14,6 +14,7 @@
+ #include "base/strings/to_string.h"
+ #include "base/trace_event/trace_event.h"
+ #include "build/build_config.h"
++#include "components/browser/audio_override.h"
+ #include "media/audio/audio_device_description.h"
+ #include "media/base/output_device_info.h"
+ #include "services/metrics/public/cpp/ukm_builders.h"
+@@ -453,6 +454,11 @@ AudioContext* AudioContext::Create(ExecutionContext* context,
+   if (context_options->hasSampleRate()) {
+     sample_rate = context_options->sampleRate();
+   }
++  // browser: the spoofed sample rate wins over the page's option.
++  if (const browser::AudioOverride& spoof = browser::GetAudioOverride();
++      spoof.active) {
++    sample_rate = spoof.sample_rate;
++  }
+ 
+   std::optional<uint32_t> render_quantum_frames = 128;
+   if (RuntimeEnabledFeatures::WebAudioConfigurableRenderQuantumEnabled(
+@@ -1242,17 +1248,24 @@ double AudioContext::baseLatency() const {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(main_thread_sequence_checker_);
+   DCHECK(destinationNode());
+ 
+-  return base_latency_;
++  // browser: the spoofed latency replaces the real one.
++  const browser::AudioOverride& spoof = browser::GetAudioOverride();
++  return spoof.active ? spoof.base_latency : base_latency_;
+ }
+ 
+ double AudioContext::outputLatency() const {
++  // browser: the stock path runs in full even when spoofing, because the
++  // lock acquisition dominates this getter's timing.
+   DCHECK_CALLED_ON_VALID_SEQUENCE(main_thread_sequence_checker_);
+   DCHECK(destinationNode());
+ 
+   DeferredTaskHandler::GraphAutoLocker locker(GetDeferredTaskHandler());
+ 
+   double factor = GetOutputLatencyQuantizingFactor();
+-  return std::round(output_position_.hardware_output_latency / factor) * factor;
++  const double real =
++      std::round(output_position_.hardware_output_latency / factor) * factor;
++  const browser::AudioOverride& spoof = browser::GetAudioOverride();
++  return spoof.active ? spoof.output_latency : real;
+ }
+ 
+ AudioPlaybackStats* AudioContext::playbackStats() {
+diff --git a/third_party/blink/renderer/modules/webaudio/audio_destination_node.cc b/third_party/blink/renderer/modules/webaudio/audio_destination_node.cc
+index 1d2302a9c4..1e06a7cf1c 100644
+--- a/third_party/blink/renderer/modules/webaudio/audio_destination_node.cc
++++ b/third_party/blink/renderer/modules/webaudio/audio_destination_node.cc
+@@ -25,6 +25,7 @@
+ 
+ #include "third_party/blink/renderer/modules/webaudio/audio_destination_node.h"
+ 
++#include "components/browser/audio_override.h"
+ #include "third_party/blink/renderer/modules/webaudio/audio_destination_handler.h"
+ #include "third_party/blink/renderer/modules/webaudio/audio_graph_tracer.h"
+ 
+@@ -39,7 +40,10 @@ AudioDestinationHandler& AudioDestinationNode::GetAudioDestinationHandler()
+ }
+ 
+ uint32_t AudioDestinationNode::maxChannelCount() const {
+-  return GetAudioDestinationHandler().MaxChannelCount();
++  // browser: the spoofed channel count replaces the real one.
++  const browser::AudioOverride& spoof = browser::GetAudioOverride();
++  return spoof.active ? spoof.max_channel_count
++                      : GetAudioDestinationHandler().MaxChannelCount();
+ }
+ 
+ void AudioDestinationNode::ReportDidCreate() {

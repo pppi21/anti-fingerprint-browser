@@ -1,0 +1,144 @@
+From ca07d529f68d32a158b5d9c4b9444735494b7c65 Mon Sep 17 00:00:00 2001
+From: Leo Rodarte <leorodarte07@gmail.com>
+Date: Sat, 19 Sep 2026 23:46:10 -0400
+Subject: [PATCH 34/41] docs-offline-stub
+
+Google Docs Offline component-extension stub (URL-namespace parity).
+---
+ chrome/browser/browser_resources.grd             |  1 +
+ .../component_extensions_allowlist/allowlist.cc  |  4 ++++
+ chrome/browser/extensions/component_loader.cc    | 16 ++++++++++++++++
+ chrome/browser/extensions/component_loader.h     |  3 +++
+ .../resources/component_extension_resources.grd  |  2 ++
+ .../google_docs_offline_stub/manifest.json       | 12 ++++++++++++
+ .../page_embed_script.js                         |  7 +++++++
+ 7 files changed, 45 insertions(+)
+ create mode 100644 chrome/browser/resources/google_docs_offline_stub/manifest.json
+ create mode 100644 chrome/browser/resources/google_docs_offline_stub/page_embed_script.js
+
+diff --git a/chrome/browser/browser_resources.grd b/chrome/browser/browser_resources.grd
+index 161313092c..77ef242e1d 100644
+--- a/chrome/browser/browser_resources.grd
++++ b/chrome/browser/browser_resources.grd
+@@ -181,6 +181,7 @@
+         <include name="IDR_DESK_API_MANIFEST" file="resources\chromeos\desk_api\manifest.json" type="BINDATA" />
+       </if>
+ 
++      <include name="IDR_GOOGLE_DOCS_OFFLINE_STUB_MANIFEST" file="resources\google_docs_offline_stub\manifest.json" type="BINDATA" />
+       <include name="IDR_NETWORK_SPEECH_SYNTHESIS_MANIFEST" file="resources\network_speech_synthesis\manifest.json" type="BINDATA" />
+       <include name="IDR_NETWORK_SPEECH_SYNTHESIS_MANIFEST_MV3" file="resources\network_speech_synthesis\mv3\manifest.json" type="BINDATA" />
+       <include name="IDR_READING_MODE_GDOCS_HELPER_MANIFEST" file="resources\reading_mode_gdocs_helper\manifest.json" type="BINDATA" />
+diff --git a/chrome/browser/extensions/component_extensions_allowlist/allowlist.cc b/chrome/browser/extensions/component_extensions_allowlist/allowlist.cc
+index a30faeb1ea..1d2dd28850 100644
+--- a/chrome/browser/extensions/component_extensions_allowlist/allowlist.cc
++++ b/chrome/browser/extensions/component_extensions_allowlist/allowlist.cc
+@@ -37,6 +37,9 @@ namespace extensions {
+ bool IsComponentExtensionAllowlisted(const std::string& extension_id) {
+   constexpr auto kAllowed = base::MakeFixedFlatSet<std::string_view>({
+       extension_misc::kContextualTasksExtensionId,
++      // browser: stub of the Google Docs Offline extension, so that the
++      // chrome-extension://<id>/ namespace resolves as in a signed-in Chrome.
++      extension_misc::kDocsOfflineExtensionId,
+       extension_misc::kGlicExtensionId,
+       extension_misc::kInAppPaymentsSupportAppId,
+       extension_misc::kPdfExtensionId,
+@@ -98,6 +101,7 @@ bool IsComponentExtensionAllowlisted(int manifest_resource_id) {
+     case IDR_AIM_ELIGIBILITY_EXTENSION_MANIFEST_JSON:
+     case IDR_CONTEXTUAL_TASKS_EXTENSION_MANIFEST_JSON:
+     case IDR_GLIC_EXTENSION_MANIFEST:
++    case IDR_GOOGLE_DOCS_OFFLINE_STUB_MANIFEST:
+     case IDR_NETWORK_SPEECH_SYNTHESIS_MANIFEST:
+     case IDR_NETWORK_SPEECH_SYNTHESIS_MANIFEST_MV3:
+     case IDR_READING_MODE_GDOCS_HELPER_MANIFEST:
+diff --git a/chrome/browser/extensions/component_loader.cc b/chrome/browser/extensions/component_loader.cc
+index e926dac169..133d453479 100644
+--- a/chrome/browser/extensions/component_loader.cc
++++ b/chrome/browser/extensions/component_loader.cc
+@@ -422,6 +422,18 @@ void ComponentLoader::AddContextualTasksExtension() {
+   }
+ }
+ 
++// browser: Chrome installs the Google Docs Offline extension
++// (ghbmnnjooekpmoecnnnilnnbdlolhkhi) on the first launch of a signed-in
++// profile, and pages can tell by fetching
++// chrome-extension://<id>/page_embed_script.js. This stub answers that fetch
++// with an empty script and bundles none of the offline editing machinery.
++// Note that --disable-component-extensions-with-background-pages disables
++// every component extension, this stub included.
++void ComponentLoader::AddGoogleDocsOfflineStubExtension() {
++  Add(IDR_GOOGLE_DOCS_OFFLINE_STUB_MANIFEST,
++      base::FilePath(FILE_PATH_LITERAL("google_docs_offline_stub")));
++}
++
+ void ComponentLoader::AddWithNameAndDescription(
+     int manifest_resource_id,
+     const base::FilePath& root_directory,
+@@ -644,6 +656,10 @@ void ComponentLoader::AddDefaultComponentExtensionsWithBackgroundPages(
+ #if BUILDFLAG(GOOGLE_CHROME_BRANDING) && !BUILDFLAG(IS_CHROMEOS)
+   AddNetworkSpeechSynthesisExtension();
+ #endif  // BUILDFLAG(GOOGLE_CHROME_BRANDING) && !BUILDFLAG(IS_CHROMEOS)
++
++  // browser: unconditional; Chrome installs the real extension regardless
++  // of branding.
++  AddGoogleDocsOfflineStubExtension();
+ }
+ 
+ void ComponentLoader::
+diff --git a/chrome/browser/extensions/component_loader.h b/chrome/browser/extensions/component_loader.h
+index ff07122e6a..0092d9342f 100644
+--- a/chrome/browser/extensions/component_loader.h
++++ b/chrome/browser/extensions/component_loader.h
+@@ -213,6 +213,9 @@ class ComponentLoader : public KeyedService {
+ 
+   void AddAimEligibilityExtension();
+ 
++  // browser: registers the Google Docs Offline stub; see the .cc file.
++  void AddGoogleDocsOfflineStubExtension();
++
+   void AddGlicExtension();
+ 
+   void AddContextualTasksExtension();
+diff --git a/chrome/browser/resources/component_extension_resources.grd b/chrome/browser/resources/component_extension_resources.grd
+index 37f5f7edf2..6a3e504bde 100644
+--- a/chrome/browser/resources/component_extension_resources.grd
++++ b/chrome/browser/resources/component_extension_resources.grd
+@@ -12,6 +12,8 @@
+   </outputs>
+   <release seq="1">
+     <includes>
++      <include name="IDR_GOOGLE_DOCS_OFFLINE_STUB_PAGE_EMBED_SCRIPT_JS" file="google_docs_offline_stub/page_embed_script.js" type="BINDATA" />
++
+       <include name="IDR_NETWORK_SPEECH_SYNTHESIS_JS" file="network_speech_synthesis/tts_extension.js" type="BINDATA" />
+ 
+       <include name="IDR_NETWORK_SPEECH_SYNTHESIS_MV3_AUDIO_HTML" file="network_speech_synthesis/mv3/audio.html" type="BINDATA" />
+diff --git a/chrome/browser/resources/google_docs_offline_stub/manifest.json b/chrome/browser/resources/google_docs_offline_stub/manifest.json
+new file mode 100644
+index 0000000000..88cb0f3a7d
+--- /dev/null
++++ b/chrome/browser/resources/google_docs_offline_stub/manifest.json
+@@ -0,0 +1,12 @@
++{
++   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAnF7RGLAxIon0/XeNZ4MLdP3DMkoORzEAKVg0sb89JpA/W2osTHr91Wqwdc9lW0mFcSpCYS9Y3e7cUMFo/M2ETASIuZncMiUzX2/0rrWtGQ3UuEj3KSe5PdaVZfisyJw/FebvHwirEWrhqcgzVUj9fL9YjE0G45d1zMKcc1umKvLqPyTznNuKBZ9GJREdGLRJCBmUgCkI8iwtwC+QZTUppmaD50/ksnEUXv+QkgGN07/KoNA5oAgo49Jf1XBoMv4QXtVZQlBYZl84zAsI82hb63a6Gu29U/4qMWDdI7+3Ne5TRvo6Zi3EI4M2NQNplJhik105qrz+eTLJJxvf4slrWwIDAQAB",
++   "manifest_version": 3,
++   "name": "Google Docs Offline",
++   "version": "1.104.1",
++   "description": "Get things done offline with the Google Docs family of products.",
++   "minimum_chrome_version": "88",
++   "web_accessible_resources": [ {
++      "matches": [ "<all_urls>" ],
++      "resources": [ "page_embed_script.js" ]
++   } ]
++}
+diff --git a/chrome/browser/resources/google_docs_offline_stub/page_embed_script.js b/chrome/browser/resources/google_docs_offline_stub/page_embed_script.js
+new file mode 100644
+index 0000000000..8426ef89a0
+--- /dev/null
++++ b/chrome/browser/resources/google_docs_offline_stub/page_embed_script.js
+@@ -0,0 +1,7 @@
++// Copyright 2026 The browser Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// Stub of the Google Docs Offline extension's page_embed_script.js. Pages
++// detect the extension by fetching this path, so it has to exist; the real
++// extension's page hooks are not bundled.

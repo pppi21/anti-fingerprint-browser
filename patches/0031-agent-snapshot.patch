@@ -1,0 +1,2201 @@
+From 3d2fb672b04cd58d7f24d41e5c987228859f2e83 Mon Sep 17 00:00:00 2001
+From: Leo Rodarte <leorodarte07@gmail.com>
+Date: Sat, 19 Sep 2026 23:46:02 -0400
+Subject: [PATCH 31/41] agent-snapshot
+
+CDP Page.captureAgentSnapshot / Page.resolveAgentNode: cross-frame
+interactive-element perception with root-viewport geometry, plus the
+blink agent_snapshot collector module. Also carries the cursor-overlay
+wiring in page_handler.cc/.h.
+---
+ .../browser/devtools/protocol/page_handler.cc | 928 +++++++++++++++++-
+ .../browser/devtools/protocol/page_handler.h  |  63 ++
+ .../public/devtools_protocol/domains/Page.pdl | 134 +++
+ third_party/blink/public/mojom/BUILD.gn       |   1 +
+ .../agent_snapshot_collector.mojom            |  93 ++
+ .../inspector/inspector_protocol_config.json  |   2 +-
+ third_party/blink/renderer/modules/BUILD.gn   |   1 +
+ .../renderer/modules/agent_snapshot/BUILD.gn  |  16 +
+ .../agent_snapshot_collector_impl.cc          | 604 ++++++++++++
+ .../agent_snapshot_collector_impl.h           |  63 ++
+ .../renderer/modules/modules_initializer.cc   |   5 +
+ 11 files changed, 1908 insertions(+), 2 deletions(-)
+ create mode 100644 third_party/blink/public/mojom/agent_snapshot/agent_snapshot_collector.mojom
+ create mode 100644 third_party/blink/renderer/modules/agent_snapshot/BUILD.gn
+ create mode 100644 third_party/blink/renderer/modules/agent_snapshot/agent_snapshot_collector_impl.cc
+ create mode 100644 third_party/blink/renderer/modules/agent_snapshot/agent_snapshot_collector_impl.h
+
+diff --git a/content/browser/devtools/protocol/page_handler.cc b/content/browser/devtools/protocol/page_handler.cc
+index 0805eafa3f..c9566b47b3 100644
+--- a/content/browser/devtools/protocol/page_handler.cc
++++ b/content/browser/devtools/protocol/page_handler.cc
+@@ -5,15 +5,21 @@
+ #include "content/browser/devtools/protocol/page_handler.h"
+ 
+ #include <algorithm>
++#include <array>
++#include <cmath>
++#include <limits>
+ #include <memory>
++#include <numeric>
+ #include <optional>
+ #include <sstream>
+ #include <string>
+ #include <utility>
+ #include <vector>
+ 
++#include "base/barrier_closure.h"
+ #include "base/check_op.h"
+ #include "base/functional/bind.h"
++#include "base/hash/hash.h"
+ #include "base/location.h"
+ #include "base/memory/ref_counted.h"
+ #include "base/memory/ref_counted_memory.h"
+@@ -21,6 +27,7 @@
+ #include "base/process/process_handle.h"
+ #include "base/strings/string_number_conversions.h"
+ #include "base/strings/string_util.h"
++#include "base/strings/stringprintf.h"
+ #include "base/strings/to_string.h"
+ #include "base/strings/utf_string_conversions.h"
+ #include "base/task/sequenced_task_runner.h"
+@@ -29,16 +36,20 @@
+ #include "base/threading/thread_restrictions.h"
+ #include "base/timer/timer.h"
+ #include "base/trace_event/trace_event.h"
++#include "cc/paint/paint_flags.h"
++#include "cc/paint/skia_paint_canvas.h"
+ #include "components/back_forward_cache/disabled_reason_id.h"
+ #include "content/browser/back_forward_cache/back_forward_cache_can_store_document_result.h"
+ #include "content/browser/back_forward_cache/back_forward_cache_disable.h"
+ #include "content/browser/back_forward_cache/back_forward_cache_metrics.h"
++#include "content/browser/devtools/cdp_cursor_overlay.h"
+ #include "content/browser/devtools/devtools_agent_host_impl.h"
+ #include "content/browser/devtools/devtools_session.h"
+ #include "content/browser/devtools/protocol/browser_handler.h"
+ #include "content/browser/devtools/protocol/devtools_mhtml_helper.h"
+ #include "content/browser/devtools/protocol/emulation_handler.h"
+ #include "content/browser/devtools/protocol/handler_helpers.h"
++#include "content/browser/devtools/protocol/input_handler.h"
+ #include "content/browser/devtools/protocol/media_recorder.h"
+ #include "content/browser/manifest/manifest_manager_host.h"
+ #include "content/browser/media/capture/web_contents_video_capture_device.h"
+@@ -47,6 +58,7 @@
+ #include "content/browser/renderer_host/navigation_request.h"
+ #include "content/browser/renderer_host/navigator.h"
+ #include "content/browser/renderer_host/render_frame_host_impl.h"
++#include "content/browser/renderer_host/render_widget_host_delegate.h"
+ #include "content/browser/renderer_host/render_widget_host_view_base.h"
+ #include "content/browser/web_contents/web_contents_impl.h"
+ #include "content/browser/web_contents/web_contents_view.h"
+@@ -64,8 +76,12 @@
+ #include "content/public/common/result_codes.h"
+ #include "content/public/common/url_constants.h"
+ #include "content/public/common/url_utils.h"
++#include "mojo/public/cpp/bindings/callback_helpers.h"
++#include "mojo/public/cpp/bindings/remote.h"
+ #include "net/base/filename_util.h"
++#include "services/service_manager/public/cpp/interface_provider.h"
+ #include "third_party/blink/public/common/manifest/manifest_util.h"
++#include "third_party/blink/public/mojom/agent_snapshot/agent_snapshot_collector.mojom.h"
+ #include "third_party/blink/public/mojom/back_forward_cache_not_restored_reasons.mojom.h"
+ #include "third_party/blink/public/mojom/content_extraction/ai_page_content.mojom.h"
+ #include "third_party/blink/public/mojom/frame/back_forward_cache_controller.mojom.h"
+@@ -74,14 +90,21 @@
+ #include "third_party/skia/include/core/SkBitmap.h"
+ #include "third_party/skia/include/core/SkColor.h"
+ #include "ui/base/page_transition_types.h"
++#include "ui/gfx/canvas.h"
+ #include "ui/gfx/codec/jpeg_codec.h"
+ #include "ui/gfx/codec/png_codec.h"
+ #include "ui/gfx/codec/webp_codec.h"
+ #include "ui/gfx/color_utils.h"
++#include "ui/gfx/font_list.h"
++#include "ui/gfx/geometry/point_f.h"
++#include "ui/gfx/geometry/rect.h"
++#include "ui/gfx/geometry/rect_conversions.h"
++#include "ui/gfx/geometry/rect_f.h"
+ #include "ui/gfx/geometry/size.h"
+ #include "ui/gfx/geometry/size_conversions.h"
+ #include "ui/gfx/image/image.h"
+ #include "ui/gfx/skbitmap_operations.h"
++#include "ui/gfx/text_utils.h"
+ #include "ui/snapshot/snapshot.h"
+ 
+ #if BUILDFLAG(IS_ANDROID)
+@@ -131,6 +154,250 @@ std::optional<std::vector<uint8_t>> EncodeBitmapAsWebp(int quality,
+   return gfx::WebpCodec::Encode(bitmap, quality);
+ }
+ 
++// browser: mark rendering for Page.captureAgentSnapshot. The browser draws
++// the labelled overlay onto the composited screenshot itself, so the client
++// never re-decodes or re-draws. Each marked element gets a colored outline
++// and a badge in the same color; neighboring marks get colors that are as
++// far apart in CIELAB as the palette allows, so a label can be tied to its
++// box by color even in a dense grid of marks.
++
++struct AgentMarkColor {
++  SkColor rgb;
++  const char* name;  // returned to the caller alongside the label
++};
++
++// Eight nameable, well-separated hues (Trubetskoy's distinct-color set).
++constexpr AgentMarkColor kAgentMarkPalette[] = {
++    {SkColorSetRGB(0xE6, 0x19, 0x4B), "red"},
++    {SkColorSetRGB(0x43, 0x63, 0xD8), "blue"},
++    {SkColorSetRGB(0x3C, 0xB4, 0x4B), "green"},
++    {SkColorSetRGB(0xF5, 0x82, 0x31), "orange"},
++    {SkColorSetRGB(0x91, 0x1E, 0xB4), "purple"},
++    {SkColorSetRGB(0x42, 0xD4, 0xF4), "cyan"},
++    {SkColorSetRGB(0xF0, 0x32, 0xE6), "magenta"},
++    {SkColorSetRGB(0xFF, 0xE1, 0x19), "yellow"},
++};
++constexpr size_t kAgentMarkPaletteSize = std::size(kAgentMarkPalette);
++
++struct LabColor {
++  double l;
++  double a;
++  double b;
++};
++
++double SrgbToLinear(double channel) {
++  const double c = channel / 255.0;
++  return c <= 0.04045 ? c / 12.92 : std::pow((c + 0.055) / 1.055, 2.4);
++}
++
++LabColor RgbToLab(SkColor color) {
++  const double r = SrgbToLinear(SkColorGetR(color));
++  const double g = SrgbToLinear(SkColorGetG(color));
++  const double b = SrgbToLinear(SkColorGetB(color));
++  const double x = (r * 0.4124 + g * 0.3576 + b * 0.1805) / 0.95047;
++  const double y = r * 0.2126 + g * 0.7152 + b * 0.0722;
++  const double z = (r * 0.0193 + g * 0.1192 + b * 0.9505) / 1.08883;
++  auto f = [](double t) {
++    return t > 0.008856 ? std::cbrt(t) : (7.787 * t + 16.0 / 116.0);
++  };
++  const double fx = f(x);
++  const double fy = f(y);
++  const double fz = f(z);
++  return {116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz)};
++}
++
++double LabDistance(const LabColor& a, const LabColor& b) {
++  const double dl = a.l - b.l;
++  const double da = a.a - b.a;
++  const double db = a.b - b.b;
++  return std::sqrt(dl * dl + da * da + db * db);
++}
++
++// Greedy graph coloring. Two marks are adjacent when their device-pixel
++// boxes, expanded for proximity, intersect; each mark then gets the palette
++// color with the largest minimum CIELAB distance to its already-colored
++// neighbors, ties going to the least-used color. Returns a palette index per
++// box.
++std::vector<int> AssignAgentMarkColors(const std::vector<gfx::RectF>& boxes,
++                                       double dsf) {
++  const size_t n = boxes.size();
++  std::vector<gfx::RectF> expanded;
++  expanded.reserve(n);
++  for (const gfx::RectF& box : boxes) {
++    const double margin =
++        std::max(8.0 * dsf, 0.15 * std::min(box.width(), box.height()));
++    expanded.emplace_back(box.x() - margin, box.y() - margin,
++                          box.width() + 2 * margin, box.height() + 2 * margin);
++  }
++  std::vector<std::vector<size_t>> adjacent(n);
++  for (size_t i = 0; i < n; ++i) {
++    for (size_t j = i + 1; j < n; ++j) {
++      if (expanded[i].Intersects(expanded[j])) {
++        adjacent[i].push_back(j);
++        adjacent[j].push_back(i);
++      }
++    }
++  }
++
++  std::array<LabColor, kAgentMarkPaletteSize> lab;
++  for (size_t k = 0; k < kAgentMarkPaletteSize; ++k) {
++    lab[k] = RgbToLab(kAgentMarkPalette[k].rgb);
++  }
++
++  // Most constrained first.
++  std::vector<size_t> order(n);
++  std::iota(order.begin(), order.end(), 0u);
++  std::ranges::sort(order, [&](size_t a, size_t b) {
++    return adjacent[a].size() > adjacent[b].size();
++  });
++
++  std::vector<int> color(n, -1);
++  std::array<int, kAgentMarkPaletteSize> usage{};
++  for (size_t index : order) {
++    double best_score = -std::numeric_limits<double>::max();
++    int best_k = 0;
++    for (size_t k = 0; k < kAgentMarkPaletteSize; ++k) {
++      double min_distance = std::numeric_limits<double>::max();
++      for (size_t neighbor : adjacent[index]) {
++        if (color[neighbor] >= 0) {
++          min_distance =
++              std::min(min_distance, LabDistance(lab[k], lab[color[neighbor]]));
++        }
++      }
++      const double base = min_distance == std::numeric_limits<double>::max()
++                              ? 1e9
++                              : min_distance;
++      const double score = base - usage[k] * 0.001;
++      if (score > best_score) {
++        best_score = score;
++        best_k = static_cast<int>(k);
++      }
++    }
++    color[index] = best_k;
++    usage[best_k]++;
++  }
++  return color;
++}
++
++// Draws every mark (outline plus labelled badge) onto `bitmap` in place.
++// `boxes` are device-pixel border-boxes and `colors` palette indices from
++// AssignAgentMarkColors. The badge always sits just outside its box, so it
++// never covers the element's own content, at whichever perimeter position
++// best avoids other badges, other boxes and the image edge.
++void DrawAgentMarks(SkBitmap& bitmap,
++                    const std::vector<gfx::RectF>& boxes,
++                    const std::vector<std::string>& labels,
++                    const std::vector<int>& colors,
++                    double dsf) {
++  cc::SkiaPaintCanvas paint_canvas(bitmap);
++  gfx::Canvas canvas(&paint_canvas, 1.0f);
++  const int img_w = bitmap.width();
++  const int img_h = bitmap.height();
++
++  const int font_px = std::max(11, static_cast<int>(std::lround(11.0 * dsf)));
++  gfx::FontList font(base::StringPrintf("Arial, Bold %dpx", font_px));
++  const int text_h = font.GetHeight();
++  const int pad_x = std::max(2, static_cast<int>(std::lround(3.0 * dsf)));
++  const int pad_y = std::max(1, static_cast<int>(std::lround(1.0 * dsf)));
++  const float core = std::max(2.0f, static_cast<float>(2.0 * dsf));
++  const int gap = std::max(2, static_cast<int>(std::lround(2.0 * dsf)));
++
++  // Outlines first, so no badge is painted under a later element's stroke.
++  for (size_t i = 0; i < boxes.size(); ++i) {
++    const gfx::RectF& b = boxes[i];
++    const SkColor col = kAgentMarkPalette[colors[i]].rgb;
++
++    // A dark halo keeps the color visible on any background.
++    cc::PaintFlags halo;
++    halo.setStyle(cc::PaintFlags::kStroke_Style);
++    halo.setStrokeWidth(core + 2.0f * static_cast<float>(dsf));
++    halo.setColor(SkColorSetARGB(0xB0, 0, 0, 0));
++    halo.setAntiAlias(true);
++    canvas.DrawRect(b, halo);
++
++    cc::PaintFlags outline;
++    outline.setStyle(cc::PaintFlags::kStroke_Style);
++    outline.setStrokeWidth(core);
++    outline.setColor(col);
++    outline.setAntiAlias(true);
++    canvas.DrawRect(b, outline);
++  }
++
++  // Integer element boxes, for overlap scoring.
++  std::vector<gfx::Rect> box_rects;
++  box_rects.reserve(boxes.size());
++  for (const gfx::RectF& b : boxes) {
++    box_rects.push_back(gfx::ToRoundedRect(b));
++  }
++
++  // Badges. When overlap is unavoidable the least-bad spot wins.
++  std::vector<gfx::Rect> placed;
++  placed.reserve(boxes.size());
++  for (size_t i = 0; i < boxes.size(); ++i) {
++    const SkColor col = kAgentMarkPalette[colors[i]].rgb;
++    const std::u16string text = base::UTF8ToUTF16(labels[i]);
++    const int bw = gfx::GetStringWidth(text, font) + 2 * pad_x;
++    const int bh = text_h + 2 * pad_y;
++
++    const int left = box_rects[i].x();
++    const int top = box_rects[i].y();
++    const int right = box_rects[i].right();
++    const int bottom = box_rects[i].bottom();
++
++    // Candidate badge origins, all fully outside the box, in priority order;
++    // above and left-aligned is the stable default.
++    const gfx::Point candidates[] = {
++        {left, top - bh - gap},          // above, left-aligned
++        {left, bottom + gap},            // below, left-aligned
++        {right - bw, top - bh - gap},    // above, right-aligned
++        {right - bw, bottom + gap},      // below, right-aligned
++        {left - bw - gap, top},          // left of box, top-aligned
++        {right + gap, top},              // right of box, top-aligned
++        {left - bw - gap, bottom - bh},  // left of box, bottom-aligned
++        {right + gap, bottom - bh},      // right of box, bottom-aligned
++    };
++
++    double best_score = std::numeric_limits<double>::max();
++    gfx::Rect best(candidates[0], gfx::Size(bw, bh));
++    for (size_t c = 0; c < std::size(candidates); ++c) {
++      const gfx::Rect r(candidates[c], gfx::Size(bw, bh));
++      double score = static_cast<double>(c) * 0.01;  // earlier is better
++      if (r.x() < 0 || r.y() < 0 || r.right() > img_w || r.bottom() > img_h) {
++        score += 1000.0;  // spills past the screenshot edge
++      }
++      for (const gfx::Rect& p : placed) {
++        if (r.Intersects(p)) {
++          score += 100.0;  // overlaps another badge
++        }
++      }
++      for (size_t j = 0; j < box_rects.size(); ++j) {
++        if (j != i && r.Intersects(box_rects[j])) {
++          score += 3.0;  // covers another element's content
++        }
++      }
++      if (score < best_score) {
++        best_score = score;
++        best = r;
++      }
++    }
++    // On screen even if every candidate spilled over an edge.
++    best.set_x(std::clamp(best.x(), 0, std::max(0, img_w - bw)));
++    best.set_y(std::clamp(best.y(), 0, std::max(0, img_h - bh)));
++    placed.push_back(best);
++
++    canvas.FillRect(best, col);
++    cc::PaintFlags badge_edge;
++    badge_edge.setStyle(cc::PaintFlags::kStroke_Style);
++    badge_edge.setStrokeWidth(1.0f);
++    badge_edge.setColor(SkColorSetARGB(0x80, 0, 0, 0));
++    canvas.DrawRect(gfx::RectF(best), badge_edge);
++
++    const SkColor text_color = color_utils::GetColorWithMaxContrast(col);
++    canvas.DrawStringRectWithFlags(text, font, text_color, best,
++                                   gfx::Canvas::TEXT_ALIGN_CENTER);
++  }
++}
++
+ std::variant<protocol::Response, BitmapEncoder>
+ GetEncoder(const std::string& format, int quality, bool optimize_for_speed) {
+   if (quality < 0 || quality > 100) {
+@@ -496,6 +763,95 @@ struct PageHandler::PendingScreenshotRequest {
+   gfx::Size requested_image_size;
+ };
+ 
++// browser: state of one Page.captureAgentSnapshot call. Ref-counted so it
++// survives the per-frame Mojo replies, the occlusion hit-tests and the
++// screenshot capture, which complete through separate BarrierClosures.
++struct PageHandler::AgentSnapshotRequest
++    : public base::RefCounted<PageHandler::AgentSnapshotRequest> {
++  // One entry per live RenderFrameHost in the page (main frame + every OOPIF).
++  struct FrameEntry {
++    base::WeakPtr<RenderFrameHostImpl> rfh;
++    std::string frame_id;
++    // The frame's widget view. For OOPIFs this is a
++    // RenderWidgetHostViewChildFrame that knows how to transform its local
++    // coordinates to the root; for same-process subframes it is the root view.
++    raw_ptr<RenderWidgetHostViewBase> view = nullptr;
++    blink::mojom::AgentFrameSnapshotPtr snapshot;
++  };
++
++  // An element composed into root-viewport CSS px, kept in this form until
++  // the async hit-test has set `obscured` and the token has been hashed.
++  struct ComposedElement {
++    int backend_node_id = 0;
++    // The local-root RenderFrameHost this element was collected from; with
++    // backend_node_id (the renderer's DOMNodeId) it is what resolveAgentNode
++    // needs to find the element again.
++    GlobalRenderFrameHostId local_root_rfh_id;
++    std::string frame_id;
++    std::string role;
++    std::optional<std::string> name;
++    std::optional<std::string> value;
++    std::optional<std::string> description;
++    std::string tag;
++    bool interactive = false;
++    std::optional<std::string> interactive_reason;
++    std::vector<std::string> states;
++    double x = 0;
++    double y = 0;
++    double width = 0;
++    double height = 0;
++    bool in_viewport = false;
++    bool obscured = false;
++    std::optional<int> shadow_host_backend_node_id;
++    // Resolved absolute URL the element points at, when it has one.
++    std::optional<std::string> href;
++    std::optional<std::string> src;
++    // The widget view that owns this element; compared against the hit-test
++    // result to decide cross-context occlusion.
++    raw_ptr<RenderWidgetHostViewBase> element_view = nullptr;
++    // Action point (root DIP == root CSS px at scale 1) used for the hit-test.
++    gfx::PointF action_point_root;
++  };
++
++  AgentSnapshotRequest() = default;
++
++  std::unique_ptr<CaptureAgentSnapshotCallback> callback;
++  PageHandler::BitmapEncoder encoder;
++  bool include_screenshot = true;
++  blink::mojom::AgentOffscreenMode offscreen_mode =
++      blink::mojom::AgentOffscreenMode::kSummary;
++
++  std::vector<FrameEntry> frames;
++  // Keeps the per-frame Mojo remotes alive until every reply (or disconnect)
++  // has been observed.
++  std::vector<mojo::Remote<blink::mojom::AgentSnapshotCollector>> collectors;
++
++  std::vector<ComposedElement> composed;
++
++  // Captured viewport metrics (root-frame CSS px).
++  std::string url;
++  std::string title;
++  double vp_width = 0;
++  double vp_height = 0;
++  double device_scale_factor = 1;
++  double scroll_x = 0;
++  double scroll_y = 0;
++  double scroll_width = 0;
++  double scroll_height = 0;
++
++  // Fans occlusion and screenshot completion into FinishAgentSnapshot.
++  base::RepeatingClosure finish_barrier;
++  // The screenshot stays unencoded until FinishAgentSnapshot, which draws the
++  // marks once occlusion has decided which elements get one.
++  base::ScopedClosureRunner capturer_handle;
++  SkBitmap screenshot_bitmap;
++  std::optional<std::vector<uint8_t>> screenshot_bytes;
++
++ private:
++  friend class base::RefCounted<PageHandler::AgentSnapshotRequest>;
++  ~AgentSnapshotRequest() = default;
++};
++
+ PageHandler::PageHandler(
+     DevToolsIOContext* io_context,
+     EmulationHandler* emulation_handler,
+@@ -1867,6 +2223,18 @@ void PageHandler::ScreencastFrameCaptured(
+     --frames_in_flight_;
+     return;
+   }
++
++  // browser: composite the cursor overlay onto the frame when active.
++  SkBitmap frame_bitmap = bitmap;
++  CdpCursorOverlay* cursor = GetCdpCursorOverlay();
++  if (cursor) {
++    float scale_x =
++        static_cast<float>(bitmap.width()) / page_metadata->GetDeviceWidth();
++    float scale_y =
++        static_cast<float>(bitmap.height()) / page_metadata->GetDeviceHeight();
++    cursor->CompositeCursorOnto(frame_bitmap, scale_x, scale_y);
++  }
++
+   base::ThreadPool::PostTaskAndReplyWithResult(
+       FROM_HERE, {base::TaskShutdownBehavior::CONTINUE_ON_SHUTDOWN},
+       base::BindOnce(
+@@ -1874,11 +2242,32 @@ void PageHandler::ScreencastFrameCaptured(
+              BitmapEncoder encoder) -> std::optional<std::vector<uint8_t>> {
+             return encoder.Run(bitmap);
+           },
+-          bitmap, screencast_encoder_),
++          frame_bitmap, screencast_encoder_),
+       base::BindOnce(&PageHandler::ScreencastFrameEncoded,
+                      weak_factory_.GetWeakPtr(), std::move(page_metadata)));
+ }
+ 
++// browser: the overlay lives on the InputHandler of the same agent host.
++CdpCursorOverlay* PageHandler::GetCdpCursorOverlay() {
++  if (!host_) {
++    return nullptr;
++  }
++  auto* contents = WebContentsImpl::FromRenderFrameHostImpl(host_);
++  if (!contents) {
++    return nullptr;
++  }
++  auto agent_host = DevToolsAgentHost::GetOrCreateFor(contents);
++  if (!agent_host) {
++    return nullptr;
++  }
++  auto input_handlers = InputHandler::ForAgentHost(
++      static_cast<DevToolsAgentHostImpl*>(agent_host.get()));
++  if (input_handlers.empty()) {
++    return nullptr;
++  }
++  return input_handlers[0]->cursor_overlay();
++}
++
+ void PageHandler::ScreencastFrameEncoded(
+     std::unique_ptr<Page::ScreencastFrameMetadata> page_metadata,
+     std::optional<std::vector<uint8_t>> data) {
+@@ -1935,6 +2324,543 @@ void PageHandler::ScreenshotCaptured(
+   request->callback->sendSuccess(Binary());
+ }
+ 
++namespace {
++
++blink::mojom::AgentOffscreenMode AgentOffscreenModeFromString(
++    const std::optional<std::string>& mode) {
++  if (mode == Page::CaptureAgentSnapshot::OffscreenModeEnum::None) {
++    return blink::mojom::AgentOffscreenMode::kNone;
++  }
++  if (mode == Page::CaptureAgentSnapshot::OffscreenModeEnum::Full) {
++    return blink::mojom::AgentOffscreenMode::kFull;
++  }
++  return blink::mojom::AgentOffscreenMode::kSummary;
++}
++
++void SendAgentNodeNotFound(Page::Backend::ResolveAgentNodeCallback& callback) {
++  callback.sendSuccess(/*found=*/false, std::nullopt, std::nullopt,
++                       std::nullopt, std::nullopt);
++}
++
++}  // namespace
++
++// browser: Page.captureAgentSnapshot. Validates, enumerates the page's local
++// roots and fans out the per-frame Mojo calls; the reply is assembled in
++// FinishAgentSnapshot once every frame, the occlusion hit-tests and the
++// screenshot have completed.
++void PageHandler::CaptureAgentSnapshot(
++    std::optional<std::string> format,
++    std::optional<int> quality,
++    std::optional<std::string> offscreen_mode,
++    std::optional<bool> include_screenshot,
++    std::unique_ptr<CaptureAgentSnapshotCallback> callback) {
++  if (!host_ || !host_->GetRenderWidgetHost() ||
++      !host_->GetRenderWidgetHost()->GetView()) {
++    callback->sendFailure(Response::InternalError());
++    return;
++  }
++  if (!CanExecuteGlobalCommands(this, callback)) {
++    return;
++  }
++
++  auto encoder =
++      GetEncoder(format.value_or(Page::CaptureScreenshot::FormatEnum::Png),
++                 quality.value_or(kDefaultScreenshotQuality),
++                 /*optimize_for_speed=*/false);
++  if (std::holds_alternative<Response>(encoder)) {
++    callback->sendFailure(std::get<Response>(encoder));
++    return;
++  }
++
++  // Each capture mints fresh agentNodeIds; the previous capture's registry
++  // is dropped so stale ids stop resolving. The counter keeps incrementing so
++  // ids stay unique across captures.
++  agent_node_registry_.clear();
++
++  auto request = base::MakeRefCounted<AgentSnapshotRequest>();
++  request->callback = std::move(callback);
++  request->encoder = std::get<BitmapEncoder>(encoder);
++  request->include_screenshot = include_screenshot.value_or(true);
++  request->offscreen_mode = AgentOffscreenModeFromString(offscreen_mode);
++
++  // Every live local root (main frame and each OOPIF root). Same-process
++  // subframes are skipped: the renderer walks a local root's same-process
++  // descendants inside one CollectFrameElements() call and returns their
++  // boxes already in the local root's space. Calling them here too would
++  // count their elements twice and, because such a subframe shares its local
++  // root's widget view, TransformPointToRootCoordSpaceF would drop its
++  // in-root offset.
++  host_->ForEachRenderFrameHostImpl([&request](RenderFrameHostImpl* rfh) {
++    if (!rfh->IsRenderFrameLive() || !rfh->is_local_root()) {
++      return;
++    }
++    AgentSnapshotRequest::FrameEntry entry;
++    entry.rfh = rfh->GetWeakPtr();
++    entry.frame_id = rfh->GetDevToolsFrameToken().ToString();
++    entry.view = static_cast<RenderWidgetHostViewBase*>(rfh->GetView());
++    request->frames.push_back(std::move(entry));
++  });
++
++  if (request->frames.empty()) {
++    OnAllAgentFramesCollected(request);
++    return;
++  }
++
++  // Proceeds once every frame has replied or dropped its pipe.
++  base::RepeatingClosure barrier = base::BarrierClosure(
++      request->frames.size(),
++      base::BindOnce(&PageHandler::OnAllAgentFramesCollected,
++                     weak_factory_.GetWeakPtr(), request));
++
++  request->collectors.reserve(request->frames.size());
++  for (size_t i = 0; i < request->frames.size(); ++i) {
++    RenderFrameHostImpl* rfh = request->frames[i].rfh.get();
++    service_manager::InterfaceProvider* remotes =
++        rfh ? rfh->GetRemoteInterfaces() : nullptr;
++    if (!remotes) {
++      // The frame went away between enumeration and dispatch.
++      barrier.Run();
++      continue;
++    }
++    mojo::Remote<blink::mojom::AgentSnapshotCollector> collector;
++    remotes->GetInterface(collector.BindNewPipeAndPassReceiver());
++    auto options = blink::mojom::AgentSnapshotOptions::New();
++    options->offscreen_mode = request->offscreen_mode;
++    // A dropped pipe still advances the barrier, with a null snapshot.
++    collector->CollectFrameElements(
++        std::move(options),
++        mojo::WrapCallbackWithDefaultInvokeIfNotRun(
++            base::BindOnce(&PageHandler::OnAgentFrameElementsCollected,
++                           weak_factory_.GetWeakPtr(), request, i, barrier),
++            nullptr));
++    request->collectors.push_back(std::move(collector));
++  }
++}
++
++void PageHandler::OnAgentFrameElementsCollected(
++    scoped_refptr<AgentSnapshotRequest> request,
++    size_t frame_index,
++    base::RepeatingClosure barrier,
++    blink::mojom::AgentFrameSnapshotPtr result) {
++  if (frame_index < request->frames.size()) {
++    request->frames[frame_index].snapshot = std::move(result);
++  }
++  barrier.Run();
++}
++
++// Composes every frame's local boxes into root-viewport CSS px, then starts
++// the occlusion hit-tests and the screenshot in parallel.
++void PageHandler::OnAllAgentFramesCollected(
++    scoped_refptr<AgentSnapshotRequest> request) {
++  if (!host_ || !host_->GetRenderWidgetHost() ||
++      !host_->GetRenderWidgetHost()->GetView()) {
++    if (request->callback) {
++      request->callback->sendFailure(Response::InternalError());
++    }
++    return;
++  }
++
++  RenderWidgetHostImpl* widget_host = host_->GetRenderWidgetHost();
++  auto* root_view = static_cast<RenderWidgetHostViewBase*>(host_->GetView());
++
++  request->url = host_->GetLastCommittedURL().spec();
++  if (auto* wc = WebContentsImpl::FromRenderFrameHostImpl(host_)) {
++    request->title = base::UTF16ToUTF8(wc->GetTitle());
++  }
++
++  // GetVisibleViewportSize() is in DIP, which is CSS px at pinch scale 1.
++  const cc::RenderFrameMetadata& metadata =
++      widget_host->render_frame_metadata_provider()->LastRenderFrameMetadata();
++  double dsf = metadata.device_scale_factor > 0
++                   ? metadata.device_scale_factor
++                   : root_view->GetDeviceScaleFactor();
++  if (dsf <= 0) {
++    dsf = 1;
++  }
++  gfx::Size visible = root_view->GetVisibleViewportSize();
++  request->device_scale_factor = dsf;
++  request->vp_width = visible.width();
++  request->vp_height = visible.height();
++  if (metadata.root_scroll_offset) {
++    // Physical px to CSS px, as BuildScreencastFrameMetadata does.
++    request->scroll_x = metadata.root_scroll_offset->x() / dsf;
++    request->scroll_y = metadata.root_scroll_offset->y() / dsf;
++  }
++  // TODO: take the scrollable content size from
++  // blink::mojom::LocalMainFrame::GetFullPageSize as CaptureScreenshot does;
++  // until then this is a lower bound from the viewport and scroll offset.
++  request->scroll_width = std::max<double>(
++      request->vp_width, request->scroll_x + request->vp_width);
++  request->scroll_height = std::max<double>(
++      request->vp_height, request->scroll_y + request->vp_height);
++
++  const gfx::RectF root_viewport_rect(0, 0, request->vp_width,
++                                      request->vp_height);
++
++  for (auto& frame : request->frames) {
++    if (!frame.snapshot || !frame.view) {
++      continue;
++    }
++    RenderWidgetHostViewBase* frame_view = frame.view;
++    const GlobalRenderFrameHostId frame_rfh_id =
++        frame.rfh ? frame.rfh->GetGlobalId() : GlobalRenderFrameHostId();
++    for (const auto& el : frame.snapshot->elements) {
++      AgentSnapshotRequest::ComposedElement ce;
++      ce.backend_node_id = el->backend_node_id;
++      ce.local_root_rfh_id = frame_rfh_id;
++      ce.frame_id = frame.frame_id;
++      ce.role = el->role;
++      if (!el->name.empty()) {
++        ce.name = el->name;
++      }
++      if (!el->value.empty()) {
++        ce.value = el->value;
++      }
++      if (!el->description.empty()) {
++        ce.description = el->description;
++      }
++      ce.tag = el->tag;
++      ce.interactive = el->interactive;
++      if (!el->interactive_reason.empty()) {
++        ce.interactive_reason = el->interactive_reason;
++      }
++      ce.states = el->states;
++      if (el->shadow_host_backend_node_id != 0) {
++        ce.shadow_host_backend_node_id = el->shadow_host_backend_node_id;
++      }
++      if (!el->href.empty()) {
++        ce.href = el->href;
++      }
++      if (!el->src.empty()) {
++        ce.src = el->src;
++      }
++      ce.element_view = frame_view;
++
++      // The renderer already expressed same-process subframe elements in
++      // their local root's space, so `frame` is always a local root: the
++      // main frame's transform is the identity, and an OOPIF root's
++      // child-frame view maps to the true root. Local CSS px equal DIP at
++      // page and pinch scale 1.
++      // TODO: divide by the page/pinch scale for zoomed pages, and map all
++      // four corners once a non-axis-aligned transform is possible.
++      const blink::mojom::AgentElementBox& box = *el->box;
++      gfx::PointF top_left = frame_view->TransformPointToRootCoordSpaceF(
++          gfx::PointF(box.x, box.y));
++      ce.x = top_left.x();
++      ce.y = top_left.y();
++      ce.width = box.width;
++      ce.height = box.height;
++
++      const gfx::RectF root_box(ce.x, ce.y, ce.width, ce.height);
++      ce.in_viewport = root_box.Intersects(root_viewport_rect);
++      ce.action_point_root =
++          gfx::PointF(ce.x + ce.width / 2, ce.y + ce.height / 2);
++
++      request->composed.push_back(std::move(ce));
++    }
++  }
++
++  const int outstanding = request->include_screenshot ? 2 : 1;
++  request->finish_barrier = base::BarrierClosure(
++      outstanding, base::BindOnce(&PageHandler::FinishAgentSnapshot,
++                                  weak_factory_.GetWeakPtr(), request));
++
++  StartAgentSnapshotOcclusion(request);
++  if (request->include_screenshot) {
++    StartAgentSnapshotScreenshot(request);
++  }
++}
++
++// Cross-context occlusion. Only interactive in-viewport elements are
++// hit-tested; everything else keeps obscured=false.
++void PageHandler::StartAgentSnapshotOcclusion(
++    scoped_refptr<AgentSnapshotRequest> request) {
++  std::vector<size_t> to_test;
++  for (size_t i = 0; i < request->composed.size(); ++i) {
++    const auto& ce = request->composed[i];
++    if (ce.interactive && ce.in_viewport) {
++      to_test.push_back(i);
++    }
++  }
++
++  RenderWidgetHostDelegate* delegate =
++      host_ && host_->GetRenderWidgetHost()
++          ? host_->GetRenderWidgetHost()->delegate()
++          : nullptr;
++  auto* root_view =
++      host_ ? static_cast<RenderWidgetHostViewBase*>(host_->GetView())
++            : nullptr;
++  if (to_test.empty() || !delegate || !delegate->GetInputEventRouter() ||
++      !root_view) {
++    request->finish_barrier.Run();
++    return;
++  }
++
++  // TODO: one async hit-test per element; a synchronous viz::HitTestQuery
++  // off the root HostFrameSinkManager could replace them.
++  base::RepeatingClosure occlusion_barrier =
++      base::BarrierClosure(to_test.size(), request->finish_barrier);
++  for (size_t index : to_test) {
++    delegate->GetRenderWidgetHostAtPointAsynchronously(
++        root_view, request->composed[index].action_point_root,
++        mojo::WrapCallbackWithDefaultInvokeIfNotRun(
++            base::BindOnce(&PageHandler::OnAgentElementOcclusionResolved,
++                           weak_factory_.GetWeakPtr(), request, index,
++                           occlusion_barrier),
++            base::WeakPtr<RenderWidgetHostViewBase>(),
++            std::optional<gfx::PointF>()));
++  }
++}
++
++void PageHandler::OnAgentElementOcclusionResolved(
++    scoped_refptr<AgentSnapshotRequest> request,
++    size_t element_index,
++    base::RepeatingClosure barrier,
++    base::WeakPtr<RenderWidgetHostViewBase> target_view,
++    std::optional<gfx::PointF> transformed_point) {
++  if (element_index < request->composed.size()) {
++    auto& ce = request->composed[element_index];
++    // A failed hit-test leaves obscured=false. A topmost view other than the
++    // element's own means cross-context content covers it.
++    if (target_view && transformed_point.has_value()) {
++      ce.obscured = target_view.get() != ce.element_view;
++    }
++  }
++  barrier.Run();
++}
++
++// OOPIF-aggregated screenshot through the same surface path as
++// CaptureScreenshot.
++void PageHandler::StartAgentSnapshotScreenshot(
++    scoped_refptr<AgentSnapshotRequest> request) {
++  RenderWidgetHostImpl* widget_host =
++      host_ ? host_->GetRenderWidgetHost() : nullptr;
++  if (!widget_host || !widget_host->GetView()) {
++    request->finish_barrier.Run();
++    return;
++  }
++  if (auto* wc = WebContents::FromRenderFrameHost(host_)) {
++    // Frames are produced even while the page is hidden.
++    request->capturer_handle =
++        wc->IncrementCapturerCount(gfx::Size(), /*stay_hidden=*/true,
++                                   /*stay_awake=*/true, /*is_activity=*/false);
++  }
++  widget_host->GetSnapshotFromBrowser(
++      base::BindOnce(&PageHandler::OnAgentSnapshotScreenshotCaptured,
++                     weak_factory_.GetWeakPtr(), request),
++      /*from_surface=*/true);
++}
++
++void PageHandler::OnAgentSnapshotScreenshotCaptured(
++    scoped_refptr<AgentSnapshotRequest> request,
++    const gfx::Image& image) {
++  if (!image.IsEmpty()) {
++    // A writable copy: the captured bitmap shares pixels with the surface
++    // capture, and FinishAgentSnapshot draws on it.
++    const SkBitmap& src = *image.ToSkBitmap();
++    if (!src.drawsNothing() &&
++        request->screenshot_bitmap.tryAllocPixels(src.info())) {
++      src.readPixels(request->screenshot_bitmap.pixmap(), 0, 0);
++    }
++  }
++  request->capturer_handle.RunAndReset();
++  request->finish_barrier.Run();
++}
++
++// Assembles the protocol response.
++void PageHandler::FinishAgentSnapshot(
++    scoped_refptr<AgentSnapshotRequest> request) {
++  if (!request->callback) {
++    return;
++  }
++
++  auto viewport = Page::AgentSnapshotViewport::Create()
++                      .SetWidth(base::ClampRound(request->vp_width))
++                      .SetHeight(base::ClampRound(request->vp_height))
++                      .SetDeviceScaleFactor(request->device_scale_factor)
++                      .SetScrollX(request->scroll_x)
++                      .SetScrollY(request->scroll_y)
++                      .SetScrollWidth(request->scroll_width)
++                      .SetScrollHeight(request->scroll_height)
++                      .Build();
++
++  auto elements =
++      std::make_unique<protocol::Array<Page::AgentSnapshotElement>>();
++
++  // The change-detection token covers the url, the viewport geometry and
++  // each reported element's identity and composed geometry.
++  // TODO: fold the focused element's backendNodeId into the token.
++  std::string token_src = base::StringPrintf(
++      "%s|%d|%d|%.1f|%.1f", request->url.c_str(),
++      base::ClampRound(request->vp_width), base::ClampRound(request->vp_height),
++      request->scroll_x, request->scroll_y);
++
++  // The marked set is what the user can act on right now: in the viewport,
++  // interactive and not occluded. Labels a1.. and the colors drive both the
++  // drawn overlay and the per-element label/color fields, so the screenshot
++  // and the listing always agree.
++  const double dsf = request->device_scale_factor;
++  std::vector<int> mark_slot(request->composed.size(), -1);
++  std::vector<gfx::RectF> mark_boxes;
++  std::vector<std::string> mark_labels;
++  for (size_t i = 0; i < request->composed.size(); ++i) {
++    const auto& ce = request->composed[i];
++    if (ce.in_viewport && ce.interactive && !ce.obscured) {
++      mark_slot[i] = static_cast<int>(mark_boxes.size());
++      mark_boxes.emplace_back(ce.x * dsf, ce.y * dsf, ce.width * dsf,
++                              ce.height * dsf);
++      mark_labels.push_back(base::StringPrintf("a%zu", mark_boxes.size()));
++    }
++  }
++  const std::vector<int> mark_colors = AssignAgentMarkColors(mark_boxes, dsf);
++
++  if (request->include_screenshot &&
++      !request->screenshot_bitmap.drawsNothing()) {
++    if (!mark_boxes.empty()) {
++      DrawAgentMarks(request->screenshot_bitmap, mark_boxes, mark_labels,
++                     mark_colors, dsf);
++    }
++    request->screenshot_bytes =
++        request->encoder.Run(request->screenshot_bitmap);
++  }
++
++  for (size_t i = 0; i < request->composed.size(); ++i) {
++    const auto& ce = request->composed[i];
++    // `none` drops elements outside the root viewport; the other modes keep
++    // them.
++    // TODO: apply a real `summary` cap on offscreen elements.
++    if (!ce.in_viewport &&
++        request->offscreen_mode == blink::mojom::AgentOffscreenMode::kNone) {
++      continue;
++    }
++
++    auto states = std::make_unique<protocol::Array<std::string>>();
++    for (const auto& state : ce.states) {
++      states->emplace_back(state);
++    }
++
++    // Only emitted elements get an agentNodeId, so the registry mirrors what
++    // the caller received.
++    const int agent_node_id = ++next_agent_node_id_;
++    agent_node_registry_[agent_node_id] = {ce.local_root_rfh_id,
++                                           ce.backend_node_id};
++
++    // Required fields go through the builder; optional ones are set after.
++    auto element = Page::AgentSnapshotElement::Create()
++                       .SetBackendNodeId(ce.backend_node_id)
++                       .SetAgentNodeId(agent_node_id)
++                       .SetFrameId(ce.frame_id)
++                       .SetRole(ce.role)
++                       .SetTag(ce.tag)
++                       .SetInteractive(ce.interactive)
++                       .SetStates(std::move(states))
++                       .SetX(ce.x)
++                       .SetY(ce.y)
++                       .SetWidth(ce.width)
++                       .SetHeight(ce.height)
++                       .SetInViewport(ce.in_viewport)
++                       .SetObscured(ce.obscured)
++                       .Build();
++    if (ce.name) {
++      element->SetName(*ce.name);
++    }
++    if (ce.value) {
++      element->SetValue(*ce.value);
++    }
++    if (ce.description) {
++      element->SetDescription(*ce.description);
++    }
++    if (ce.interactive_reason) {
++      element->SetInteractiveReason(*ce.interactive_reason);
++    }
++    if (ce.shadow_host_backend_node_id) {
++      element->SetShadowHostBackendNodeId(*ce.shadow_host_backend_node_id);
++    }
++    if (ce.href) {
++      element->SetHref(*ce.href);
++    }
++    if (ce.src) {
++      element->SetSrc(*ce.src);
++    }
++    if (mark_slot[i] >= 0) {
++      const int slot = mark_slot[i];
++      element->SetLabel(mark_labels[slot]);
++      element->SetColor(kAgentMarkPalette[mark_colors[slot]].name);
++    }
++
++    base::StringAppendF(&token_src, ";%d,%.1f,%.1f,%.1f,%.1f",
++                        ce.backend_node_id, ce.x, ce.y, ce.width, ce.height);
++    elements->emplace_back(std::move(element));
++  }
++
++  std::string snapshot_token =
++      base::StringPrintf("%08x", base::PersistentHash(token_src));
++
++  std::optional<Binary> screenshot;
++  if (request->include_screenshot && request->screenshot_bytes) {
++    screenshot = Binary::fromVector(std::move(*request->screenshot_bytes));
++  }
++
++  request->callback->sendSuccess(request->url, request->title,
++                                 std::move(viewport), std::move(elements),
++                                 std::move(screenshot), snapshot_token);
++}
++
++// browser: Page.resolveAgentNode.
++void PageHandler::ResolveAgentNode(
++    int agent_node_id,
++    std::unique_ptr<ResolveAgentNodeCallback> callback) {
++  auto it = agent_node_registry_.find(agent_node_id);
++  if (it == agent_node_registry_.end()) {
++    SendAgentNodeNotFound(*callback);
++    return;
++  }
++  const AgentNodeEntry entry = it->second;
++  RenderFrameHostImpl* rfh = RenderFrameHostImpl::FromID(entry.local_root);
++  service_manager::InterfaceProvider* remotes =
++      rfh && rfh->IsRenderFrameLive() ? rfh->GetRemoteInterfaces() : nullptr;
++  if (!remotes) {
++    SendAgentNodeNotFound(*callback);
++    return;
++  }
++
++  mojo::Remote<blink::mojom::AgentSnapshotCollector> collector;
++  remotes->GetInterface(collector.BindNewPipeAndPassReceiver());
++  // The proxy pointer is read before the Remote moves into the reply
++  // callback, which keeps the pipe alive until the reply. A dropped pipe
++  // still answers found=false instead of hanging.
++  blink::mojom::AgentSnapshotCollector* raw = collector.get();
++  raw->ResolveNode(
++      entry.dom_node_id,
++      mojo::WrapCallbackWithDefaultInvokeIfNotRun(
++          base::BindOnce(&PageHandler::OnAgentNodeResolved,
++                         weak_factory_.GetWeakPtr(), std::move(callback),
++                         entry.local_root, std::move(collector)),
++          /*found=*/false, /*box=*/nullptr));
++}
++
++void PageHandler::OnAgentNodeResolved(
++    std::unique_ptr<ResolveAgentNodeCallback> callback,
++    GlobalRenderFrameHostId local_root_rfh_id,
++    mojo::Remote<blink::mojom::AgentSnapshotCollector> collector,
++    bool found,
++    blink::mojom::AgentElementBoxPtr box) {
++  RenderFrameHostImpl* rfh = RenderFrameHostImpl::FromID(local_root_rfh_id);
++  if (!found || !box || !rfh || !rfh->IsRenderFrameLive() || !rfh->GetView()) {
++    SendAgentNodeNotFound(*callback);
++    return;
++  }
++
++  // Same composition as the capture path: the top-left goes through the
++  // frame's widget view (identity for the main frame, the true root
++  // transform for an OOPIF's child-frame view); width and height are kept.
++  auto* view = static_cast<RenderWidgetHostViewBase*>(rfh->GetView());
++  gfx::PointF top_left =
++      view->TransformPointToRootCoordSpaceF(gfx::PointF(box->x, box->y));
++  callback->sendSuccess(/*found=*/true, top_left.x(), top_left.y(), box->width,
++                        box->height);
++}
++
+ Response PageHandler::StopLoading() {
+   ResponseOrWebContents result = GetWebContentsForTopLevelActiveFrame();
+ 
+diff --git a/content/browser/devtools/protocol/page_handler.h b/content/browser/devtools/protocol/page_handler.h
+index 0ceca6f809..89923bf9ce 100644
+--- a/content/browser/devtools/protocol/page_handler.h
++++ b/content/browser/devtools/protocol/page_handler.h
+@@ -13,7 +13,10 @@
+ #include <variant>
+ #include <vector>
+ 
++#include "base/containers/flat_map.h"
++#include "base/functional/callback.h"
+ #include "base/memory/raw_ptr.h"
++#include "base/memory/scoped_refptr.h"
+ #include "base/memory/weak_ptr.h"
+ #include "base/scoped_observation.h"
+ #include "build/build_config.h"
+@@ -26,11 +29,15 @@
+ #include "content/browser/preloading/prerender/prerender_final_status.h"
+ #include "content/browser/renderer_host/render_widget_host_impl.h"
+ #include "content/public/browser/download_manager.h"
++#include "content/public/browser/global_routing_id.h"
+ #include "content/public/browser/javascript_dialog_manager.h"
+ #include "content/public/browser/render_widget_host.h"
+ #include "content/public/browser/render_widget_host_observer.h"
+ #include "content/public/common/javascript_dialog_type.h"
++#include "mojo/public/cpp/bindings/remote.h"
++#include "third_party/blink/public/mojom/agent_snapshot/agent_snapshot_collector.mojom-forward.h"
+ #include "third_party/blink/public/mojom/manifest/manifest.mojom-forward.h"
++#include "ui/gfx/geometry/point_f.h"
+ #include "url/gurl.h"
+ 
+ class SkBitmap;
+@@ -46,11 +53,13 @@ class Image;
+ namespace content {
+ 
+ class BackForwardCacheCanStoreDocumentResult;
++class CdpCursorOverlay;
+ class DevToolsAgentHostImpl;
+ class DevToolsIOContext;
+ class FrameTreeNode;
+ class NavigationRequest;
+ class RenderFrameHostImpl;
++class RenderWidgetHostViewBase;
+ class WebContentsImpl;
+ 
+ namespace protocol {
+@@ -157,6 +166,17 @@ class PageHandler : public DevToolsDomainHandler,
+       std::optional<bool> capture_beyond_viewport,
+       std::optional<bool> optimize_for_speed,
+       std::unique_ptr<CaptureScreenshotCallback> callback) override;
++  // browser: Page.captureAgentSnapshot and Page.resolveAgentNode; see
++  // Page.pdl.
++  void CaptureAgentSnapshot(
++      std::optional<std::string> format,
++      std::optional<int> quality,
++      std::optional<std::string> offscreen_mode,
++      std::optional<bool> include_screenshot,
++      std::unique_ptr<CaptureAgentSnapshotCallback> callback) override;
++  void ResolveAgentNode(
++      int agent_node_id,
++      std::unique_ptr<ResolveAgentNodeCallback> callback) override;
+   void CaptureSnapshot(
+       std::optional<std::string> format,
+       std::unique_ptr<CaptureSnapshotCallback> callback) override;
+@@ -225,6 +245,37 @@ class PageHandler : public DevToolsDomainHandler,
+  private:
+   struct PendingScreenshotRequest;
+ 
++  // browser: the captureAgentSnapshot pipeline. AgentSnapshotRequest is
++  // ref-counted so it outlives the individual BarrierClosure stages.
++  struct AgentSnapshotRequest;
++  void OnAgentFrameElementsCollected(
++      scoped_refptr<AgentSnapshotRequest> request,
++      size_t frame_index,
++      base::RepeatingClosure barrier,
++      blink::mojom::AgentFrameSnapshotPtr result);
++  void OnAllAgentFramesCollected(scoped_refptr<AgentSnapshotRequest> request);
++  void StartAgentSnapshotOcclusion(scoped_refptr<AgentSnapshotRequest> request);
++  void OnAgentElementOcclusionResolved(
++      scoped_refptr<AgentSnapshotRequest> request,
++      size_t element_index,
++      base::RepeatingClosure barrier,
++      base::WeakPtr<RenderWidgetHostViewBase> target_view,
++      std::optional<gfx::PointF> transformed_point);
++  void StartAgentSnapshotScreenshot(
++      scoped_refptr<AgentSnapshotRequest> request);
++  void OnAgentSnapshotScreenshotCaptured(
++      scoped_refptr<AgentSnapshotRequest> request,
++      const gfx::Image& image);
++  void FinishAgentSnapshot(scoped_refptr<AgentSnapshotRequest> request);
++
++  // `collector` is bound only to keep the Mojo Remote alive until the reply.
++  void OnAgentNodeResolved(
++      std::unique_ptr<ResolveAgentNodeCallback> callback,
++      GlobalRenderFrameHostId local_root_rfh_id,
++      mojo::Remote<blink::mojom::AgentSnapshotCollector> collector,
++      bool found,
++      blink::mojom::AgentElementBoxPtr box);
++
+   using BitmapEncoder =
+       base::RepeatingCallback<std::optional<std::vector<uint8_t>>(
+           const SkBitmap& bitmap)>;
+@@ -241,6 +292,7 @@ class PageHandler : public DevToolsDomainHandler,
+   void ScreencastFrameCaptured(
+       std::unique_ptr<Page::ScreencastFrameMetadata> metadata,
+       const SkBitmap& bitmap);
++  CdpCursorOverlay* GetCdpCursorOverlay();  // browser
+   void ScreencastFrameEncoded(
+       std::unique_ptr<Page::ScreencastFrameMetadata> metadata,
+       std::optional<std::vector<uint8_t>> data);
+@@ -304,6 +356,17 @@ class PageHandler : public DevToolsDomainHandler,
+   base::flat_set<raw_ptr<download::DownloadItem, CtnExperimental>>
+       pending_downloads_;
+ 
++  // browser: resolveAgentNode support. The counter is never reset, so
++  // agentNodeIds are unique over the handler's lifetime; the registry holds
++  // the ids minted by the most recent capture and is cleared at the start of
++  // every capture.
++  struct AgentNodeEntry {
++    GlobalRenderFrameHostId local_root;
++    int32_t dom_node_id = 0;
++  };
++  int next_agent_node_id_ = 0;
++  base::flat_map<int, AgentNodeEntry> agent_node_registry_;
++
+   bool is_prerendering_allowed_ = true;
+   base::RepeatingCallback<void(std::string)> prepare_for_reload_callback_;
+   bool have_pending_reload_ = false;
+diff --git a/third_party/blink/public/devtools_protocol/domains/Page.pdl b/third_party/blink/public/devtools_protocol/domains/Page.pdl
+index 80cd13ea63..ee2630acb9 100644
+--- a/third_party/blink/public/devtools_protocol/domains/Page.pdl
++++ b/third_party/blink/public/devtools_protocol/domains/Page.pdl
+@@ -601,6 +601,140 @@ domain Page
+       # Base64-encoded image data.
+       binary data
+ 
++  # Viewport and scroll geometry captured with an agent snapshot. All values
++  # are in the root frame's CSS-pixel space; deviceScaleFactor converts to
++  # the device pixels of the returned screenshot.
++  experimental type AgentSnapshotViewport extends object
++    properties
++      # Layout viewport width in CSS pixels.
++      integer width
++      # Layout viewport height in CSS pixels.
++      integer height
++      # Device pixel ratio (CSS px -> device px).
++      number deviceScaleFactor
++      # Horizontal scroll offset in CSS pixels.
++      number scrollX
++      # Vertical scroll offset in CSS pixels.
++      number scrollY
++      # Full scrollable content width in CSS pixels.
++      number scrollWidth
++      # Full scrollable content height in CSS pixels.
++      number scrollHeight
++
++  # One interactive element, gathered across all frames (cross-origin OOPIFs
++  # and open or closed shadow DOM included). Geometry is composed into the
++  # root viewport's CSS-pixel space, so annotations land where the user sees
++  # the element.
++  experimental type AgentSnapshotElement extends object
++    properties
++      # Stable CDP identity of the element.
++      DOM.BackendNodeId backendNodeId
++      # Opaque browser-minted handle, unique across all frames including
++      # OOPIFs; used with resolveAgentNode.
++      integer agentNodeId
++      # Id of the frame that owns this element.
++      FrameId frameId
++      # Computed accessibility role, or the tag-derived role when no ARIA role.
++      string role
++      # Accessible name.
++      optional string name
++      # Current value (form controls), if any.
++      optional string value
++      # Accessible description, if any.
++      optional string description
++      # Lowercased tag name (e.g. "div", "button", "input").
++      string tag
++      # Whether the element is considered interactive/actionable.
++      boolean interactive
++      # Why it was classified interactive: role, form-control, listener,
++      # cursor or tabindex.
++      optional string interactiveReason
++      # Active state flags: visible, enabled, focusable, focused, editable,
++      # checked, expanded, selected, disabled, readonly, required.
++      array of string states
++      # Border-box X in the root viewport's CSS-pixel space (viewport-relative).
++      number x
++      # Border-box Y in the root viewport's CSS-pixel space (viewport-relative).
++      number y
++      # Border-box width in CSS pixels.
++      number width
++      # Border-box height in CSS pixels.
++      number height
++      # Whether the border-box intersects the root viewport.
++      boolean inViewport
++      # True when a cross-context hit-test at the element's action point lands
++      # on other content in any frame, so the element cannot be clicked.
++      boolean obscured
++      # The shadow host's backendNodeId when this element lives inside a
++      # shadow tree.
++      optional DOM.BackendNodeId shadowHostBackendNodeId
++      # Short handle drawn on the screenshot (e.g. "a1"). Present only for
++      # marked elements, those in the viewport, interactive and not obscured,
++      # which the agent can act on right now.
++      optional string label
++      # Name of the color of this element's outline and badge (e.g. "red").
++      # Present only for marked elements; neighboring marks get colors as far
++      # apart as possible so a label binds unambiguously to its box.
++      optional string color
++      # Where this element points, resolved against the document base URL. An
++      # agent cannot get a link's destination from its accessible name, and
++      # clicking to discover it follows redirects and destroys the page state
++      # being inspected. Absent when the element has no such attribute.
++      # href: <a>, <area>, <link>.
++      optional string href
++      # src: <img>, <iframe>, <video>, <audio>, <source>, <embed>, <script>.
++      optional string src
++
++  # Captures one agent-perception frame: interactive elements across all
++  # frames with geometry composed into the root viewport and cross-context
++  # occlusion flags, plus an OOPIF-aggregated screenshot.
++  experimental command captureAgentSnapshot
++    parameters
++      # Screenshot compression format (defaults to png).
++      optional enum format
++        jpeg
++        png
++        webp
++      # Compression quality [0..100] (jpeg/webp only).
++      optional integer quality
++      # How to report elements outside the root viewport: none (drop them),
++      # summary (cap the count), full (all). Defaults to summary.
++      optional enum offscreenMode
++        none
++        summary
++        full
++      # Include the screenshot in the response (defaults to true).
++      optional boolean includeScreenshot
++    returns
++      # Page URL at capture time.
++      string url
++      # Page title at capture time.
++      string title
++      # Viewport + scroll geometry.
++      AgentSnapshotViewport viewport
++      # Interactive elements, composed into root-viewport space.
++      array of AgentSnapshotElement elements
++      # OOPIF-aggregated screenshot; present when includeScreenshot.
++      optional binary screenshot
++      # Cheap change-detection token over url, geometry and element
++      # identities.
++      string snapshotToken
++
++  # Resolves an agentNodeId from a prior captureAgentSnapshot to the
++  # element's current border-box in the root viewport's CSS-pixel space, the
++  # same units as AgentSnapshotElement. Works uniformly for elements in
++  # cross-origin frames. found is false when the id is unknown or the element
++  # is gone or not laid out.
++  experimental command resolveAgentNode
++    parameters
++      integer agentNodeId
++    returns
++      boolean found
++      optional number x
++      optional number y
++      optional number width
++      optional number height
++
+   # Returns a snapshot of the page as a string. For MHTML format, the serialization includes
+   # iframes, shadow DOM, external resources, and element-inline styles.
+   experimental command captureSnapshot
+diff --git a/third_party/blink/public/mojom/BUILD.gn b/third_party/blink/public/mojom/BUILD.gn
+index f51eea1932..e164c2d695 100644
+--- a/third_party/blink/public/mojom/BUILD.gn
++++ b/third_party/blink/public/mojom/BUILD.gn
+@@ -55,6 +55,7 @@ mojom("mojom_platform") {
+   generate_java = true
+   sources = [
+     "ad_tagging/ad_evidence.mojom",
++    "agent_snapshot/agent_snapshot_collector.mojom",
+     "ai/ai_common.mojom",
+     "ai/ai_language_model.mojom",
+     "ai/ai_manager.mojom",
+diff --git a/third_party/blink/public/mojom/agent_snapshot/agent_snapshot_collector.mojom b/third_party/blink/public/mojom/agent_snapshot/agent_snapshot_collector.mojom
+new file mode 100644
+index 0000000000..85234024b0
+--- /dev/null
++++ b/third_party/blink/public/mojom/agent_snapshot/agent_snapshot_collector.mojom
+@@ -0,0 +1,93 @@
++// Copyright 2026 The browser Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// Per-frame interactive-element collection for Page.captureAgentSnapshot.
++//
++// Implemented in the renderer and bound per local root frame. The browser
++// calls it once per local root (main frame and every OOPIF) while assembling
++// one snapshot. Each frame reports its elements in its own local CSS-pixel
++// space, as getBoundingClientRect() would; the browser composes those boxes
++// into the root viewport and runs the cross-context occlusion test.
++
++module blink.mojom;
++
++// How elements outside the frame's own layout viewport are reported.
++enum AgentOffscreenMode {
++  kNone,     // drop off-viewport elements
++  kSummary,  // include, but the caller may cap the count
++  kFull,     // include all
++};
++
++struct AgentSnapshotOptions {
++  AgentOffscreenMode offscreen_mode = kSummary;
++};
++
++// Border-box in the frame's LOCAL CSS-pixel space, viewport-relative
++// (i.e. matching Element.getBoundingClientRect()).
++struct AgentElementBox {
++  double x;
++  double y;
++  double width;
++  double height;
++};
++
++struct AgentElement {
++  // DevTools backend node id (== Blink DOMNodeId), stable and browser-visible.
++  int32 backend_node_id;
++
++  // Computed accessibility role, or a tag-derived role when no ARIA role.
++  string role;
++  // Accessible name, current value and accessible description; empty when
++  // absent.
++  string name;
++  string value;
++  string description;
++  // Lowercased tag name (e.g. "div", "button", "input").
++  string tag;
++
++  // Whether the element is classified interactive/actionable.
++  bool interactive;
++  // Why: "role" | "form-control" | "listener" | "cursor" | "tabindex"
++  // (empty when not interactive).
++  string interactive_reason;
++
++  // Active state flags: visible, enabled, focusable, focused, editable,
++  // checked, expanded, selected, disabled, readonly, required.
++  array<string> states;
++
++  // Local (frame) CSS-pixel border-box.
++  AgentElementBox box;
++  // Whether the box intersects this frame's own layout viewport.
++  bool in_frame_viewport;
++
++  // Backend node id of the shadow host when this element lives inside a
++  // shadow tree (open or closed), else 0.
++  int32 shadow_host_backend_node_id;
++
++  // Where this element points, resolved against the document base URL. An
++  // agent cannot learn a link's destination from its accessible name, and
++  // clicking to find out follows redirects and destroys the page state it
++  // was inspecting. Empty when the element has no such attribute.
++  // href: <a>, <area>, <link>. src: <img>, <iframe>, <video>, <audio>,
++  // <source>, <embed>, <script>.
++  string href;
++  string src;
++};
++
++struct AgentFrameSnapshot {
++  array<AgentElement> elements;
++};
++
++interface AgentSnapshotCollector {
++  // Gathers the interactive elements of this local root and of its
++  // same-process descendant frames, open and closed shadow DOM included.
++  // Remote (OOPIF) children are left to their own call.
++  CollectFrameElements(AgentSnapshotOptions options)
++      => (AgentFrameSnapshot result);
++
++  // Resolves a process-local DOMNodeId (as returned in
++  // AgentElement.backend_node_id) to the element's current local-root-space
++  // box. found is false when the node is gone or is not a laid-out element.
++  ResolveNode(int32 local_dom_node_id) => (bool found, AgentElementBox box);
++};
+diff --git a/third_party/blink/renderer/core/inspector/inspector_protocol_config.json b/third_party/blink/renderer/core/inspector/inspector_protocol_config.json
+index 5d87a34721..021320aab8 100644
+--- a/third_party/blink/renderer/core/inspector/inspector_protocol_config.json
++++ b/third_party/blink/renderer/core/inspector/inspector_protocol_config.json
+@@ -87,7 +87,7 @@
+             },
+             {
+                 "domain": "Page",
+-                "exclude": ["getNavigationHistory", "navigateToHistoryEntry", "resetNavigationHistory", "captureScreenshot", "screencastFrameAck", "handleJavaScriptDialog", "setColorPickerEnabled",
++                "exclude": ["getNavigationHistory", "navigateToHistoryEntry", "resetNavigationHistory", "captureScreenshot", "captureAgentSnapshot", "resolveAgentNode", "screencastFrameAck", "handleJavaScriptDialog", "setColorPickerEnabled",
+                             "getAppManifest", "getAnnotatedPageContent", "setControlNavigations", "processNavigation", "printToPDF", "bringToFront", "setDownloadBehavior", "navigate", "crash", "close", "setWebLifecycleState", "captureSnapshot", "getInstallabilityErrors", "getManifestIcons", "getAppId", "setSPCTransactionMode", "setRPHRegistrationMode", "setPrerenderingAllowed", "startScreenRecording", "stopScreenRecording"],
+                 "pass_associated_data": [
+                     "addScriptToEvaluateOnNewDocument",
+diff --git a/third_party/blink/renderer/modules/BUILD.gn b/third_party/blink/renderer/modules/BUILD.gn
+index 269ff4196e..e480aede3c 100644
+--- a/third_party/blink/renderer/modules/BUILD.gn
++++ b/third_party/blink/renderer/modules/BUILD.gn
+@@ -58,6 +58,7 @@ component("modules") {
+     "//third_party/blink/renderer/bindings/modules/v8",
+     "//third_party/blink/renderer/modules/accessibility",
+     "//third_party/blink/renderer/modules/ad_auction",
++    "//third_party/blink/renderer/modules/agent_snapshot",
+     "//third_party/blink/renderer/modules/ai",
+     "//third_party/blink/renderer/modules/animationworklet",
+     "//third_party/blink/renderer/modules/app_banner",
+diff --git a/third_party/blink/renderer/modules/agent_snapshot/BUILD.gn b/third_party/blink/renderer/modules/agent_snapshot/BUILD.gn
+new file mode 100644
+index 0000000000..9601add049
+--- /dev/null
++++ b/third_party/blink/renderer/modules/agent_snapshot/BUILD.gn
+@@ -0,0 +1,16 @@
++# Copyright 2026 The browser Authors
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++
++import("//third_party/blink/renderer/modules/modules.gni")
++
++blink_modules_sources("agent_snapshot") {
++  sources = [
++    "agent_snapshot_collector_impl.cc",
++    "agent_snapshot_collector_impl.h",
++  ]
++
++  deps = [ "//third_party/blink/renderer/modules/accessibility" ]
++
++  public_deps = [ "//third_party/blink/public/mojom:mojom_modules_blink" ]
++}
+diff --git a/third_party/blink/renderer/modules/agent_snapshot/agent_snapshot_collector_impl.cc b/third_party/blink/renderer/modules/agent_snapshot/agent_snapshot_collector_impl.cc
+new file mode 100644
+index 0000000000..0ad0e4ed9c
+--- /dev/null
++++ b/third_party/blink/renderer/modules/agent_snapshot/agent_snapshot_collector_impl.cc
+@@ -0,0 +1,604 @@
++// Copyright 2026 The browser Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "third_party/blink/renderer/modules/agent_snapshot/agent_snapshot_collector_impl.h"
++
++#include "base/containers/span.h"
++#include "base/notreached.h"
++#include "third_party/blink/public/common/metrics/document_update_reason.h"
++#include "third_party/blink/renderer/core/accessibility/ax_context.h"
++#include "third_party/blink/renderer/core/accessibility/ax_object_cache.h"
++#include "third_party/blink/renderer/core/dom/container_node.h"
++#include "third_party/blink/renderer/core/dom/document.h"
++#include "third_party/blink/renderer/core/dom/dom_node_ids.h"
++#include "third_party/blink/renderer/core/dom/element.h"
++#include "third_party/blink/renderer/core/dom/node.h"
++#include "third_party/blink/renderer/core/dom/shadow_root.h"
++#include "third_party/blink/renderer/core/event_type_names.h"
++#include "third_party/blink/renderer/core/frame/frame.h"
++#include "third_party/blink/renderer/core/frame/local_dom_window.h"
++#include "third_party/blink/renderer/core/frame/local_frame.h"
++#include "third_party/blink/renderer/core/frame/local_frame_view.h"
++#include "third_party/blink/renderer/core/geometry/dom_rect.h"
++#include "third_party/blink/renderer/core/html/forms/html_input_element.h"
++#include "third_party/blink/renderer/core/html/forms/html_option_element.h"
++#include "third_party/blink/renderer/core/html/forms/html_select_element.h"
++#include "third_party/blink/renderer/core/html/forms/html_text_area_element.h"
++#include "third_party/blink/renderer/core/html/forms/text_control_element.h"
++#include "third_party/blink/renderer/core/html_names.h"
++#include "third_party/blink/renderer/core/layout/layout_object.h"
++#include "third_party/blink/renderer/core/style/computed_style.h"
++#include "third_party/blink/renderer/core/style/computed_style_constants.h"
++#include "third_party/blink/renderer/modules/accessibility/ax_object.h"
++#include "third_party/blink/renderer/modules/accessibility/ax_object_cache_impl.h"
++#include "third_party/blink/renderer/platform/heap/collection_support/heap_hash_map.h"
++#include "third_party/blink/renderer/platform/heap/collection_support/heap_vector.h"
++#include "third_party/blink/renderer/platform/wtf/text/wtf_string.h"
++#include "third_party/blink/renderer/platform/wtf/vector_traits.h"
++#include "ui/accessibility/ax_mode.h"
++#include "ui/gfx/geometry/point_f.h"
++
++namespace blink {
++
++namespace {
++
++// Reads a URL-valued attribute resolved against the document base URL.
++// Guarded by the element's own IsURLAttribute rather than by tag name: a
++// stray href on a <div> is not a URL attribute, and Element::GetURLAttribute
++// DCHECKs on exactly that. Returns a null String when there is no such
++// attribute.
++String UrlAttribute(const Element* element, const QualifiedName& name) {
++  if (!element->FastHasAttribute(name)) {
++    return String();
++  }
++  const Attribute* attribute = element->Attributes().Find(name);
++  if (!attribute || !element->IsURLAttribute(*attribute)) {
++    return String();
++  }
++  return element->GetURLAttribute(name);
++}
++
++bool RoleIn(const String& role, base::span<const char* const> roles) {
++  for (const char* candidate : roles) {
++    if (role == candidate) {
++      return true;
++    }
++  }
++  return false;
++}
++
++// Roles (as produced by AXObject::RoleName) that are actionable by
++// themselves.
++bool IsInteractiveRole(const String& role) {
++  static constexpr const char* kRoles[] = {
++      "button",        "link",         "textbox",   "checkbox",
++      "radio",         "combobox",     "menuitem",  "menuitemcheckbox",
++      "menuitemradio", "tab",          "switch",    "slider",
++      "searchbox",     "spinbutton",   "option",    "listbox",
++      "menu",          "radiogroup",   "scrollbar", "treeitem",
++      "gridcell",      "columnheader", "rowheader"};
++  return RoleIn(role, kRoles);
++}
++
++// Roles with no semantics of their own; a non-interactive element with one
++// of these is dropped to keep the snapshot small.
++bool IsGenericRole(const String& role) {
++  static constexpr const char* kRoles[] = {
++      "generic", "GenericContainer", "none", "presentation", "IgnoredGeneric"};
++  return role.empty() || RoleIn(role, kRoles);
++}
++
++bool HasClickListener(Node* node) {
++  return node->HasEventListeners(event_type_names::kClick) ||
++         node->HasEventListeners(event_type_names::kMousedown) ||
++         node->HasEventListeners(event_type_names::kMouseup) ||
++         node->HasEventListeners(event_type_names::kKeydown) ||
++         node->HasEventListeners(event_type_names::kPointerdown);
++}
++
++bool HasPointerCursor(Element* element) {
++  const LayoutObject* layout_object = element->GetLayoutObject();
++  return layout_object &&
++         layout_object->StyleRef().Cursor() == ECursor::kPointer;
++}
++
++// Current value for form controls; empty for everything else.
++String FormControlValue(Element* element) {
++  if (auto* input = DynamicTo<HTMLInputElement>(element)) {
++    return input->Value();
++  }
++  if (auto* textarea = DynamicTo<HTMLTextAreaElement>(element)) {
++    return textarea->Value();
++  }
++  if (auto* select = DynamicTo<HTMLSelectElement>(element)) {
++    return select->Value();
++  }
++  return String();
++}
++
++// Why an element counts as interactive, strongest signal first. The string
++// form goes on the wire; the enum order ranks coincident nested elements.
++enum class InteractiveReason {
++  kNone,
++  kTabIndex,
++  kCursor,
++  kListener,
++  kFormControl,
++  kRole,
++};
++
++InteractiveReason ClassifyInteractive(Element* element, const String& role) {
++  if (IsInteractiveRole(role)) {
++    return InteractiveReason::kRole;
++  }
++  if (element->IsFormControlElement()) {
++    return InteractiveReason::kFormControl;
++  }
++  if (HasClickListener(element)) {
++    return InteractiveReason::kListener;
++  }
++  if (HasPointerCursor(element)) {
++    return InteractiveReason::kCursor;
++  }
++  if (element->tabIndex() >= 0) {
++    return InteractiveReason::kTabIndex;
++  }
++  return InteractiveReason::kNone;
++}
++
++String InteractiveReasonName(InteractiveReason reason) {
++  switch (reason) {
++    case InteractiveReason::kNone:
++      return "";
++    case InteractiveReason::kTabIndex:
++      return "tabindex";
++    case InteractiveReason::kCursor:
++      return "cursor";
++    case InteractiveReason::kListener:
++      return "listener";
++    case InteractiveReason::kFormControl:
++      return "form-control";
++    case InteractiveReason::kRole:
++      return "role";
++  }
++  NOTREACHED();
++}
++
++Vector<String> ElementStates(Element* element) {
++  Vector<String> states;
++  states.push_back("visible");
++
++  if (element->IsDisabledFormControl()) {
++    states.push_back("disabled");
++  } else if (element->IsFormControlElement()) {
++    states.push_back("enabled");
++  }
++  if (element->IsFocusable(Element::UpdateBehavior::kNoneForAccessibility)) {
++    states.push_back("focusable");
++  }
++  if (element->IsFocusedElementInDocument()) {
++    states.push_back("focused");
++  }
++  if (element->FastHasAttribute(html_names::kContenteditableAttr) ||
++      IsA<TextControlElement>(element)) {
++    states.push_back("editable");
++  }
++  if (auto* input = DynamicTo<HTMLInputElement>(element);
++      input && input->Checked()) {
++    states.push_back("checked");
++  }
++  if (auto* option = DynamicTo<HTMLOptionElement>(element)) {
++    if (option->Selected()) {
++      states.push_back("selected");
++    }
++  } else if (EqualIgnoringAsciiCase(
++                 element->FastGetAttribute(html_names::kAriaSelectedAttr),
++                 "true")) {
++    states.push_back("selected");
++  }
++  if (EqualIgnoringAsciiCase(
++          element->FastGetAttribute(html_names::kAriaExpandedAttr), "true")) {
++    states.push_back("expanded");
++  }
++  if (element->FastHasAttribute(html_names::kReadonlyAttr)) {
++    states.push_back("readonly");
++  }
++  if (element->FastHasAttribute(html_names::kRequiredAttr)) {
++    states.push_back("required");
++  }
++  return states;
++}
++
++// Mojo rejects a null WTF::String in a non-nullable string field
++// (RESULT_CODE_KILLED_BAD_MESSAGE), and both String() and several AX getters
++// produce null strings, so every wire value goes through here.
++String NonNull(const String& s) {
++  return s.IsNull() ? String("") : s;
++}
++
++// Next ancestor element, crossing shadow boundaries into the shadow host.
++Element* AncestorElement(Element* element) {
++  if (Element* parent = element->parentElement()) {
++    return parent;
++  }
++  return element->OwnerShadowHost();
++}
++
++// Local-root CSS-pixel border-box, captured before the AX cache is frozen.
++struct ElementBox {
++  double x = 0;
++  double y = 0;
++  double width = 0;
++  double height = 0;
++};
++
++// What the dedup pass needs to know about each emitted element.
++struct KeptElement {
++  DISALLOW_NEW();
++
++ public:
++  void Trace(Visitor* visitor) const { visitor->Trace(element); }
++
++  Member<Element> element;
++  ElementBox box;
++  InteractiveReason reason = InteractiveReason::kNone;
++};
++
++// A candidate from the geometry pass.
++struct Candidate {
++  DISALLOW_NEW();
++
++ public:
++  void Trace(Visitor* visitor) const { visitor->Trace(element); }
++
++  Member<Element> element;
++  ElementBox box;
++  bool in_frame_viewport = false;
++};
++
++struct Collected {
++  STACK_ALLOCATED();
++
++ public:
++  Vector<mojom::blink::AgentElementPtr> elements;
++  HeapVector<KeptElement> kept;
++};
++
++}  // namespace
++
++}  // namespace blink
++
++WTF_ALLOW_MOVE_AND_INIT_WITH_MEM_FUNCTIONS(blink::KeptElement)
++WTF_ALLOW_MOVE_AND_INIT_WITH_MEM_FUNCTIONS(blink::Candidate)
++
++namespace blink {
++
++namespace {
++
++// This local root plus every same-process descendant frame, depth first.
++// Remote (OOPIF) frames are separate local roots that the browser drives
++// with their own CollectFrameElements() call, so descending into them here
++// would count their elements twice.
++void CollectSameProcessFrames(LocalFrame* frame,
++                              HeapVector<Member<LocalFrame>>& out) {
++  out.push_back(frame);
++  for (Frame* child = frame->FirstChild(); child;
++       child = child->NextSibling()) {
++    if (auto* local_child = DynamicTo<LocalFrame>(child)) {
++      CollectSameProcessFrames(local_child, out);
++    }
++  }
++}
++
++// Collects one same-process frame's document in two passes: geometry first,
++// then accessibility under a frozen AX cache. Forcing a layout update while
++// the cache is frozen violates a Blink invariant and crashes the renderer,
++// so every layout-dependent read (viewport size, bounding boxes) happens in
++// the first pass. Boxes are returned in the local root's coordinate space
++// (LocalFrameView::ConvertToRootFrame), so the browser composes all frames
++// of a local root with one view transform.
++void CollectFrameDocumentElements(
++    LocalFrame* frame,
++    mojom::blink::AgentOffscreenMode offscreen_mode,
++    Collected& out) {
++  Document* document = frame->GetDocument();
++  if (!document || !document->documentElement() || !document->View()) {
++    return;
++  }
++  LocalFrameView* view = document->View();
++  document->UpdateStyleAndLayout(DocumentUpdateReason::kInspector);
++
++  LocalDOMWindow* window = frame->DomWindow();
++  const double viewport_width = window ? window->innerWidth() : 0;
++  const double viewport_height = window ? window->innerHeight() : 0;
++
++  // Pass 1: geometry. Depth first over this document, descending into open
++  // and closed shadow trees but not into child frames.
++  HeapVector<Candidate> candidates;
++  {
++    HeapVector<Member<ContainerNode>> stack;
++    stack.push_back(document->documentElement());
++    while (!stack.empty()) {
++      ContainerNode* node = stack.back();
++      stack.pop_back();
++      for (Node* child = node->firstChild(); child;
++           child = child->nextSibling()) {
++        if (auto* child_container = DynamicTo<ContainerNode>(child)) {
++          stack.push_back(child_container);
++        }
++        auto* element = DynamicTo<Element>(child);
++        if (!element) {
++          continue;
++        }
++        if (ShadowRoot* shadow_root = element->GetShadowRoot()) {
++          stack.push_back(shadow_root);
++        }
++        // Non-rendered elements are not reported.
++        if (!element->GetLayoutObject()) {
++          continue;
++        }
++        DOMRect* rect = element->GetBoundingClientRect();
++        // Identity for the local root's own document; for a same-process
++        // subframe this adds the subframe's in-root offset, which the
++        // browser-side transform drops because such subframes share the
++        // local root's widget view.
++        const gfx::PointF root_top_left =
++            view->ConvertToRootFrame(gfx::PointF(rect->x(), rect->y()));
++        // The viewport test stays per frame: frame-local rect against the
++        // frame's own viewport.
++        Candidate candidate;
++        candidate.element = element;
++        candidate.box = {root_top_left.x(), root_top_left.y(), rect->width(),
++                         rect->height()};
++        candidate.in_frame_viewport =
++            rect->x() < viewport_width && rect->x() + rect->width() > 0 &&
++            rect->y() < viewport_height && rect->y() + rect->height() > 0;
++        candidates.push_back(candidate);
++      }
++    }
++  }
++
++  // Pass 2: accessibility role and name, then classification. Every
++  // Document owns its own AXObjectCache, so accessibility is enabled and the
++  // cache frozen per document. ExistingAXObjectCache() rather than
++  // AXContext::GetAXObjectCache(): the latter has preconditions that are not
++  // met here and can crash the renderer (see InspectorAccessibilityAgent).
++  // Constructing the AXContext is what creates the cache.
++  AXContext ax_context(*document, ui::kAXModeComplete);
++  AXObjectCache* base_cache = document->ExistingAXObjectCache();
++  if (!base_cache) {
++    return;
++  }
++  auto& cache = To<AXObjectCacheImpl>(*base_cache);
++  cache.UpdateAXForAllDocuments();
++  ScopedFreezeAXCache freeze(cache);
++
++  for (const Candidate& candidate : candidates) {
++    Element* element = candidate.element;
++    String role;
++    String name;
++    String description;
++    if (AXObject* ax = cache.Get(element)) {
++      role = AXObject::RoleName(ax->RoleValue());
++      ax::mojom::blink::NameFrom name_from;
++      name = ax->ComputedName(&name_from);
++      ax::mojom::blink::DescriptionFrom description_from;
++      AXObject::AXObjectVector description_objects;
++      description =
++          ax->Description(name_from, description_from, &description_objects);
++    }
++    if (role.empty()) {
++      role = element->localName();
++    }
++
++    const InteractiveReason reason = ClassifyInteractive(element, role);
++    const bool interactive = reason != InteractiveReason::kNone;
++    // Non-interactive elements are kept only when they carry semantics and
++    // occupy space.
++    if (!interactive && (IsGenericRole(role) || (candidate.box.width == 0 &&
++                                                 candidate.box.height == 0))) {
++      continue;
++    }
++    if (offscreen_mode == mojom::blink::AgentOffscreenMode::kNone &&
++        !candidate.in_frame_viewport) {
++      continue;
++    }
++
++    auto agent_element = mojom::blink::AgentElement::New();
++    agent_element->backend_node_id =
++        static_cast<int32_t>(DOMNodeIds::IdForNode(element));
++    agent_element->role = NonNull(role);
++    agent_element->name = NonNull(name);
++    agent_element->value = NonNull(FormControlValue(element));
++    agent_element->description = NonNull(description);
++    agent_element->tag = NonNull(element->localName());
++    agent_element->interactive = interactive;
++    agent_element->interactive_reason = InteractiveReasonName(reason);
++    agent_element->states = ElementStates(element);
++    agent_element->box = mojom::blink::AgentElementBox::New(
++        candidate.box.x, candidate.box.y, candidate.box.width,
++        candidate.box.height);
++    agent_element->in_frame_viewport = candidate.in_frame_viewport;
++    // Resolved against the document base, so the agent gets the URL a click
++    // would navigate to rather than a relative fragment.
++    agent_element->href = NonNull(UrlAttribute(element, html_names::kHrefAttr));
++    agent_element->src = NonNull(UrlAttribute(element, html_names::kSrcAttr));
++    Element* shadow_host = element->OwnerShadowHost();
++    agent_element->shadow_host_backend_node_id =
++        shadow_host ? static_cast<int32_t>(DOMNodeIds::IdForNode(shadow_host))
++                    : 0;
++
++    out.elements.push_back(std::move(agent_element));
++    KeptElement kept;
++    kept.element = element;
++    kept.box = candidate.box;
++    kept.reason = reason;
++    out.kept.push_back(kept);
++  }
++}
++
++// Drops the weaker of two coincident nested interactive elements: when an
++// interactive element nearly fills its nearest interactive ancestor, they are
++// the same click target. The stronger interactivity signal wins and a tie
++// keeps the outer element. Nested controls with dissimilar bounds are left
++// alone. Returns one flag per element.
++Vector<bool> CoincidentNestedElements(const HeapVector<KeptElement>& kept) {
++  HeapHashMap<Member<Element>, wtf_size_t> interactive_index;
++  for (wtf_size_t i = 0; i < kept.size(); ++i) {
++    if (kept[i].reason != InteractiveReason::kNone) {
++      interactive_index.insert(kept[i].element, i);
++    }
++  }
++  Vector<bool> removed(kept.size());
++  for (wtf_size_t i = 0; i < kept.size(); ++i) {
++    if (kept[i].reason == InteractiveReason::kNone) {
++      continue;
++    }
++    for (Element* ancestor = AncestorElement(kept[i].element); ancestor;
++         ancestor = AncestorElement(ancestor)) {
++      auto it = interactive_index.find(ancestor);
++      if (it == interactive_index.end()) {
++        continue;
++      }
++      const wtf_size_t j = it->value;
++      const double area_i = kept[i].box.width * kept[i].box.height;
++      const double area_j = kept[j].box.width * kept[j].box.height;
++      if (area_j > 0 && area_i >= 0.75 * area_j) {
++        if (kept[i].reason > kept[j].reason) {
++          removed[j] = true;
++        } else {
++          removed[i] = true;
++        }
++      }
++      break;  // Only the nearest interactive ancestor counts.
++    }
++  }
++  return removed;
++}
++
++}  // namespace
++
++// static
++const char AgentSnapshotCollectorImpl::kSupplementName[] =
++    "AgentSnapshotCollectorImpl";
++
++// static
++AgentSnapshotCollectorImpl* AgentSnapshotCollectorImpl::From(
++    Document& document) {
++  return Supplement<Document>::From<AgentSnapshotCollectorImpl>(document);
++}
++
++// static
++void AgentSnapshotCollectorImpl::BindReceiver(
++    LocalFrame* frame,
++    mojo::PendingReceiver<mojom::blink::AgentSnapshotCollector> receiver) {
++  DCHECK(frame && frame->GetDocument());
++  auto& document = *frame->GetDocument();
++  auto* collector = AgentSnapshotCollectorImpl::From(document);
++  if (!collector) {
++    collector = MakeGarbageCollected<AgentSnapshotCollectorImpl>(
++        base::PassKey<AgentSnapshotCollectorImpl>(), *frame);
++    Supplement<Document>::ProvideTo(document, collector);
++  }
++  collector->Bind(std::move(receiver));
++}
++
++AgentSnapshotCollectorImpl::AgentSnapshotCollectorImpl(
++    base::PassKey<AgentSnapshotCollectorImpl>,
++    LocalFrame& frame)
++    : Supplement<Document>(*frame.GetDocument()),
++      receiver_set_(this, frame.DomWindow()) {}
++
++AgentSnapshotCollectorImpl::~AgentSnapshotCollectorImpl() = default;
++
++void AgentSnapshotCollectorImpl::Bind(
++    mojo::PendingReceiver<mojom::blink::AgentSnapshotCollector> receiver) {
++  receiver_set_.Add(
++      std::move(receiver),
++      GetSupplementable()->GetTaskRunner(TaskType::kInternalUserInteraction));
++}
++
++void AgentSnapshotCollectorImpl::Trace(Visitor* visitor) const {
++  visitor->Trace(receiver_set_);
++  Supplement<Document>::Trace(visitor);
++}
++
++void AgentSnapshotCollectorImpl::CollectFrameElements(
++    mojom::blink::AgentSnapshotOptionsPtr options,
++    CollectFrameElementsCallback callback) {
++  auto result = mojom::blink::AgentFrameSnapshot::New();
++
++  LocalFrame* root_frame = GetSupplementable()->GetFrame();
++  Document* root_document = GetSupplementable();
++  if (!root_frame || !root_document || !root_document->documentElement() ||
++      !root_document->View()) {
++    std::move(callback).Run(std::move(result));
++    return;
++  }
++  const mojom::blink::AgentOffscreenMode offscreen_mode =
++      options ? options->offscreen_mode
++              : mojom::blink::AgentOffscreenMode::kSummary;
++
++  // The browser calls this on local roots only; same-process descendants are
++  // walked here with their boxes expressed in this local root's space.
++  HeapVector<Member<LocalFrame>> frames;
++  CollectSameProcessFrames(root_frame, frames);
++  Collected collected;
++  for (LocalFrame* frame : frames) {
++    CollectFrameDocumentElements(frame, offscreen_mode, collected);
++  }
++
++  const Vector<bool> removed = CoincidentNestedElements(collected.kept);
++  result->elements.ReserveInitialCapacity(collected.elements.size());
++  for (wtf_size_t i = 0; i < collected.elements.size(); ++i) {
++    if (!removed[i]) {
++      result->elements.push_back(std::move(collected.elements[i]));
++    }
++  }
++  std::move(callback).Run(std::move(result));
++}
++
++void AgentSnapshotCollectorImpl::ResolveNode(int32_t local_dom_node_id,
++                                             ResolveNodeCallback callback) {
++  // The mojo `box` field is non-nullable, so a not-found reply carries a
++  // zero box.
++  auto not_found = [&callback]() {
++    std::move(callback).Run(
++        /*found=*/false,
++        mojom::blink::AgentElementBox::New(0.0, 0.0, 0.0, 0.0));
++  };
++
++  // DOMNodeIds are process-global, so this also resolves nodes in the
++  // same-process subframes whose ids CollectFrameElements handed out.
++  auto* element = DynamicTo<Element>(DOMNodeIds::NodeForId(local_dom_node_id));
++  if (!element || !element->GetLayoutObject()) {
++    not_found();
++    return;
++  }
++  Document& document = element->GetDocument();
++  LocalFrame* frame = document.GetFrame();
++  if (!frame || !frame->View()) {
++    not_found();
++    return;
++  }
++
++  // Same layout update as the capture path; geometry only, no AX cache.
++  document.UpdateStyleAndLayout(DocumentUpdateReason::kInspector);
++  // Layout can run script and detach the element.
++  if (!element->GetLayoutObject()) {
++    not_found();
++    return;
++  }
++
++  // Local-root space, exactly as CollectFrameDocumentElements reports it.
++  DOMRect* rect = element->GetBoundingClientRect();
++  const gfx::PointF root_top_left =
++      frame->View()->ConvertToRootFrame(gfx::PointF(rect->x(), rect->y()));
++  std::move(callback).Run(
++      /*found=*/true,
++      mojom::blink::AgentElementBox::New(root_top_left.x(), root_top_left.y(),
++                                         rect->width(), rect->height()));
++}
++
++}  // namespace blink
+diff --git a/third_party/blink/renderer/modules/agent_snapshot/agent_snapshot_collector_impl.h b/third_party/blink/renderer/modules/agent_snapshot/agent_snapshot_collector_impl.h
+new file mode 100644
+index 0000000000..ae28056d0e
+--- /dev/null
++++ b/third_party/blink/renderer/modules/agent_snapshot/agent_snapshot_collector_impl.h
+@@ -0,0 +1,63 @@
++// Copyright 2026 The browser Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef THIRD_PARTY_BLINK_RENDERER_MODULES_AGENT_SNAPSHOT_AGENT_SNAPSHOT_COLLECTOR_IMPL_H_
++#define THIRD_PARTY_BLINK_RENDERER_MODULES_AGENT_SNAPSHOT_AGENT_SNAPSHOT_COLLECTOR_IMPL_H_
++
++#include "base/types/pass_key.h"
++#include "mojo/public/cpp/bindings/pending_receiver.h"
++#include "third_party/blink/public/mojom/agent_snapshot/agent_snapshot_collector.mojom-blink.h"
++#include "third_party/blink/renderer/platform/mojo/heap_mojo_receiver_set.h"
++#include "third_party/blink/renderer/platform/supplementable.h"
++
++namespace blink {
++
++class Document;
++class LocalFrame;
++
++// Serves Page.captureAgentSnapshot's per-frame interactive-element
++// collection. Bound once per local root frame (the main frame and every
++// OOPIF); the browser drives one CollectFrameElements() call per local root
++// and composes the returned local-space boxes itself.
++//
++// Lives in modules/ rather than core/inspector because collecting
++// accessibility roles and names needs modules/accessibility.
++class AgentSnapshotCollectorImpl final
++    : public GarbageCollected<AgentSnapshotCollectorImpl>,
++      public mojom::blink::AgentSnapshotCollector,
++      public Supplement<Document> {
++ public:
++  static const char kSupplementName[];
++  static AgentSnapshotCollectorImpl* From(Document&);
++  static void BindReceiver(
++      LocalFrame* frame,
++      mojo::PendingReceiver<mojom::blink::AgentSnapshotCollector> receiver);
++
++  explicit AgentSnapshotCollectorImpl(base::PassKey<AgentSnapshotCollectorImpl>,
++                                      LocalFrame&);
++  AgentSnapshotCollectorImpl(const AgentSnapshotCollectorImpl&) = delete;
++  AgentSnapshotCollectorImpl& operator=(const AgentSnapshotCollectorImpl&) =
++      delete;
++  ~AgentSnapshotCollectorImpl() override;
++
++  void Trace(Visitor* visitor) const override;
++
++  // mojom::blink::AgentSnapshotCollector:
++  void CollectFrameElements(mojom::blink::AgentSnapshotOptionsPtr options,
++                            CollectFrameElementsCallback callback) override;
++  void ResolveNode(int32_t local_dom_node_id,
++                   ResolveNodeCallback callback) override;
++
++ private:
++  void Bind(
++      mojo::PendingReceiver<mojom::blink::AgentSnapshotCollector> receiver);
++
++  HeapMojoReceiverSet<mojom::blink::AgentSnapshotCollector,
++                      AgentSnapshotCollectorImpl>
++      receiver_set_;
++};
++
++}  // namespace blink
++
++#endif  // THIRD_PARTY_BLINK_RENDERER_MODULES_AGENT_SNAPSHOT_AGENT_SNAPSHOT_COLLECTOR_IMPL_H_
+diff --git a/third_party/blink/renderer/modules/modules_initializer.cc b/third_party/blink/renderer/modules/modules_initializer.cc
+index c43fc9b59f..3419873e95 100644
+--- a/third_party/blink/renderer/modules/modules_initializer.cc
++++ b/third_party/blink/renderer/modules/modules_initializer.cc
+@@ -40,6 +40,7 @@
+ #include "third_party/blink/renderer/core/scheduler/task_attribution_tracker_impl.h"
+ #include "third_party/blink/renderer/modules/accessibility/ax_object_cache_impl.h"
+ #include "third_party/blink/renderer/modules/accessibility/inspector_accessibility_agent.h"
++#include "third_party/blink/renderer/modules/agent_snapshot/agent_snapshot_collector_impl.h"
+ #include "third_party/blink/renderer/modules/app_banner/app_banner_controller.h"
+ #include "third_party/blink/renderer/modules/audio_output_devices/html_media_element_audio_output_device.h"
+ #include "third_party/blink/renderer/modules/cache_storage/inspector_cache_storage_agent.h"
+@@ -250,6 +251,10 @@ void ModulesInitializer::InitLocalFrame(LocalFrame& frame) const {
+       BindRepeating(&PeerConnectionTracker::BindToFrame,
+                     WrapCrossThreadWeakPersistent(&frame)));
+ 
++  // browser: Page.captureAgentSnapshot's per-frame collector.
++  frame.GetInterfaceRegistry()->AddInterface(BindRepeating(
++      &AgentSnapshotCollectorImpl::BindReceiver, WrapWeakPersistent(&frame)));
++
+   frame.GetInterfaceRegistry()->AddInterface(
+       BindRepeating(&InnerTextAgent::BindReceiver, WrapWeakPersistent(&frame)));
+ 

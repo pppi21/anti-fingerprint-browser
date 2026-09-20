@@ -1,0 +1,132 @@
+From 88038e9dd610817d4e938093f0d00355370062bf Mon Sep 17 00:00:00 2001
+From: Leo Rodarte <leorodarte07@gmail.com>
+Date: Sat, 19 Sep 2026 23:46:06 -0400
+Subject: [PATCH 33/41] webauthn-decline
+
+WebAuthn auto-decline.
+---
+ content/browser/webauth/authenticator_impl.cc | 69 +++++++++++++++++++
+ content/browser/webauth/authenticator_impl.h  |  5 ++
+ 2 files changed, 74 insertions(+)
+
+diff --git a/content/browser/webauth/authenticator_impl.cc b/content/browser/webauth/authenticator_impl.cc
+index 57a219a1e3..41af56ff70 100644
+--- a/content/browser/webauth/authenticator_impl.cc
++++ b/content/browser/webauth/authenticator_impl.cc
+@@ -7,12 +7,37 @@
+ #include <memory>
+ #include <utility>
+ 
++#include "base/command_line.h"
++#include "base/functional/bind.h"
++#include "base/rand_util.h"
++#include "base/task/single_thread_task_runner.h"
++#include "base/time/time.h"
++#include "components/browser/browser_switches.h"
+ #include "content/browser/webauth/authenticator_common_impl.h"
+ #include "content/public/browser/document_service.h"
+ #include "content/public/browser/render_frame_host.h"
+ 
+ namespace content {
+ 
++namespace {
++
++// browser: --auto-decline-webauthn answers every ceremony that would show
++// platform authenticator UI with the error a user cancel produces, after a
++// delay in the range a person takes to read the prompt and dismiss it.
++constexpr base::TimeDelta kAutoDeclineMinDelay = base::Seconds(1);
++constexpr base::TimeDelta kAutoDeclineMaxDelay = base::Seconds(5);
++
++bool ShouldAutoDeclineWebauthn() {
++  return base::CommandLine::ForCurrentProcess()->HasSwitch(
++      switches::kAutoDeclineWebauthn);
++}
++
++base::TimeDelta RandomCancelDelay() {
++  return base::RandTimeDelta(kAutoDeclineMinDelay, kAutoDeclineMaxDelay);
++}
++
++}  // namespace
++
+ void AuthenticatorImpl::Create(
+     RenderFrameHost* render_frame_host,
+     mojo::PendingReceiver<blink::mojom::Authenticator> receiver) {
+@@ -67,6 +92,17 @@ AuthenticatorImpl::~AuthenticatorImpl() = default;
+ void AuthenticatorImpl::MakeCredential(
+     blink::mojom::PublicKeyCredentialCreationOptionsPtr options,
+     MakeCredentialCallback callback) {
++  // browser: decline before authenticator_common_impl_ reaches any OS UI, so
++  // the relying party sees the NOT_ALLOWED_ERROR of a user cancel and no
++  // platform prompt appears.
++  if (ShouldAutoDeclineWebauthn()) {
++    base::SingleThreadTaskRunner::GetCurrentDefault()->PostDelayedTask(
++        FROM_HERE,
++        base::BindOnce(&AuthenticatorImpl::ReplyNotAllowedToMakeCredential,
++                       weak_factory_.GetWeakPtr(), std::move(callback)),
++        RandomCancelDelay());
++    return;
++  }
+   authenticator_common_impl_->MakeCredential(origin(), std::move(options),
+                                              /*payment_options=*/nullptr,
+                                              std::move(callback));
+@@ -76,11 +112,44 @@ void AuthenticatorImpl::MakeCredential(
+ void AuthenticatorImpl::GetCredential(
+     blink::mojom::GetCredentialOptionsPtr options,
+     GetCredentialCallback callback) {
++  // browser: only ceremonies that would show platform authenticator UI are
++  // declined. Password-only requests (no public_key) never involve WebAuthn.
++  // Conditional-mediation requests are silent autofill probes that show no
++  // UI in Chrome; declining them breaks relying parties that treat
++  // NotAllowedError from the probe as a hard failure, so they pass through
++  // and, with no enrolled credentials, stay pending exactly as in Chrome.
++  const bool is_webauthn = options && options->public_key;
++  const bool is_conditional =
++      options && options->mediation == blink::mojom::Mediation::CONDITIONAL;
++  if (ShouldAutoDeclineWebauthn() && is_webauthn && !is_conditional) {
++    base::SingleThreadTaskRunner::GetCurrentDefault()->PostDelayedTask(
++        FROM_HERE,
++        base::BindOnce(&AuthenticatorImpl::ReplyNotAllowedToGetCredential,
++                       weak_factory_.GetWeakPtr(), std::move(callback)),
++        RandomCancelDelay());
++    return;
++  }
+   authenticator_common_impl_->GetCredential(origin(), std::move(options),
+                                             /*payment_options=*/nullptr,
+                                             std::move(callback));
+ }
+ 
++// browser: the replies a user cancel produces.
++void AuthenticatorImpl::ReplyNotAllowedToMakeCredential(
++    MakeCredentialCallback callback) {
++  std::move(callback).Run(blink::mojom::AuthenticatorStatus::NOT_ALLOWED_ERROR,
++                          /*credential=*/nullptr,
++                          /*dom_exception_details=*/nullptr);
++}
++
++void AuthenticatorImpl::ReplyNotAllowedToGetCredential(
++    GetCredentialCallback callback) {
++  std::move(callback).Run(MakeGetAssertionResponse(
++      blink::mojom::AuthenticatorStatus::NOT_ALLOWED_ERROR,
++      /*assertion=*/nullptr,
++      /*dom_exception_details=*/nullptr));
++}
++
+ // mojom::Authenticator
+ void AuthenticatorImpl::Report(
+     blink::mojom::PublicKeyCredentialReportOptionsPtr options,
+diff --git a/content/browser/webauth/authenticator_impl.h b/content/browser/webauth/authenticator_impl.h
+index e357d494d7..1da8e79a5a 100644
+--- a/content/browser/webauth/authenticator_impl.h
++++ b/content/browser/webauth/authenticator_impl.h
+@@ -66,6 +66,11 @@ class CONTENT_EXPORT AuthenticatorImpl
+       IsConditionalMediationAvailableCallback callback) override;
+   void Cancel() override;
+ 
++  // browser: the delayed replies of --auto-decline-webauthn. Bound through a
++  // WeakPtr so a reply is dropped when the document is gone by then.
++  void ReplyNotAllowedToMakeCredential(MakeCredentialCallback callback);
++  void ReplyNotAllowedToGetCredential(GetCredentialCallback callback);
++
+   std::unique_ptr<AuthenticatorCommonImpl> authenticator_common_impl_;
+ 
+   // Owns pipes to this Authenticator from |render_frame_host_|.

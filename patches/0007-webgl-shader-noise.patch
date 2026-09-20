@@ -1,0 +1,1137 @@
+From 0664755e4e096a0261d436afb08ebc59c30373a2 Mon Sep 17 00:00:00 2001
+From: Leo Rodarte <leorodarte07@gmail.com>
+Date: Sat, 19 Sep 2026 23:45:07 -0400
+Subject: [PATCH 07/41] webgl-shader-noise
+
+WebGL shader-precision noise, plus the --webgl-shader-noise-k consumer:
+comma-separated name=value overrides for the 13 per-surface multipliers,
+parsed once per process (the switch itself is declared and propagated in
+switch-resolver).
+---
+ .../blink/renderer/modules/webgl/BUILD.gn     |    3 +
+ .../modules/webgl/webgl_shader_noise.cc       | 1030 +++++++++++++++++
+ .../modules/webgl/webgl_shader_noise.h        |   57 +
+ 3 files changed, 1090 insertions(+)
+ create mode 100644 third_party/blink/renderer/modules/webgl/webgl_shader_noise.cc
+ create mode 100644 third_party/blink/renderer/modules/webgl/webgl_shader_noise.h
+
+diff --git a/third_party/blink/renderer/modules/webgl/BUILD.gn b/third_party/blink/renderer/modules/webgl/BUILD.gn
+index d611207944..777d410300 100644
+--- a/third_party/blink/renderer/modules/webgl/BUILD.gn
++++ b/third_party/blink/renderer/modules/webgl/BUILD.gn
+@@ -162,6 +162,8 @@ blink_modules_sources("webgl") {
+     "webgl_sampler.h",
+     "webgl_shader.cc",
+     "webgl_shader.h",
++    "webgl_shader_noise.cc",
++    "webgl_shader_noise.h",
+     "webgl_shader_pixel_local_storage.cc",
+     "webgl_shader_pixel_local_storage.h",
+     "webgl_shader_precision_format.cc",
+@@ -195,6 +197,7 @@ blink_modules_sources("webgl") {
+ 
+   public_deps = [ "//device/vr/public/mojom:vr_service_blink" ]
+   deps = [
++    "//components/browser:browser_switches",
+     "//device/vr/buildflags",
+     "//gpu/command_buffer/client:gles2_implementation",
+     "//gpu/command_buffer/client:gles2_interface",
+diff --git a/third_party/blink/renderer/modules/webgl/webgl_shader_noise.cc b/third_party/blink/renderer/modules/webgl/webgl_shader_noise.cc
+new file mode 100644
+index 0000000000..e92138b909
+--- /dev/null
++++ b/third_party/blink/renderer/modules/webgl/webgl_shader_noise.cc
+@@ -0,0 +1,1030 @@
++// Copyright 2026 The browser Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "third_party/blink/renderer/modules/webgl/webgl_shader_noise.h"
++
++#include <array>
++#include <cstddef>
++#include <cstdint>
++#include <iterator>
++#include <string>
++#include <string_view>
++#include <utility>
++
++#include "base/check_op.h"
++#include "base/command_line.h"
++#include "base/notreached.h"
++#include "base/strings/strcat.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_split.h"
++#include "base/strings/string_util.h"
++#include "base/strings/stringprintf.h"
++#include "components/browser/browser_switches.h"
++#include "components/browser/switch_resolver.h"
++
++namespace blink {
++
++namespace {
++
++// Per-process perturbation amplitude parsed from --webgl-shader-noise.
++// 0.0 = inactive. Carries both the noise magnitude AND the per-profile salt:
++// shader-side code uses the amplitude as a multiplier on its noise output
++// (controls magnitude) and also folds it into the noise function's seed term
++// (per-profile pattern). Same amplitude on every machine running the same
++// profile, so the per-profile fingerprint is reproducible across hosts.
++float GetWebGLShaderNoiseAmplitude() {
++  static const float cached = browser::ResolveLinearNoiseSwitch(
++      ::switches::kWebglShaderNoise, browser::kSaltWebglShaderNoise, 1e-3,
++      3e-3);
++  return cached;
++}
++
++// Per-surface amplitude multipliers, calibrated per surface against a
++// variance probe (first-flip amplitude per surface):
++//
++//   sin/cos/tan/asin/acos/atan-1arg ..... flips ~5e-4 -> nd_kt  = 0.05 (anchor)
++//   atan-2arg w/ quadrant disambig ...... flips  1e-3 -> nd_kt2 = 5e-4
++//   pow/sqrt/inversesqrt ................ flips  1e-3 -> nd_kp  = 1e-4
++//   exp/exp2 ............................ flips  1e-3 -> nd_ke  = 3e-3
++//   log/log2 ............................ never flipped below 5e-2 -> nd_klg
++//   length/distance ..................... (initial)  -> nd_kl  = 1e-3
++//   normalize / reflect / refract ....... flips  1e-3 -> nd_kn  = 1e-4
++//                                                     -> nd_kr  = 1e-4
++//   texture2D / 2DProj / Cube (LINEAR) .. flips  1e-3 -> nd_kx  = 0.01 (*)
++//   smoothstep .......................... flips  1e-3 -> nd_kss = 5e-4
++//   mix ................................. flips  1e-3 -> nd_km  = 5e-3
++//   gl_FragCoord substitute ............. flips  1e-3 -> nd_kf  = 5e-2
++//   gl_FragColor offset ................. small region -> nd_kc = 2.0
++//
++// K_surface ~= surface_first_flip / 1e-3 so every wrapped surface activates
++// at switch ~= 1e-3 (the LINEAR anchor). Wrappers compose by multiplication
++// into the per-call-site perturbation term.
++//
++// (*) nd_kx is downscaled from the 1.0 anchor: the original anchor produced
++// visible fuzz on real SDF text shaders (validated against Google Maps tile
++// labels). The visible-fuzz threshold sits at an effective UV shift of ~5e-5
++// in normalized texture coordinates; the hash-flip threshold (measured with
++// a text-hash probe) sits an order of magnitude below that at ~1e-5.
++// nd_kx = 0.01 puts the effective UV shift at amp 1e-3 at exactly 1e-5
++// (hash flips) and at amp 3e-3 at 3e-5 (still below the visible-fuzz
++// threshold), giving ~1.7x headroom at the top of the derived amplitude
++// range.
++//
++// NEAREST-canary cap: for a probe sampling a 4x4 texture across a 256-px
++// canvas, the closest fragment-to-texel-boundary distance is ~= 1/(2*256)
++// ~= 2e-3. Canary preservation requires K_kx * max_switch * 0.5 < 2e-3.
++// With nd_kx = 0.01, that caps the upper end of the --webgl-shader-noise
++// input at ~= 0.4, far looser than the visible-fuzz constraint above, which
++// is now the binding constraint on the input range.
++//
++// nd_kc (color-output offset) is sized differently from the rest: it is
++// injected once per fragment at the end of main() for shaders that read a
++// varying but sample no texture (see RewriteFragmentShaderForNoise). The
++// wrapper perturbations alone flip a full-canvas hash via statistical
++// accumulation across thousands of fragments but are unreliable on small
++// subset reads: CreepJS's "pixels" fingerprint reads only the bottom-left
++// 17x42 region of a 256x256 canvas, which contains ~8 line fragments for
++// the LINE_LOOP triangle. K_kc = 2.0 gives a max offset of 0.5 * 2.0 * 3e-3
++// = 3e-3 absolute = 0.76 uint8 LSB per channel, so P(per-channel LSB flip)
++// ~= 76%, P(any of 3 channels flips) ~= 99%, and on 8 in-region fragments
++// P(>= 1 flip) ~= 99.999%. Alpha is left unperturbed because many shaders
++// depend on alpha = 1.0 for canvas compositing.
++struct NoiseMultiplier {
++  std::string_view name;       // --webgl-shader-noise-k key, e.g. "kt".
++  std::string_view glsl_name;  // Prelude constant, e.g. "nd_kt".
++  float default_value;
++};
++
++// Declaration order is the prelude's declaration order.
++constexpr NoiseMultiplier kNoiseMultipliers[] = {
++    {"kt", "nd_kt", 0.05f},    // sin/cos/tan/asin/acos/atan-1arg
++    {"kt2", "nd_kt2", 5e-4f},  // atan-2arg
++    {"kp", "nd_kp", 1e-4f},    // pow/sqrt/inversesqrt
++    {"ke", "nd_ke", 3e-3f},    // exp/exp2
++    {"klg", "nd_klg", 0.1f},   // log/log2 (uncalibrated)
++    {"kl", "nd_kl", 1e-3f},    // length/distance
++    {"kn", "nd_kn", 1e-4f},    // normalize
++    {"kr", "nd_kr", 1e-4f},    // reflect/refract
++    {"kx", "nd_kx", 0.01f},    // texture2D family
++    {"kss", "nd_kss", 5e-4f},  // smoothstep
++    {"km", "nd_km", 5e-3f},    // mix
++    {"kf", "nd_kf", 5e-2f},    // gl_FragCoord
++    {"kc", "nd_kc", 2.0f},     // gl_FragColor offset
++};
++
++using NoiseMultiplierValues = std::array<float, std::size(kNoiseMultipliers)>;
++
++// Effective per-surface multipliers: the calibrated defaults above with any
++// --webgl-shader-noise-k overrides applied. Parsed once per process. Only
++// the prelude's `const float nd_k*` declarations consume these, so a single
++// interception point covers every wrapper.
++const NoiseMultiplierValues& GetNoiseMultiplierValues() {
++  static const NoiseMultiplierValues cached = [] {
++    NoiseMultiplierValues values;
++    for (size_t i = 0; i < values.size(); ++i) {
++      values[i] = kNoiseMultipliers[i].default_value;
++    }
++    const base::CommandLine* command_line =
++        base::CommandLine::ForCurrentProcess();
++    if (!command_line->HasSwitch(::switches::kWebglShaderNoiseK)) {
++      return values;
++    }
++    const std::string overrides =
++        command_line->GetSwitchValueASCII(::switches::kWebglShaderNoiseK);
++    for (std::string_view token :
++         base::SplitStringPiece(overrides, ",", base::TRIM_WHITESPACE,
++                                base::SPLIT_WANT_NONEMPTY)) {
++      const size_t eq = token.find('=');
++      if (eq == std::string_view::npos) {
++        continue;
++      }
++      double parsed = 0.0;
++      if (!base::StringToDouble(token.substr(eq + 1), &parsed)) {
++        continue;
++      }
++      const std::string_view name = token.substr(0, eq);
++      for (size_t i = 0; i < values.size(); ++i) {
++        if (kNoiseMultipliers[i].name == name) {
++          values[i] = static_cast<float>(parsed);
++        }
++      }
++    }
++    return values;
++  }();
++  return cached;
++}
++
++// GLSL ES 1.0 builtin function and qualifier names that introduce natural
++// cross-GPU variance (empirically validated across NVIDIA and AMD GPUs).
++// Shaders that reference at least one of these get the perturbation rewrite;
++// shaders that reference none of them are passed through unchanged so canary
++// tests (flat-color triangles, clear, axis-aligned lines, points, NEAREST
++// samples, depth test) stay bit-identical to upstream Chrome on the host's
++// GPU.
++//
++// The list intentionally omits `dot`, `cross`, and simple arithmetic
++// operators even though they involve float math: their precision is
++// constrained tightly enough by the spec that no variance was observed
++// across the two test GPUs. Adding them would over-perturb and risk
++// false-positive activation on canary shaders.
++//
++// `gl_FragCoord` triggers eligibility even though it's a builtin variable
++// (not a function): its natural cross-GPU variance arises from sub-pixel
++// rasterizer precision and propagates into any shader that reads it.
++// `varying` triggers eligibility because varying-reading shaders are the
++// ones that receive the color-output offset.
++constexpr std::string_view kVarianceKeywords[] = {
++    "texture2D",    "texture2DProj", "texture2DLod", "textureCube", "sin",
++    "cos",          "tan",           "asin",         "acos",        "atan",
++    "pow",          "exp",           "log",          "exp2",        "log2",
++    "sqrt",         "inversesqrt",   "length",       "distance",    "normalize",
++    "reflect",      "refract",       "smoothstep",   "mix",         "varying",
++    "gl_FragCoord",
++};
++
++// Subset of kVarianceKeywords for which BuildPrelude provides wrapper
++// definitions reachable via SubstituteCallSites. Shaders containing only
++// keywords NOT in this list (e.g. `texture2DLod`) still trigger eligibility
++// via ContainsVarianceKeyword but pass through the substitution unchanged:
++// no harm, just no perturbation. Extending coverage means adding the
++// keyword here AND defining its wrapper(s) in BuildPrelude.
++//
++// `texture2DLod` is intentionally absent: its use requires the
++// GL_EXT_shader_texture_lod extension in fragment shaders, and emitting
++// our wrapper unconditionally would break shaders that don't enable the
++// extension. Add it back behind a per-shader extension check.
++constexpr std::string_view kWrappedKeywords[] = {
++    "sin",       "cos",           "tan",         "asin",       "acos",
++    "atan",      "exp",           "log",         "exp2",       "log2",
++    "sqrt",      "inversesqrt",   "pow",         "length",     "distance",
++    "normalize", "reflect",       "refract",     "smoothstep", "mix",
++    "texture2D", "texture2DProj", "textureCube",
++};
++
++// Plain-identifier substitutions applied AFTER call-site substitution.
++// Used for built-in variables like gl_FragCoord that user code reads as
++// expressions (not function calls). The replacement string is inserted in
++// place of the identifier with no `(` boundary requirement on the right,
++// just the standalone-identifier check on both sides.
++struct IdentSubstitution {
++  std::string_view identifier;
++  std::string_view replacement;
++};
++
++constexpr IdentSubstitution kIdentSubstitutions[] = {
++    {"gl_FragCoord", "nd_fc()"},
++};
++
++bool IsIdentChar(char c) {
++  return base::IsAsciiAlphaNumeric(c) || c == '_';
++}
++
++// Whitespace as far as the GLSL rewriter is concerned. Deliberately narrower
++// than base::IsAsciiWhitespace (no \f / \v), matching the original scanner.
++bool IsGlslSpace(char c) {
++  return c == ' ' || c == '\t' || c == '\r' || c == '\n';
++}
++
++// Returns the position of the first occurrence of `ident` in `src` at or
++// after `from` that is a standalone identifier (neither neighbour is an
++// identifier character), or npos if there is none.
++size_t FindStandaloneIdentifier(std::string_view src,
++                                std::string_view ident,
++                                size_t from = 0) {
++  size_t pos = from;
++  while ((pos = src.find(ident, pos)) != std::string_view::npos) {
++    const size_t end = pos + ident.size();
++    const bool left_ok = pos == 0 || !IsIdentChar(src[pos - 1]);
++    const bool right_ok = end == src.size() || !IsIdentChar(src[end]);
++    if (left_ok && right_ok) {
++      return pos;
++    }
++    ++pos;
++  }
++  return std::string_view::npos;
++}
++
++bool ContainsStandaloneIdentifier(std::string_view src,
++                                  std::string_view ident) {
++  return FindStandaloneIdentifier(src, ident) != std::string_view::npos;
++}
++
++// Returns true if `src` contains at least one variance keyword as a
++// standalone identifier. Comments are not skipped: a false positive there is
++// harmless because the downstream rewriter does its own tokenization and
++// only modifies actual call sites.
++bool ContainsVarianceKeyword(std::string_view src) {
++  for (std::string_view keyword : kVarianceKeywords) {
++    if (ContainsStandaloneIdentifier(src, keyword)) {
++      return true;
++    }
++  }
++  return false;
++}
++
++// Color-offset eligibility: the shader reads at least one varying.
++bool HasVaryingDeclaration(std::string_view src) {
++  return ContainsStandaloneIdentifier(src, "varying");
++}
++
++// Color-offset eligibility: the shader samples any texture function. Catches
++// the three GLSL ES 1.0 fragment-shader sampling families. textureLod is
++// extension-gated and intentionally excluded: its presence wouldn't reach
++// NEAREST-canary territory anyway.
++bool ContainsTextureFunction(std::string_view src) {
++  static constexpr std::string_view kTextureFunctions[] = {
++      "texture2D",
++      "texture2DProj",
++      "textureCube",
++      "texture2DLod",
++  };
++  for (std::string_view keyword : kTextureFunctions) {
++    if (ContainsStandaloneIdentifier(src, keyword)) {
++      return true;
++    }
++  }
++  return false;
++}
++
++// Returns true if the shader is GLSL ES 3.00 or higher (WebGL2), detected via
++// a `#version 300`+ directive. This matters because the legacy texture
++// builtins `texture2D` / `texture2DProj` / `textureCube` do NOT exist in GLSL
++// ES 3.00; there they are `texture` / `textureProj` / `texture`. three.js
++// emits compatibility `#define texture2D texture` shims, but our prelude is
++// injected above them (at the first non-preprocessor token), so those shims
++// never reach the wrapper bodies. Emitting the wrong builtin makes the whole
++// prelude fail to compile ("no matching overloaded function found"), taking
++// the site's rendering down with it. Absent `#version`, or `#version 100`,
++// means ES 1.00.
++bool ShaderTargetsES3(std::string_view src) {
++  constexpr std::string_view kDirective = "#version";
++  size_t pos = 0;
++  while ((pos = src.find(kDirective, pos)) != std::string_view::npos) {
++    size_t p = pos + kDirective.size();
++    // Reject `#versionfoo`; the directive token must end on a non-ident char.
++    if (p < src.size() && IsIdentChar(src[p])) {
++      pos += kDirective.size();
++      continue;
++    }
++    while (p < src.size() && (src[p] == ' ' || src[p] == '\t')) {
++      ++p;
++    }
++    int version = 0;
++    bool any_digit = false;
++    while (p < src.size() && base::IsAsciiDigit(src[p])) {
++      version = version * 10 + (src[p] - '0');
++      any_digit = true;
++      ++p;
++    }
++    if (any_digit) {
++      return version >= 300;
++    }
++    pos += kDirective.size();
++  }
++  return false;
++}
++
++// ---------------------------------------------------------------------------
++// Prelude generation.
++// ---------------------------------------------------------------------------
++
++// GLSL type name for a component count of 1..4.
++std::string_view GlslType(int dim) {
++  static constexpr std::string_view kTypes[] = {"float", "vec2", "vec3",
++                                                "vec4"};
++  DCHECK_GE(dim, 1);
++  DCHECK_LE(dim, 4);
++  return kTypes[dim - 1];
++}
++
++// Hands out the per-call-site salts of one wrapper family as `base + 0.0`,
++// `base + 0.1`, ... in emission order. Every noise term in the prelude gets a
++// distinct salt so that no two perturbations are correlated.
++class SaltSequence {
++ public:
++  explicit SaltSequence(double base) : base_(base) {}
++
++  double Next() {
++    static constexpr double kSteps[] = {0.0, 0.1, 0.2, 0.3, 0.4,
++                                        0.5, 0.6, 0.7, 0.8, 0.9};
++    CHECK_LT(next_, std::size(kSteps));
++    return base_ + kSteps[next_++];
++  }
++
++ private:
++  const double base_;
++  size_t next_ = 0;
++};
++
++// One `nd_n(gl_FragCoord.xy, salt)` noise sample.
++std::string NoiseSample(SaltSequence& salt) {
++  return base::StringPrintf("nd_n(gl_FragCoord.xy,%#g)", salt.Next());
++}
++
++// A `dim`-component noise vector: the bare sample for dim == 1, otherwise
++// `vecN(sample, sample, ...)`.
++std::string NoiseTerm(int dim, SaltSequence& salt) {
++  std::string samples = NoiseSample(salt);
++  for (int i = 1; i < dim; ++i) {
++    base::StrAppend(&samples, {",", NoiseSample(salt)});
++  }
++  if (dim == 1) {
++    return samples;
++  }
++  return base::StrCat({GlslType(dim), "(", samples, ")"});
++}
++
++// A `dim`-component vector whose first two components are noise samples and
++// the rest are 0.0. Used where only the .xy components may move (projective
++// texture coordinates, gl_FragCoord).
++std::string NoiseXYTerm(int dim, SaltSequence& salt) {
++  std::string term = base::StrCat(
++      {GlslType(dim), "(", NoiseSample(salt), ",", NoiseSample(salt)});
++  for (int i = 2; i < dim; ++i) {
++    term += ",0.0";
++  }
++  return term + ")";
++}
++
++// How a wrapper keeps a perturbed input inside its builtin's domain. The
++// perturbation term is sign-varying per fragment, so at a domain boundary
++// roughly half of all fragments would otherwise be pushed outside the domain
++// -> undefined -> NaN -> garbage pixel. Clamping keeps the perturbation
++// everywhere the builtin is defined and is a no-op elsewhere (the
++// unperturbed result at the boundary is the clamped one).
++//
++// Not a calibration knob: any non-zero multiplier trips this, so it cannot
++// be tuned away. Regression that motivated it: Google Maps SDF text on
++// chromium 152 / ANGLE 419, where `pow(0.0 - 1.5e-7, y)` in the transparent
++// surround of every glyph went NaN and rendered as a noise box around
++// pristine text.
++struct DomainClamp {
++  enum Kind { kNone, kMin, kRange } kind = kNone;
++  std::string_view lo;
++  std::string_view hi;
++};
++
++constexpr DomainClamp kNoClamp{};
++constexpr DomainClamp kClampNonNegative{DomainClamp::kMin, "0.0"};
++constexpr DomainClamp kClampPositive{DomainClamp::kMin, "1e-7"};
++constexpr DomainClamp kClampUnitRange{DomainClamp::kRange, "-1.0", "1.0"};
++
++std::string ApplyClamp(const DomainClamp& clamp, std::string expr) {
++  switch (clamp.kind) {
++    case DomainClamp::kNone:
++      return expr;
++    case DomainClamp::kMin:
++      return base::StrCat({"max(", expr, ",", clamp.lo, ")"});
++    case DomainClamp::kRange:
++      return base::StrCat({"clamp(", expr, ",", clamp.lo, ",", clamp.hi, ")"});
++  }
++  NOTREACHED();
++}
++
++// `T nd_fn(T x) { return fn(clamp(x + noise * nd_a * k)); }` for float, vec2,
++// vec3 and vec4. Input-additive: used by the trig, inverse trig, exp/log and
++// sqrt families, which all share the call shape `T fn(T x)`.
++void EmitUnary(std::string& p,
++               std::string_view fn,
++               double salt_base,
++               std::string_view k,
++               const DomainClamp& clamp) {
++  SaltSequence salt(salt_base);
++  for (int dim = 1; dim <= 4; ++dim) {
++    const std::string_view type = GlslType(dim);
++    const std::string arg = ApplyClamp(
++        clamp, base::StrCat({"x+", NoiseTerm(dim, salt), "*nd_a*", k}));
++    base::StrAppend(
++        &p, {type, " nd_", fn, "(", type, " x){return ", fn, "(", arg, ");}"});
++  }
++}
++
++// `T nd_fn(T v [, extra params]) { return fn(v + noise * nd_a * k [, extra
++// args]); }` for vec2, vec3 and vec4. Input-additive on the first vector
++// argument; the other arguments pass through. `extra_params` may use "$T"
++// for the vector type.
++void EmitVectorInput(std::string& p,
++                     std::string_view fn,
++                     double salt_base,
++                     std::string_view k,
++                     std::string_view first_param,
++                     std::string_view extra_params,
++                     std::string_view extra_args) {
++  SaltSequence salt(salt_base);
++  for (int dim = 2; dim <= 4; ++dim) {
++    const std::string_view type = GlslType(dim);
++    std::string params(extra_params);
++    base::ReplaceSubstringsAfterOffset(&params, 0, "$T", type);
++    base::StrAppend(&p, {type, " nd_", fn, "(", type, " ", first_param, params,
++                         "){return ", fn, "(", first_param, "+",
++                         NoiseTerm(dim, salt), "*nd_a*", k, extra_args, ");}"});
++  }
++}
++
++// `float nd_fn(vecN ...) { return fn(...) * (1.0 + noise * nd_a * nd_kl); }`
++// for vec2, vec3 and vec4. Output-multiplicative: fn(zero) = 0 stays 0, so
++// the canary at zero is preserved; non-zero results scale by
++// [1 - amp * nd_kl, 1 + amp * nd_kl]. `params` may use "$T" for the vector
++// type.
++void EmitScaledOutput(std::string& p,
++                      std::string_view fn,
++                      double salt_base,
++                      std::string_view params,
++                      std::string_view args) {
++  SaltSequence salt(salt_base);
++  for (int dim = 2; dim <= 4; ++dim) {
++    std::string typed_params(params);
++    base::ReplaceSubstringsAfterOffset(&typed_params, 0, "$T", GlslType(dim));
++    base::StrAppend(
++        &p, {"float nd_", fn, "(", typed_params, "){return ", fn, "(", args,
++             ")*(1.0+", NoiseSample(salt), "*nd_a*nd_kl);}"});
++  }
++}
++
++// `T nd_fn(L a, L b, X x) { return fn(a, b, x + noise * nd_a * k); }` for
++// component counts `first_dim`..4, where the perturbed argument is the last
++// one. GLSL ES 1.0 has both the all-vector overloads and the mixed ones
++// (`T smoothstep(float, float, T)`, `T mix(T, T, float)`): `scalar_leading`
++// makes the two leading parameters float, `scalar_last` makes the last
++// parameter (and therefore its noise term) float.
++void EmitTernary(std::string& p,
++                 std::string_view fn,
++                 double salt_base,
++                 std::string_view k,
++                 std::string_view a,
++                 std::string_view b,
++                 std::string_view x,
++                 int first_dim,
++                 bool scalar_leading,
++                 bool scalar_last) {
++  SaltSequence salt(salt_base);
++  for (int dim = first_dim; dim <= 4; ++dim) {
++    const std::string_view type = GlslType(dim);
++    const std::string_view leading = scalar_leading ? "float" : type;
++    const std::string_view last = scalar_last ? "float" : type;
++    base::StrAppend(&p, {type,
++                         " nd_",
++                         fn,
++                         "(",
++                         leading,
++                         " ",
++                         a,
++                         ",",
++                         leading,
++                         " ",
++                         b,
++                         ",",
++                         last,
++                         " ",
++                         x,
++                         "){return ",
++                         fn,
++                         "(",
++                         a,
++                         ",",
++                         b,
++                         ",",
++                         x,
++                         "+",
++                         NoiseTerm(scalar_last ? 1 : dim, salt),
++                         "*nd_a*",
++                         k,
++                         ");}"});
++  }
++}
++
++// Assembles the GLSL prelude injected at the top of every variance-eligible
++// fragment shader. Emitted as a single physical line: user line numbers in
++// gl.getShaderInfoLog shift by exactly +1.
++//
++// `es3` selects the texture-sampling builtins used inside the nd_texture*
++// wrapper bodies: GLSL ES 3.00 (WebGL2) uses texture/textureProj, GLSL ES
++// 1.00 (WebGL1) uses texture2D/texture2DProj/textureCube. The wrapper
++// *names* are identical in both dialects so SubstituteCallSites is
++// unaffected.
++//
++// Layout:
++//   `precision highp float;` ensures our helpers compile in shaders that
++//     don't declare a default precision. A user-declared `precision` later
++//     in the source overrides this for user-declared variables (legal in
++//     GLSL ES 1.0: last declaration wins).
++//   `nd_a` is the per-profile amplitude as a literal float constant.
++//   `nd_k*` are the per-surface multipliers as const float constants. ANGLE
++//     inlines const-qualified globals, so they leave no introspection
++//     footprint.
++//   `nd_n(p, s)` is deterministic noise in [-0.5, 0.5] keyed by
++//     gl_FragCoord, a per-callsite salt, and nd_a (so different profiles
++//     produce different noise patterns AND different magnitudes).
++//   `nd_<fn>` are overloaded wrappers for each kWrappedKeyword across the
++//     relevant scalar/vec2/vec3/vec4 shapes.
++//   `nd_fc()` is the perturbed gl_FragCoord substitute used by
++//     SubstituteIdents.
++//   `nd_color_offset()` is the per-fragment RGB offset injected at the end
++//     of main() by RewriteFragmentShaderForNoise.
++//
++// Prelude content depends only on the amplitude and the dialect, so callers
++// should retrieve it via GetCachedPrelude() rather than re-running this.
++std::string BuildPrelude(float amplitude, bool es3) {
++  // Dialect-dependent texture-sampling builtin names (see ShaderTargetsES3).
++  const std::string_view tex2d = es3 ? "texture" : "texture2D";
++  const std::string_view tex2dproj = es3 ? "textureProj" : "texture2DProj";
++  const std::string_view texcube = es3 ? "texture" : "textureCube";
++
++  std::string p;
++  p.reserve(20000);
++
++  p += "precision highp float;";
++  base::StringAppendF(&p, "float nd_a=%#g;", amplitude);
++
++  const NoiseMultiplierValues& k = GetNoiseMultiplierValues();
++  for (size_t i = 0; i < k.size(); ++i) {
++    base::StringAppendF(&p, "const float %s=%#g;",
++                        std::string(kNoiseMultipliers[i].glsl_name).c_str(),
++                        k[i]);
++  }
++
++  p += "float nd_n(vec2 p,float s){return fract(sin(dot(p,vec2(127.1,311.7))"
++       "+s+nd_a*1e6)*43758.5453)-0.5;}";
++
++  // Trig + inverse trig. Canary-safe for x=0 (sin/tan etc.): sin(0 + d) ~= d
++  // << 1 LSB at calibrated amp. asin/acos are clamped to their [-1, 1]
++  // domain.
++  EmitUnary(p, "sin", 10.0, "nd_kt", kNoClamp);
++  EmitUnary(p, "cos", 20.0, "nd_kt", kNoClamp);
++  EmitUnary(p, "tan", 30.0, "nd_kt", kNoClamp);
++  EmitUnary(p, "asin", 11.0, "nd_kt", kClampUnitRange);
++  EmitUnary(p, "acos", 21.0, "nd_kt", kClampUnitRange);
++  EmitUnary(p, "atan", 31.0, "nd_kt", kNoClamp);  // 1-arg overload
++
++  // atan 2-arg overload (atan(y, x) = atan(y/x) with quadrant disambiguation).
++  // Perturb y only: perturbing both could shift the quadrant near axes.
++  {
++    SaltSequence salt(32.0);
++    for (int dim = 1; dim <= 4; ++dim) {
++      const std::string_view type = GlslType(dim);
++      base::StrAppend(
++          &p, {type, " nd_atan(", type, " y,", type, " x){return atan(y+",
++               NoiseTerm(dim, salt), "*nd_a*nd_kt2,x);}"});
++    }
++  }
++
++  // Exponential family + roots. log/log2 are undefined at x <= 0, sqrt at
++  // x < 0 and inversesqrt at x <= 0, so each is clamped to its domain.
++  EmitUnary(p, "exp", 100.0, "nd_ke", kNoClamp);
++  EmitUnary(p, "log", 110.0, "nd_klg", kClampPositive);
++  EmitUnary(p, "exp2", 120.0, "nd_ke", kNoClamp);
++  EmitUnary(p, "log2", 130.0, "nd_klg", kClampPositive);
++  EmitUnary(p, "sqrt", 140.0, "nd_kp", kClampNonNegative);
++  EmitUnary(p, "inversesqrt", 150.0, "nd_kp", kClampPositive);
++
++  // pow: input-additive on x (base), clamped to x >= 0; y untouched.
++  {
++    SaltSequence salt(40.0);
++    for (int dim = 1; dim <= 4; ++dim) {
++      const std::string_view type = GlslType(dim);
++      base::StrAppend(
++          &p, {type, " nd_pow(", type, " x,", type, " y){return pow(max(x+",
++               NoiseTerm(dim, salt), "*nd_a*nd_kp,0.0),y);}"});
++    }
++  }
++
++  // length / distance: output-multiplicative scaled by nd_kl.
++  EmitScaledOutput(p, "length", 50.0, "$T v", "v");
++  EmitScaledOutput(p, "distance", 60.0, "$T a,$T b", "a,b");
++
++  // normalize: input-additive (output auto-renormalizes) scaled by nd_kn.
++  // Edge case is the exact zero vector, where the unperturbed result is
++  // also undefined; not a canary concern.
++  EmitVectorInput(p, "normalize", 70.0, "nd_kn", "v", "", "");
++
++  // reflect / refract: input-additive on I (incident vector) scaled by nd_kr.
++  // N (and eta) untouched. reflect(0, N) = 0, so the canary at zero I holds.
++  EmitVectorInput(p, "reflect", 200.0, "nd_kr", "I", ",$T N", ",N");
++  EmitVectorInput(p, "refract", 210.0, "nd_kr", "I", ",$T N,float eta",
++                  ",N,eta");
++
++  // smoothstep: perturb x (3rd arg) scaled by nd_kss. Canary-safe outside
++  // the transition region (output saturates to 0 or 1, perturbation
++  // absorbed). Sensitive near the transition (1/(edge1-edge0) slope), but
++  // that's exactly where natural cross-GPU variance lives. GLSL ES 1.0 also
++  // has the scalar-edge overloads `T smoothstep(float, float, T)`.
++  EmitTernary(p, "smoothstep", 220.0, "nd_kss", "e0", "e1", "x",
++              /*first_dim=*/1, /*scalar_leading=*/false,
++              /*scalar_last=*/false);
++  EmitTernary(p, "smoothstep", 230.0, "nd_kss", "e0", "e1", "x",
++              /*first_dim=*/2, /*scalar_leading=*/true,
++              /*scalar_last=*/false);
++
++  // mix: perturb a (3rd arg, interpolation factor) scaled by nd_km.
++  // Canary-safe when x == y (output is x regardless of a). Output change
++  // is d*(y - x), so perturbation visibility scales with the range of mixed
++  // values. GLSL ES 1.0 also has the scalar-a overloads `T mix(T, T, float)`.
++  EmitTernary(p, "mix", 240.0, "nd_km", "x", "y", "a", /*first_dim=*/1,
++              /*scalar_leading=*/false, /*scalar_last=*/false);
++  EmitTernary(p, "mix", 250.0, "nd_km", "x", "y", "a", /*first_dim=*/2,
++              /*scalar_leading=*/false, /*scalar_last=*/true);
++
++  // texture2D: input-additive on UV scaled by nd_kx. Peak UV shift
++  // = 0.5 * nd_a * nd_kx stays << half-texel for the probe-validated switch
++  // range, so NEAREST sampling rounds the perturbation away (canary
++  // preserved). LINEAR and mipmap pick the perturbation up via the filter
++  // coefficients (LINEAR) and LOD selection gradients (mipmap, far more
++  // sensitive than LINEAR).
++  //
++  // The bias overload (vec2 uv, float bias) is fragment-shader-only and
++  // doesn't require any extension, so it is emitted unconditionally.
++  {
++    SaltSequence salt(80.0);
++    base::StrAppend(
++        &p, {"vec4 nd_texture2D(sampler2D s,vec2 uv){return ", tex2d, "(s,uv+",
++             NoiseTerm(2, salt), "*nd_a*nd_kx);}"});
++    base::StrAppend(
++        &p, {"vec4 nd_texture2D(sampler2D s,vec2 uv,float bias){"
++             "return ",
++             tex2d, "(s,uv+", NoiseTerm(2, salt), "*nd_a*nd_kx,bias);}"});
++  }
++
++  // texture2DProj: perturb the projective coord's .xy components only. The
++  // .z (or .w for vec4) is the projective divisor; perturbing it would warp
++  // the projection in an unpredictable way. Four overloads: vec3 (divide by
++  // .z) and vec4 (divide by .w), plus their fragment-only `float bias`
++  // variants. GLSL ES 1.0 defines a bias overload for every projective
++  // sampler, and a user call site that uses it would otherwise rewrite to
++  // nd_texture2DProj(...) with no matching overload.
++  {
++    SaltSequence salt(260.0);
++    for (std::string_view bias_param : {"", ",float bias"}) {
++      const std::string_view bias_arg = bias_param.empty() ? "" : ",bias";
++      for (int dim = 3; dim <= 4; ++dim) {
++        base::StrAppend(
++            &p, {"vec4 nd_texture2DProj(sampler2D s,", GlslType(dim), " c",
++                 bias_param, "){return ", tex2dproj, "(s,c+",
++                 NoiseXYTerm(dim, salt), "*nd_a*nd_kx", bias_arg, ");}"});
++      }
++    }
++  }
++
++  // textureCube: perturb the 3D direction vector. Small perturbations could
++  // shift face boundaries near cube edges, which is exactly the natural
++  // cross-GPU variance pattern for cubemap sampling. Two overloads: the
++  // plain sampler and its fragment-only `float bias` variant (common in
++  // three.js environment-map / reflection shaders).
++  {
++    SaltSequence salt(280.0);
++    for (std::string_view bias_param : {"", ",float bias"}) {
++      const std::string_view bias_arg = bias_param.empty() ? "" : ",bias";
++      base::StrAppend(&p, {"vec4 nd_textureCube(samplerCube s,vec3 v",
++                           bias_param, "){return ", texcube, "(s,v+",
++                           NoiseTerm(3, salt), "*nd_a*nd_kx", bias_arg, ");}"});
++    }
++  }
++
++  // gl_FragCoord substitute. SubstituteIdents rewrites user-code reads of
++  // `gl_FragCoord` to `nd_fc()`; this helper applies sub-pixel additive
++  // perturbation to the .x and .y components (.z = depth, .w = 1/clip-w are
++  // left unchanged since perturbing them produces gross visual artifacts
++  // rather than natural sub-pixel variance). Wrappers above continue
++  // referencing the real `gl_FragCoord` directly inside the prelude:
++  // SubstituteIdents starts past the prelude so internal seeds stay raw.
++  {
++    SaltSequence salt(90.0);
++    base::StrAppend(&p, {"vec4 nd_fc(){return gl_FragCoord+",
++                         NoiseXYTerm(4, salt), "*nd_a*nd_kf;}"});
++  }
++
++  // Color-output offset, injected just before the closing `}` of main() for
++  // shaders that read a varying but don't sample any texture (gated by the
++  // rewriter, see RewriteFragmentShaderForNoise). Each call produces a
++  // per-fragment vec3 offset (RGB only; alpha preserved) keyed by
++  // gl_FragCoord and per-channel salts, scaled by nd_a * nd_kc.
++  {
++    SaltSequence salt(400.0);
++    base::StrAppend(&p, {"vec3 nd_color_offset(){return ", NoiseTerm(3, salt),
++                         "*nd_a*nd_kc;}"});
++  }
++
++  return p;
++}
++
++// Cached prelude: content depends only on the process-static amplitude and
++// the target GLSL dialect, so compute once per dialect and reuse. A given
++// process serves both WebGL1 (ES 1.00) and WebGL2 (ES 3.00) contexts, so
++// both variants are cached independently.
++const std::string& GetCachedPrelude(bool es3) {
++  if (es3) {
++    static const std::string cached_es3 =
++        BuildPrelude(GetWebGLShaderNoiseAmplitude(), /*es3=*/true);
++    return cached_es3;
++  }
++  static const std::string cached_es1 =
++      BuildPrelude(GetWebGLShaderNoiseAmplitude(), /*es3=*/false);
++  return cached_es1;
++}
++
++// ---------------------------------------------------------------------------
++// Source rewriting.
++// ---------------------------------------------------------------------------
++
++// Find the position after any #version/#extension/#pragma/#define directives.
++// GLSL ES 1.0 requires preprocessor directives to precede non-preprocessor
++// code, so the prelude must be inserted past them. Comments and blank lines
++// before the first non-preprocessor token are also skipped.
++size_t FindInsertionPoint(std::string_view src) {
++  size_t pos = 0;
++  while (pos < src.size()) {
++    while (pos < src.size() && IsGlslSpace(src[pos])) {
++      ++pos;
++    }
++    if (pos >= src.size()) {
++      break;
++    }
++    if (pos + 1 < src.size() && src[pos] == '/' && src[pos + 1] == '/') {
++      while (pos < src.size() && src[pos] != '\n') {
++        ++pos;
++      }
++      continue;
++    }
++    if (pos + 1 < src.size() && src[pos] == '/' && src[pos + 1] == '*') {
++      pos += 2;
++      while (pos + 1 < src.size() &&
++             !(src[pos] == '*' && src[pos + 1] == '/')) {
++        ++pos;
++      }
++      if (pos + 1 < src.size()) {
++        pos += 2;
++      }
++      continue;
++    }
++    if (src[pos] == '#') {
++      while (pos < src.size() && src[pos] != '\n') {
++        ++pos;
++      }
++      continue;
++    }
++    break;  // First non-preprocessor, non-comment token.
++  }
++  return pos;
++}
++
++// For each kWrappedKeyword that appears as a standalone identifier followed
++// by `(` (with optional whitespace between), prepend `nd_`. Boundary checks
++// reject neighbouring identifier characters so `texture2DProj`, `mysin`,
++// `sin12` etc. are correctly skipped.
++//
++// Comments are not skipped here. Keywords inside comments that happen to be
++// followed by `(` get rewritten, but the surrounding comment delimiters are
++// unchanged so the comment still terminates correctly. ANGLE strips comments
++// before semantic analysis, so the only visible effect is uglier source if
++// logged.
++std::string SubstituteCallSites(std::string src, size_t after_prelude) {
++  for (std::string_view keyword : kWrappedKeywords) {
++    size_t pos = after_prelude;
++    while ((pos = FindStandaloneIdentifier(src, keyword, pos)) !=
++           std::string_view::npos) {
++      size_t look = pos + keyword.size();
++      while (look < src.size() && IsGlslSpace(src[look])) {
++        ++look;
++      }
++      if (look < src.size() && src[look] == '(') {
++        src.insert(pos, "nd_");
++        pos += 3;  // strlen("nd_")
++      }
++      // Skip the keyword itself so the next search cannot re-match inside
++      // the freshly substituted `nd_<keyword>`.
++      pos += keyword.size();
++    }
++  }
++  return src;
++}
++
++// For each kIdentSubstitution that appears as a standalone identifier,
++// replace it in place with the configured replacement. Unlike
++// SubstituteCallSites, the right boundary does NOT require a following `(`:
++// used for expression-valued built-in variables like gl_FragCoord that user
++// code reads without parens.
++std::string SubstituteIdents(std::string src, size_t after_prelude) {
++  for (const IdentSubstitution& sub : kIdentSubstitutions) {
++    size_t pos = after_prelude;
++    while ((pos = FindStandaloneIdentifier(src, sub.identifier, pos)) !=
++           std::string_view::npos) {
++      src.replace(pos, sub.identifier.size(), sub.replacement);
++      pos += sub.replacement.size();
++    }
++  }
++  return src;
++}
++
++// Returns a copy of `src` with all line and block comment contents replaced
++// by spaces (newlines preserved). Character offsets are preserved, so parser
++// results computed against the stripped copy can be used directly against
++// the original. Keeps FindMainBodyClose from being misled by braces inside
++// comments, a real concern for adversarial fingerprint shaders.
++std::string StripCommentsToSpaces(std::string src) {
++  enum { kNormal, kLine, kBlock } state = kNormal;
++  size_t i = 0;
++  while (i < src.size()) {
++    if (state == kNormal) {
++      if (i + 1 < src.size() && src[i] == '/' && src[i + 1] == '/') {
++        src[i] = ' ';
++        src[i + 1] = ' ';
++        state = kLine;
++        i += 2;
++      } else if (i + 1 < src.size() && src[i] == '/' && src[i + 1] == '*') {
++        src[i] = ' ';
++        src[i + 1] = ' ';
++        state = kBlock;
++        i += 2;
++      } else {
++        ++i;
++      }
++    } else if (state == kLine) {
++      if (src[i] == '\n') {
++        state = kNormal;
++      } else {
++        src[i] = ' ';
++      }
++      ++i;
++    } else {  // kBlock
++      if (i + 1 < src.size() && src[i] == '*' && src[i + 1] == '/') {
++        src[i] = ' ';
++        src[i + 1] = ' ';
++        state = kNormal;
++        i += 2;
++      } else {
++        src[i] = ' ';
++        ++i;
++      }
++    }
++  }
++  return src;
++}
++
++// Returns the position of the closing `}` that ends main()'s body, or npos
++// if no well-formed main() is found past `after_prelude`.
++//
++// "Well-formed" here means: a standalone identifier `main` preceded (after
++// whitespace) by a standalone identifier `void`, then `(`, optional ws, `)`,
++// optional ws, then the body `{`. Brace depth tracking then finds the
++// matching `}`. Operates on a comment-stripped copy so braces inside
++// `// { ... }` or `/* { ... } */` don't perturb the depth counter; the
++// returned position is valid against the original (unstripped) `src` since
++// StripCommentsToSpaces preserves character offsets.
++//
++// Conservative parser: only matches the canonical `void main()` form. ANGLE
++// rejects any other signature for the fragment entry point anyway, so
++// missing it would imply a shader that won't compile; declining to inject
++// is the right behavior.
++size_t FindMainBodyClose(const std::string& src, size_t after_prelude) {
++  const std::string stripped = StripCommentsToSpaces(src);
++  auto skip_ws_fwd = [&stripped](size_t& p) {
++    while (p < stripped.size() && IsGlslSpace(stripped[p])) {
++      ++p;
++    }
++  };
++  size_t pos = after_prelude;
++  while ((pos = FindStandaloneIdentifier(stripped, "main", pos)) !=
++         std::string_view::npos) {
++    const size_t after_main = pos + 4;
++    // Verify the token immediately to the left (after whitespace) is `void`.
++    size_t left = pos;
++    while (left > after_prelude && IsGlslSpace(stripped[left - 1])) {
++      --left;
++    }
++    if (left < 4 || stripped.compare(left - 4, 4, "void") != 0 ||
++        (left - 4 > 0 && IsIdentChar(stripped[left - 5]))) {
++      ++pos;
++      continue;
++    }
++    // Expect `()` and `{` past `main`, allowing whitespace between tokens.
++    size_t p = after_main;
++    skip_ws_fwd(p);
++    if (p >= stripped.size() || stripped[p] != '(') {
++      ++pos;
++      continue;
++    }
++    ++p;
++    skip_ws_fwd(p);
++    if (p >= stripped.size() || stripped[p] != ')') {
++      ++pos;
++      continue;
++    }
++    ++p;
++    skip_ws_fwd(p);
++    if (p >= stripped.size() || stripped[p] != '{') {
++      ++pos;
++      continue;
++    }
++    // Brace-depth track to the matching `}`. `{` and `}` inside string
++    // literals don't exist in GLSL, so no escaping needed.
++    size_t depth = 1;
++    ++p;
++    while (p < stripped.size() && depth > 0) {
++      if (stripped[p] == '{') {
++        ++depth;
++      } else if (stripped[p] == '}') {
++        --depth;
++        if (depth == 0) {
++          return p;  // Position of the closing `}` of main().
++        }
++      }
++      ++p;
++    }
++    // Unbalanced: give up rather than guess.
++    return std::string::npos;
++  }
++  return std::string::npos;
++}
++
++}  // namespace
++
++String RewriteFragmentShaderForNoise(const String& src) {
++  const float amp = GetWebGLShaderNoiseAmplitude();
++  if (amp == 0.0f) {
++    return src;
++  }
++
++  std::string ascii(src.Utf8());
++
++  // Coarse canary filter: bail unchanged for shaders that don't reference
++  // any natural-variance construct.
++  if (!ContainsVarianceKeyword(ascii)) {
++    return src;
++  }
++
++  const bool es3 = ShaderTargetsES3(ascii);
++
++  // Color-offset eligibility, computed on the ORIGINAL source (before
++  // SubstituteCallSites rewrites texture2D -> nd_texture2D). Inject the
++  // color-output offset only for shaders that read a varying and DON'T
++  // sample any texture: the texture path's NEAREST canary was calibrated
++  // for the wrapper amplitudes and would break if the offset stacked on
++  // top.
++  //
++  // ES3 (WebGL2) is excluded: the injection writes to `gl_FragColor`, a GLSL
++  // ES 1.0 builtin that does not exist in GLSL ES 3.00. There the fragment
++  // output is a user-declared `out vec4 <name>` with an arbitrary name
++  // (three.js happens to shim `#define gl_FragColor pc_fragColor`, but raw
++  // WebGL2 shaders do not), so emitting `gl_FragColor` would fail to compile.
++  // Re-enabling for ES3 requires resolving the actual fragment output name.
++  const bool inject_color_offset =
++      !es3 && HasVaryingDeclaration(ascii) && !ContainsTextureFunction(ascii);
++
++  const size_t insert_pos = FindInsertionPoint(ascii);
++  const std::string& prelude = GetCachedPrelude(es3);
++  ascii.insert(insert_pos, prelude);
++  const size_t after_prelude = insert_pos + prelude.size();
++  ascii = SubstituteCallSites(std::move(ascii), after_prelude);
++  ascii = SubstituteIdents(std::move(ascii), after_prelude);
++
++  if (inject_color_offset) {
++    const size_t main_close = FindMainBodyClose(ascii, after_prelude);
++    if (main_close != std::string::npos) {
++      ascii.insert(main_close, "gl_FragColor.rgb+=nd_color_offset();");
++    }
++  }
++
++  return String::FromUtf8(ascii);
++}
++
++}  // namespace blink
+diff --git a/third_party/blink/renderer/modules/webgl/webgl_shader_noise.h b/third_party/blink/renderer/modules/webgl/webgl_shader_noise.h
+new file mode 100644
+index 0000000000..84ae750b70
+--- /dev/null
++++ b/third_party/blink/renderer/modules/webgl/webgl_shader_noise.h
+@@ -0,0 +1,57 @@
++// Copyright 2026 The browser Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef THIRD_PARTY_BLINK_RENDERER_MODULES_WEBGL_WEBGL_SHADER_NOISE_H_
++#define THIRD_PARTY_BLINK_RENDERER_MODULES_WEBGL_WEBGL_SHADER_NOISE_H_
++
++#include "third_party/blink/renderer/modules/modules_export.h"
++#include "third_party/blink/renderer/platform/wtf/text/wtf_string.h"
++
++// WebGL fragment shader source rewriting (--webgl-shader-noise).
++//
++// Applied at WebGLRenderingContextBase::shaderSource() before the GLSL source
++// is handed to ANGLE. The rewrite injects per-profile sub-LSB perturbations
++// on natural-variance constructs in the fragment shader: transcendental
++// function calls (sin/cos/pow/length/etc.), texture sampling UV inputs and
++// gl_FragCoord reads, plus a per-fragment color offset for shaders that read
++// varyings without sampling textures. Constants, uniform reads, and
++// flat-color writes pass through unchanged.
++//
++// Why source rewriting and not a readPixels-boundary hook:
++//   Most free tampering-detection sites compare readPixels output against
++//   re-derived canonical pixels (rerunning the same draw on a worker, on a
++//   2D canvas via different methods, etc.). A blanket readPixels perturbation
++//   diverges from those re-derivations and gets flagged. Source rewriting
++//   perturbs the natural-variance functions themselves, so the divergence
++//   matches what the spoofed GPU would actually produce: the same divergence
++//   from every readback path.
++//
++// Canary preservation strategy:
++//   1. Coarse: if the shader source contains no natural-variance keywords,
++//      return it unchanged. Pure flat-color and pure uniform-read shaders
++//      pass through.
++//   2. Fine: for shaders that DO call natural-variance functions, perturb
++//      only the function inputs (not the outputs). NEAREST texture sampling
++//      rounds the UV perturbation away. The tiny amplitude (~1e-5) sits
++//      inside the natural cross-GPU variance band so the perturbed output
++//      looks like another plausible GPU rasterizer rather than a tampered
++//      one.
++//
++// The implementation works on std::string rather than WTF::String: the
++// rewrite is a byte-level pass over ASCII GLSL that has already been
++// converted for ANGLE, and it converts back at the boundary.
++
++namespace blink {
++
++// Rewrites a fragment shader source for per-profile WebGL variance spoofing.
++// Returns the input unchanged when:
++//   - --webgl-shader-noise is not set, or set to 0
++//   - The source contains no natural-variance constructs (canary shader)
++// The original source remains available via WebGLShader::Source() for
++// gl.getShaderSource(); only the version sent to ANGLE/the GPU is rewritten.
++MODULES_EXPORT String RewriteFragmentShaderForNoise(const String& src);
++
++}  // namespace blink
++
++#endif  // THIRD_PARTY_BLINK_RENDERER_MODULES_WEBGL_WEBGL_SHADER_NOISE_H_

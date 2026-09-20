@@ -1,0 +1,301 @@
+From cd30920ac64377b742878171a3c76d7e3304d642 Mon Sep 17 00:00:00 2001
+From: Leo Rodarte <leorodarte07@gmail.com>
+Date: Sat, 19 Sep 2026 23:45:44 -0400
+Subject: [PATCH 25/41] webrtc-ip
+
+WebRTC local-IP spoof.
+---
+ components/browser/webrtc_ip_spoofer.cc       | 153 ++++++++++++++++++
+ components/browser/webrtc_ip_spoofer.h        |  38 +++++
+ .../renderer/modules/peerconnection/BUILD.gn  |   1 +
+ .../rtc_peer_connection_handler.cc            |   8 +-
+ .../peerconnection/rtc_stats_report.cc        |  18 +++
+ 5 files changed, 217 insertions(+), 1 deletion(-)
+ create mode 100644 components/browser/webrtc_ip_spoofer.cc
+ create mode 100644 components/browser/webrtc_ip_spoofer.h
+
+diff --git a/components/browser/webrtc_ip_spoofer.cc b/components/browser/webrtc_ip_spoofer.cc
+new file mode 100644
+index 0000000000..62b81f9c8a
+--- /dev/null
++++ b/components/browser/webrtc_ip_spoofer.cc
+@@ -0,0 +1,153 @@
++// Copyright 2026 The browser Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/browser/webrtc_ip_spoofer.h"
++
++#include <optional>
++#include <string>
++#include <string_view>
++
++#include "base/command_line.h"
++#include "base/no_destructor.h"
++#include "base/strings/string_util.h"
++#include "components/browser/browser_switches.h"
++
++namespace browser {
++namespace {
++
++struct SpoofConfig {
++  std::string ipv4;
++  std::string ipv6;
++};
++
++const SpoofConfig& GetSpoofConfig() {
++  static const base::NoDestructor<SpoofConfig> config([] {
++    const base::CommandLine* command_line =
++        base::CommandLine::ForCurrentProcess();
++    return SpoofConfig{command_line->GetSwitchValueASCII(switches::kWebrtcIP4),
++                       command_line->GetSwitchValueASCII(switches::kWebrtcIP6)};
++  }());
++  return *config;
++}
++
++// Reserved addresses keep their value, as does anything that is not an IP
++// literal (mDNS host candidates such as "<uuid>.local").
++bool IsExemptAddress(std::string_view ip) {
++  if (ip.empty()) {
++    return true;
++  }
++  for (char c : ip) {
++    if (!base::IsHexDigit(c) && c != '.' && c != ':') {
++      return true;
++    }
++  }
++  return ip == "0.0.0.0" || ip == "::" || ip == "127.0.0.1" || ip == "::1" ||
++         base::StartsWith(ip, "169.254.") ||
++         base::StartsWith(ip, "fe80", base::CompareCase::INSENSITIVE_ASCII);
++}
++
++// Offset of the space-separated token number |index| of |line|, if any.
++std::optional<size_t> TokenOffset(std::string_view line, size_t index) {
++  size_t offset = 0;
++  for (size_t i = 0; i < index; ++i) {
++    offset = line.find(' ', offset);
++    if (offset == std::string_view::npos) {
++      return std::nullopt;
++    }
++    ++offset;
++  }
++  if (offset >= line.size()) {
++    return std::nullopt;
++  }
++  return offset;
++}
++
++// Replaces the token starting at |offset| of |line| with its spoofed form.
++void SpoofTokenAt(std::string* line, size_t offset) {
++  size_t end = line->find(' ', offset);
++  if (end == std::string::npos) {
++    end = line->size();
++  }
++  const std::string replacement =
++      SpoofWebRtcIp(std::string_view(*line).substr(offset, end - offset));
++  line->replace(offset, end - offset, replacement);
++}
++
++// "c=IN IP4 <address>" carries the address in token 2; "o=<user> <id>
++// <version> IN IP4 <address>" in token 5.
++std::string SpoofSdpLine(std::string_view line) {
++  if (base::StartsWith(line, "a=candidate:")) {
++    return SpoofWebRtcCandidate(line);
++  }
++  std::string result(line);
++  std::optional<size_t> address;
++  if (base::StartsWith(line, "c=")) {
++    address = TokenOffset(result, 2);
++  } else if (base::StartsWith(line, "o=")) {
++    address = TokenOffset(result, 5);
++  }
++  if (address) {
++    SpoofTokenAt(&result, *address);
++  }
++  return result;
++}
++
++}  // namespace
++
++bool IsWebRtcIpSpoofActive() {
++  const SpoofConfig& config = GetSpoofConfig();
++  return !config.ipv4.empty() || !config.ipv6.empty();
++}
++
++std::string SpoofWebRtcIp(std::string_view ip) {
++  if (IsExemptAddress(ip)) {
++    return std::string(ip);
++  }
++  const bool is_ipv6 = ip.find(':') != std::string_view::npos;
++  const std::string& replacement =
++      is_ipv6 ? GetSpoofConfig().ipv6 : GetSpoofConfig().ipv4;
++  return replacement.empty() ? std::string(ip) : replacement;
++}
++
++// RFC 5245 candidate: "candidate:<foundation> <component> <transport>
++// <priority> <address> <port> typ <type> [raddr <address> rport <port>] ...".
++std::string SpoofWebRtcCandidate(std::string_view candidate) {
++  if (!IsWebRtcIpSpoofActive() || candidate.empty()) {
++    return std::string(candidate);
++  }
++  std::string result(candidate);
++  if (std::optional<size_t> address = TokenOffset(result, 4)) {
++    SpoofTokenAt(&result, *address);
++  }
++  static constexpr std::string_view kRelatedAddress = " raddr ";
++  const size_t related = result.find(kRelatedAddress);
++  if (related != std::string::npos) {
++    SpoofTokenAt(&result, related + kRelatedAddress.size());
++  }
++  return result;
++}
++
++std::string SpoofWebRtcSdp(std::string_view sdp) {
++  if (!IsWebRtcIpSpoofActive() || sdp.empty()) {
++    return std::string(sdp);
++  }
++  std::string result;
++  result.reserve(sdp.size());
++  size_t pos = 0;
++  while (pos < sdp.size()) {
++    const size_t newline = sdp.find('\n', pos);
++    const size_t next =
++        newline == std::string_view::npos ? sdp.size() : newline + 1;
++    size_t content_end = newline == std::string_view::npos ? sdp.size() : newline;
++    if (content_end > pos && sdp[content_end - 1] == '\r') {
++      --content_end;
++    }
++    result += SpoofSdpLine(sdp.substr(pos, content_end - pos));
++    result += sdp.substr(content_end, next - content_end);
++    pos = next;
++  }
++  return result;
++}
++
++}  // namespace browser
+diff --git a/components/browser/webrtc_ip_spoofer.h b/components/browser/webrtc_ip_spoofer.h
+new file mode 100644
+index 0000000000..3f80279faf
+--- /dev/null
++++ b/components/browser/webrtc_ip_spoofer.h
+@@ -0,0 +1,38 @@
++// Copyright 2026 The browser Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// Replaces the local IP addresses WebRTC exposes to pages (ICE candidates,
++// session descriptions and candidate stats) with the addresses given by
++// --webrtc-ip4 and --webrtc-ip6. Reserved addresses (unspecified, loopback,
++// link-local) and non-IP hosts such as mDNS names are left alone.
++
++#ifndef COMPONENTS_BROWSER_WEBRTC_IP_SPOOFER_H_
++#define COMPONENTS_BROWSER_WEBRTC_IP_SPOOFER_H_
++
++#include <string>
++#include <string_view>
++
++#include "base/component_export.h"
++
++namespace browser {
++
++// True when at least one replacement address is configured.
++COMPONENT_EXPORT(BROWSER) bool IsWebRtcIpSpoofActive();
++
++// The replacement for |ip|, or |ip| itself when it is reserved, not an IP
++// literal, or no replacement of its address family is configured.
++COMPONENT_EXPORT(BROWSER) std::string SpoofWebRtcIp(std::string_view ip);
++
++// Replaces the connection address and any "raddr" related address of an ICE
++// candidate line, with or without the "a=" SDP prefix.
++COMPONENT_EXPORT(BROWSER)
++std::string SpoofWebRtcCandidate(std::string_view candidate);
++
++// Replaces the addresses in the a=candidate, c= and o= lines of an SDP body.
++// Line endings are preserved.
++COMPONENT_EXPORT(BROWSER) std::string SpoofWebRtcSdp(std::string_view sdp);
++
++}  // namespace browser
++
++#endif  // COMPONENTS_BROWSER_WEBRTC_IP_SPOOFER_H_
+diff --git a/third_party/blink/renderer/modules/peerconnection/BUILD.gn b/third_party/blink/renderer/modules/peerconnection/BUILD.gn
+index 626cedd059..bb7837941d 100644
+--- a/third_party/blink/renderer/modules/peerconnection/BUILD.gn
++++ b/third_party/blink/renderer/modules/peerconnection/BUILD.gn
+@@ -175,6 +175,7 @@ blink_modules_sources("peerconnection") {
+   public_deps = [ "//third_party/webrtc_overrides:webrtc_component" ]
+   deps = [
+     "//build:chromecast_buildflags",
++    "//components/browser:browser_switches",
+     "//components/webrtc:net_address_utils",
+     "//components/webrtc:thread_wrapper",
+     "//crypto",
+diff --git a/third_party/blink/renderer/modules/peerconnection/rtc_peer_connection_handler.cc b/third_party/blink/renderer/modules/peerconnection/rtc_peer_connection_handler.cc
+index c16fd93412..db108e4c2c 100644
+--- a/third_party/blink/renderer/modules/peerconnection/rtc_peer_connection_handler.cc
++++ b/third_party/blink/renderer/modules/peerconnection/rtc_peer_connection_handler.cc
+@@ -27,6 +27,7 @@
+ #include "base/threading/thread_checker.h"
+ #include "base/trace_event/trace_event.h"
+ #include "build/chromecast_buildflags.h"
++#include "components/browser/webrtc_ip_spoofer.h"
+ #include "media/base/media_switches.h"
+ #include "third_party/blink/public/common/features.h"
+ #include "third_party/blink/public/platform/platform.h"
+@@ -98,8 +99,10 @@ enum class RtcpMux { kDisabled, kEnabled, kNoMedia, kMax };
+ RTCSessionDescriptionPlatform* CreateWebKitSessionDescription(
+     const std::string& sdp,
+     const std::string& type) {
++  // browser: local addresses are replaced before the description reaches
++  // script.
+   return MakeGarbageCollected<RTCSessionDescriptionPlatform>(
+-      String::FromUtf8(type), String::FromUtf8(sdp));
++      String::FromUtf8(type), String::FromUtf8(browser::SpoofWebRtcSdp(sdp)));
+ }
+ 
+ RTCSessionDescriptionPlatform* CreateWebKitSessionDescription(
+@@ -598,6 +601,9 @@ class RTCPeerConnectionHandler::Observer
+     DCHECK(native_peer_connection_);
+     std::string sdp = candidate->ToString();
+     DCHECK(!sdp.empty());
++    // browser: local addresses are replaced before the candidate reaches
++    // script.
++    sdp = browser::SpoofWebRtcCandidate(sdp);
+     // The generated candidate may have been added to the pending or current
+     // local description, take a snapshot and surface them to the main thread.
+     // Remote descriptions are also surfaced because
+diff --git a/third_party/blink/renderer/modules/peerconnection/rtc_stats_report.cc b/third_party/blink/renderer/modules/peerconnection/rtc_stats_report.cc
+index 7d0540fa6f..505859e93c 100644
+--- a/third_party/blink/renderer/modules/peerconnection/rtc_stats_report.cc
++++ b/third_party/blink/renderer/modules/peerconnection/rtc_stats_report.cc
+@@ -9,6 +9,7 @@
+ #include "base/notimplemented.h"
+ #include "base/notreached.h"
+ #include "base/numerics/safe_conversions.h"
++#include "components/browser/webrtc_ip_spoofer.h"
+ #include "third_party/blink/public/common/features.h"
+ #include "third_party/blink/renderer/bindings/core/v8/script_value.h"
+ #include "third_party/blink/renderer/bindings/core/v8/v8_object_builder.h"
+@@ -518,6 +519,23 @@ RTCIceCandidateStats* ToV8Stat(
+   // Non-standard and obsolete stats.
+   SET_STAT(webrtc_stat.is_remote, v8_stat->setIsRemote);
+   SET_STAT(webrtc_stat.ip, v8_stat->setIp);
++
++  // browser: candidate addresses are replaced before they reach script.
++  if (browser::IsWebRtcIpSpoofActive()) {
++    if (webrtc_stat.address.has_value()) {
++      v8_stat->setAddress(String::FromUtf8(
++          browser::SpoofWebRtcIp(webrtc_stat.address.value())));
++    }
++    if (webrtc_stat.ip.has_value()) {
++      v8_stat->setIp(
++          String::FromUtf8(browser::SpoofWebRtcIp(webrtc_stat.ip.value())));
++    }
++    if (webrtc_stat.related_address.has_value()) {
++      v8_stat->setRelatedAddress(String::FromUtf8(
++          browser::SpoofWebRtcIp(webrtc_stat.related_address.value())));
++    }
++  }
++
+   return v8_stat;
+ }
+ 

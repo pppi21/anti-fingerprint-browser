@@ -1,0 +1,30 @@
+From db6b706876444fa977527cc1aa6cb6069f614dcb Mon Sep 17 00:00:00 2001
+From: Leo Rodarte <leorodarte07@gmail.com>
+Date: Sat, 19 Sep 2026 23:46:11 -0400
+Subject: [PATCH 35/41] widevine-cdm
+
+Widevine CDM host-file path.
+---
+ chrome/common/media/cdm_host_file_path.cc | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/chrome/common/media/cdm_host_file_path.cc b/chrome/common/media/cdm_host_file_path.cc
+index e6cea8c3ff..4f9bf70b99 100644
+--- a/chrome/common/media/cdm_host_file_path.cc
++++ b/chrome/common/media/cdm_host_file_path.cc
+@@ -107,10 +107,13 @@ void AddCdmHostFilePaths(
+ 
+ #else  // BUILDFLAG(GOOGLE_CHROME_BRANDING)
+ 
++// browser: no host files are registered. The CDM still verifies
++// widevinecdm.dll and its signature file itself through CdmHostFiles.
+ void AddCdmHostFilePaths(
+     std::vector<media::CdmHostFilePath>* cdm_host_file_paths) {
+-  NOTIMPLEMENTED() << "CDM host file paths need to be provided for the CDM to "
+-                      "verify the host.";
++  DVLOG(1) << __func__;
++  DCHECK(cdm_host_file_paths);
++  DCHECK(cdm_host_file_paths->empty());
+ }
+ 
+ #endif  // BUILDFLAG(GOOGLE_CHROME_BRANDING)

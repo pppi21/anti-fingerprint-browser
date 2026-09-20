@@ -1,0 +1,27 @@
+# v153 fix-build-refs: drop build-graph references to targets/files absent from
+# our unpruned / small-checkout v153 source, so `gn gen` can load the graph.
+# Re-derived for v153: both refs are still absent and still referenced -- they
+# are the ones upstream's fix-building-with-prunned-binaries.patch removes, which
+# we skip. Only line numbers moved (chrome/test/BUILD.gn 4925 -> 4857,
+# chrome/BUILD.gn 932 -> 1044); both contexts byte-identical to v152.
+--- a/chrome/test/BUILD.gn
++++ b/chrome/test/BUILD.gn
+@@ -4857,7 +4857,6 @@
+       data_deps += [
+         "//chrome/test:load_library_perf_tests",
+         "//components/tracing:tracing_perftests",
+-        "//components/variations/test_data/cipd:single_group_per_study_prefer_existing_behavior_seed",
+         "//testing:run_perf_test",
+         "//ui/views:views_perftests",
+       ]
+--- a/chrome/BUILD.gn
++++ b/chrome/BUILD.gn
+@@ -1044,8 +1044,6 @@
+ 
+   bundle_data("chrome_framework_resources") {
+     sources = [
+-      "//ui/gl/resources/angle-metal/gpu_shader_cache.bin",
+-
+       # This image is used to badge the lock icon in the
+       # authentication dialogs, such as those used for installation
+       # from disk image and Keystone promotion (if so enabled).  It

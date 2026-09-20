@@ -1,0 +1,40 @@
+From 73d14782f5f165b7ddf8429ca8b4cfc007ad9253 Mon Sep 17 00:00:00 2001
+From: Leo Rodarte <leorodarte07@gmail.com>
+Date: Sat, 19 Sep 2026 23:45:41 -0400
+Subject: [PATCH 24/41] payments-parity
+
+canMakePayment/hasEnrolledInstrument basic-card short-circuit.
+---
+ .../renderer/modules/payments/payment_request.cc     | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/third_party/blink/renderer/modules/payments/payment_request.cc b/third_party/blink/renderer/modules/payments/payment_request.cc
+index c6ed02f52f..4404e2ca71 100644
+--- a/third_party/blink/renderer/modules/payments/payment_request.cc
++++ b/third_party/blink/renderer/modules/payments/payment_request.cc
+@@ -1117,6 +1117,12 @@ ScriptPromise<IDLBoolean> PaymentRequest::canMakePayment(
+     return ToResolvedPromise<IDLBoolean>(script_state, false);
+   }
+ 
++  // browser: Chrome resolves false for basic-card-only requests, which have
++  // no app handler any more. Match that synchronously.
++  if (method_names_.size() == 1 && method_names_.Contains("basic-card")) {
++    return ToResolvedPromise<IDLBoolean>(script_state, false);
++  }
++
+   if (!payment_provider_.is_bound() || GetPendingAcceptPromiseResolver() ||
+       can_make_payment_resolver_ || !script_state->ContextIsValid()) {
+     exception_state.ThrowDOMException(DOMExceptionCode::kInvalidStateError,
+@@ -1142,6 +1148,12 @@ ScriptPromise<IDLBoolean> PaymentRequest::hasEnrolledInstrument(
+     return ToResolvedPromise<IDLBoolean>(script_state, false);
+   }
+ 
++  // browser: mirrors the basic-card short-circuit in canMakePayment() so
++  // the two methods cannot be told apart.
++  if (method_names_.size() == 1 && method_names_.Contains("basic-card")) {
++    return ToResolvedPromise<IDLBoolean>(script_state, false);
++  }
++
+   if (!payment_provider_.is_bound() || GetPendingAcceptPromiseResolver() ||
+       has_enrolled_instrument_resolver_ || !script_state->ContextIsValid()) {
+     exception_state.ThrowDOMException(DOMExceptionCode::kInvalidStateError,

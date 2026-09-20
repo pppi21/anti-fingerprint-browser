@@ -1,0 +1,60 @@
+From 179b2090a06d26c2c237e68b984c7ef12c98b496 Mon Sep 17 00:00:00 2001
+From: Leo Rodarte <leorodarte07@gmail.com>
+Date: Sat, 19 Sep 2026 23:46:24 -0400
+Subject: [PATCH 40/41] build-config
+
+gitignore adjustments for the custom build.
+---
+ .gitignore             | 5 ++---
+ third_party/.gitignore | 5 +++++
+ 2 files changed, 7 insertions(+), 3 deletions(-)
+
+diff --git a/.gitignore b/.gitignore
+index c763167e2d..60c8cec6e8 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -289,9 +289,7 @@ vs-chromium-project.txt
+ /tools/.bisect-builds-cache.json
+ /tools/cygprofile/*.wprgo
+ /tools/distcc
+-/tools/gn/bin/linux
+-/tools/gn/bin/mac
+-/tools/gn/bin/win
++/tools/gn/
+ /tools/histograms
+ /tools/json_schema_compiler/test/json_schema_compiler_tests.xml
+ /tools/metrics/actions/actions.old.xml
+@@ -304,6 +302,7 @@ vs-chromium-project.txt
+ /tools/skia_goldctl/
+ /tools/tryserver
+ /tools/win/link_limiter/build
++/third_party/git
+ /ui/file_manager/tsconfig.json
+ /ui/file_manager/integration_tests/tsconfig.json
+ /ui/keyboard/keyboard_mojom_bindings.xml
+diff --git a/third_party/.gitignore b/third_party/.gitignore
+index f15e5cbf36..1874017376 100644
+--- a/third_party/.gitignore
++++ b/third_party/.gitignore
+@@ -56,6 +56,7 @@
+ /fuchsia-sdk/images
+ /fuchsia-sdk/images-internal
+ /fuchsia-sdk/sdk
++/git/
+ /glfw/src
+ /glslang/src
+ /gn/
+@@ -125,9 +126,13 @@
+ /qemu-linux-x64
+ /qemu-mac-x64
+ /readability/src
++/rust/
+ /rust-src
+ /rust-toolchain-intermediate
+ /rust-toolchain/
++/rust-toolchain-arm/
++/rust-toolchain-x64/
++/rust-toolchain-x86/
+ /scan-build/src
+ /scons-2.0.1
+ /screen-ai/*/*

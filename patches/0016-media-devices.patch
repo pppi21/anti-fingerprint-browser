@@ -1,0 +1,135 @@
+From 38ee92911a4a017abfb216ed5fddc1de3256969f Mon Sep 17 00:00:00 2001
+From: Leo Rodarte <leorodarte07@gmail.com>
+Date: Sat, 19 Sep 2026 23:45:26 -0400
+Subject: [PATCH 16/41] media-devices
+
+enumerateDevices spoof.
+---
+ .../renderer/modules/mediastream/BUILD.gn     |  1 +
+ .../modules/mediastream/media_devices.cc      | 78 +++++++++++++++++++
+ 2 files changed, 79 insertions(+)
+
+diff --git a/third_party/blink/renderer/modules/mediastream/BUILD.gn b/third_party/blink/renderer/modules/mediastream/BUILD.gn
+index d6a91ebb3b..22712d6a16 100644
+--- a/third_party/blink/renderer/modules/mediastream/BUILD.gn
++++ b/third_party/blink/renderer/modules/mediastream/BUILD.gn
+@@ -137,6 +137,7 @@ blink_modules_sources("mediastream") {
+   ]
+   deps = [
+     "//build:chromecast_buildflags",
++    "//components/browser:browser_switches",
+     "//media/capture/mojom:image_capture_blink",
+     "//media/webrtc",
+     "//services/viz/public/cpp/gpu",
+diff --git a/third_party/blink/renderer/modules/mediastream/media_devices.cc b/third_party/blink/renderer/modules/mediastream/media_devices.cc
+index 4fe2cb45a0..e1c8b49627 100644
+--- a/third_party/blink/renderer/modules/mediastream/media_devices.cc
++++ b/third_party/blink/renderer/modules/mediastream/media_devices.cc
+@@ -5,15 +5,20 @@
+ #include "third_party/blink/renderer/modules/mediastream/media_devices.h"
+ 
+ #include <algorithm>
++#include <optional>
+ #include <utility>
+ 
+ #include "base/feature_list.h"
+ #include "base/metrics/histogram_functions.h"
+ #include "base/notreached.h"
+ #include "base/strings/strcat.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_split.h"
+ #include "base/strings/stringprintf.h"
+ #include "base/uuid.h"
+ #include "build/build_config.h"
++#include "components/browser/browser_switches.h"
++#include "components/browser/switch_resolver.h"
+ #include "media/base/media_permission.h"
+ #include "mojo/public/cpp/bindings/remote.h"
+ #include "services/network/public/mojom/permissions_policy/permissions_policy_feature.mojom-blink.h"
+@@ -85,6 +90,54 @@ BASE_FEATURE(kDeviceChangeRequiresPermission, base::FEATURE_ENABLED_BY_DEFAULT);
+ 
+ namespace {
+ 
++// browser: device counts from --fingerprint-media ("mics,webcams,speakers",
++// "auto" or "seed:<N>"); nullopt when not spoofed.
++struct MediaDeviceSpoof {
++  uint32_t mics = 1;
++  uint32_t webcams = 1;
++  uint32_t speakers = 1;
++};
++
++const std::optional<MediaDeviceSpoof>& CachedMediaDeviceSpoof() {
++  static const std::optional<MediaDeviceSpoof> spoof =
++      browser::ResolveSwitch<std::optional<MediaDeviceSpoof>>(
++          switches::kFingerprintMedia,
++          [](const std::string& value)
++              -> std::optional<std::optional<MediaDeviceSpoof>> {
++            if (value.empty()) {
++              return std::nullopt;
++            }
++            std::vector<std::string> parts = base::SplitString(
++                value, ",", base::TRIM_WHITESPACE, base::SPLIT_WANT_ALL);
++            MediaDeviceSpoof result;
++            if (parts.size() >= 1) {
++              base::StringToUint(parts[0], &result.mics);
++            }
++            if (parts.size() >= 2) {
++              base::StringToUint(parts[1], &result.webcams);
++            }
++            if (parts.size() >= 3) {
++              base::StringToUint(parts[2], &result.speakers);
++            }
++            return result;
++          },
++          [](int32_t seed) -> std::optional<MediaDeviceSpoof> {
++            // Mics 1-3, webcams 0-2, speakers 1-3, with independent salts so
++            // the three do not move in lockstep.
++            return MediaDeviceSpoof{
++                1u + browser::DeterministicBucket(seed, browser::kSaltMediaMics,
++                                                  3),
++                browser::DeterministicBucket(seed, browser::kSaltMediaWebcams,
++                                             3),
++                1u + browser::DeterministicBucket(
++                         seed, browser::kSaltMediaSpeakers, 3)};
++          },
++          std::nullopt,
++          /*inherit_from_master_seed=*/false)
++          .value;
++  return spoof;
++}
++
+ constexpr base::TimeDelta kEnumerateDevicesTimeout = base::Seconds(4);
+ 
+ void SendLogMessage(const std::string& message) {
+@@ -1487,6 +1540,31 @@ void MediaDevices::DevicesEnumerated(
+   }
+ 
+   ReportCompletedEnumerateDevices(result_contains_nonempty_input_device_ids);
++
++  // browser: with spoofed device counts, the list matches Chrome's
++  // pre-permission shape: at most one entry per kind with empty deviceId,
++  // label and groupId, in MediaDeviceType order (audioinput, videoinput,
++  // audiooutput). Counts act as booleans, because
++  // TranslateMediaDeviceInfoArray stops after the first entry per kind
++  // without permission.
++  if (const std::optional<MediaDeviceSpoof>& spoof = CachedMediaDeviceSpoof()) {
++    media_devices.clear();
++    if (spoof->mics > 0) {
++      media_devices.push_back(MakeGarbageCollected<InputDeviceInfo>(
++          String(""), String(""), String(""),
++          mojom::blink::MediaDeviceType::kMediaAudioInput));
++    }
++    if (spoof->webcams > 0) {
++      media_devices.push_back(MakeGarbageCollected<InputDeviceInfo>(
++          String(""), String(""), String(""),
++          mojom::blink::MediaDeviceType::kMediaVideoInput));
++    }
++    if (spoof->speakers > 0) {
++      media_devices.push_back(MakeGarbageCollected<MediaDeviceInfo>(
++          String(""), String(""), String(""),
++          mojom::blink::MediaDeviceType::kMediaAudioOutput));
++    }
++  }
+   result_tracker->Resolve(media_devices);
+   tracer->End();
+ }

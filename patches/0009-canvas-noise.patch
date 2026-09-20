@@ -1,0 +1,1182 @@
+From cc075e11cb10c9bf66adcaf8670da0cc9792c6d4 Mon Sep 17 00:00:00 2001
+From: Leo Rodarte <leorodarte07@gmail.com>
+Date: Sat, 19 Sep 2026 23:45:15 -0400
+Subject: [PATCH 09/41] canvas-noise
+
+Canvas 2D curve/style noise pipeline, with the shared deterministic-noise
+hash in platform/graphics so gradient.cc can use it without depending on
+modules/.
+---
+ .../blink/renderer/modules/canvas/BUILD.gn    |   3 +
+ .../canvas2d/base_rendering_context_2d.cc     |  42 ++-
+ .../canvas2d/canvas_2d_recorder_context.cc    |  66 ++++-
+ .../canvas2d/canvas_2d_recorder_context.h     |   4 +
+ .../canvas/canvas2d/canvas_curve_noise.cc     | 227 +++++++++++++++++
+ .../canvas/canvas2d/canvas_curve_noise.h      | 239 ++++++++++++++++++
+ .../canvas_rendering_context_2d_state.cc      |  98 ++++++-
+ .../canvas_rendering_context_2d_state.h       |  11 +
+ .../modules/canvas/canvas2d/canvas_style.cc   |  17 +-
+ .../modules/canvas/canvas2d/canvas_style.h    |  18 +-
+ third_party/blink/renderer/platform/BUILD.gn  |   1 +
+ .../platform/graphics/deterministic_noise.h   |  40 +++
+ .../renderer/platform/graphics/gradient.cc    |  23 ++
+ .../renderer/platform/graphics/gradient.h     |  18 ++
+ 14 files changed, 780 insertions(+), 27 deletions(-)
+ create mode 100644 third_party/blink/renderer/modules/canvas/canvas2d/canvas_curve_noise.cc
+ create mode 100644 third_party/blink/renderer/modules/canvas/canvas2d/canvas_curve_noise.h
+ create mode 100644 third_party/blink/renderer/platform/graphics/deterministic_noise.h
+
+diff --git a/third_party/blink/renderer/modules/canvas/BUILD.gn b/third_party/blink/renderer/modules/canvas/BUILD.gn
+index 1d29be2717..1798647dc7 100644
+--- a/third_party/blink/renderer/modules/canvas/BUILD.gn
++++ b/third_party/blink/renderer/modules/canvas/BUILD.gn
+@@ -18,6 +18,8 @@ blink_modules_sources("canvas") {
+     "canvas2d/canvas_filter_operation_resolver.h",
+     "canvas2d/canvas_gradient.cc",
+     "canvas2d/canvas_gradient.h",
++    "canvas2d/canvas_curve_noise.cc",
++    "canvas2d/canvas_curve_noise.h",
+     "canvas2d/canvas_image_source_util.cc",
+     "canvas2d/canvas_image_source_util.h",
+     "canvas2d/canvas_path.cc",
+@@ -58,6 +60,7 @@ blink_modules_sources("canvas") {
+   ]
+ 
+   deps = [
++    "//components/browser:browser_switches",
+     "//third_party/blink/renderer/modules/webcodecs",
+     "//third_party/blink/renderer/modules/webgpu",
+   ]
+diff --git a/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc b/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
+index 38528f7b8d..5f4b9ced9f 100644
+--- a/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
++++ b/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
+@@ -23,6 +23,7 @@
+ #include "base/numerics/safe_conversions.h"
+ #include "base/task/single_thread_task_runner.h"
+ #include "base/time/time.h"
++#include "cc/paint/color_filter.h"
+ #include "cc/paint/paint_canvas.h"
+ #include "cc/paint/paint_flags.h"
+ #include "cc/paint/paint_image.h"
+@@ -60,6 +61,7 @@
+ #include "third_party/blink/renderer/core/offscreencanvas/offscreen_canvas.h"
+ #include "third_party/blink/renderer/core/style/computed_style.h"
+ #include "third_party/blink/renderer/modules/canvas/canvas2d/canvas_2d_recorder_context.h"
++#include "third_party/blink/renderer/modules/canvas/canvas2d/canvas_curve_noise.h"
+ #include "third_party/blink/renderer/modules/canvas/canvas2d/canvas_rendering_context_2d_state.h"
+ #include "third_party/blink/renderer/modules/canvas/htmlcanvas/canvas_context_creation_attributes_helpers.h"
+ #include "third_party/blink/renderer/modules/webgpu/dawn_conversions.h"
+@@ -1131,8 +1133,9 @@ void BaseRenderingContext2D::DrawTextInternal(
+   Draw<OverdrawOp::kNone>(
+       /*draw_func=*/
+       [font, text = std::move(text), direction, bidi_override, location,
+-       run_start, run_end, canvas, &text_painter](MemoryManagedPaintCanvas* c,
+-                                                  const cc::PaintFlags* flags) {
++       run_start, run_end, canvas, &text_painter, paint_type,
++       is_accelerated = IsAccelerated()](MemoryManagedPaintCanvas* c,
++                                         const cc::PaintFlags* flags) {
+         TextRun text_run(text, direction, bidi_override);
+         // Font::DrawType::kGlyphsAndClusters is required for printing to PDF,
+         // otherwise the character to glyph mapping will not be reversible,
+@@ -1146,9 +1149,42 @@ void BaseRenderingContext2D::DrawTextInternal(
+         Font::DrawType draw_type = (canvas && canvas->IsPrinting())
+                                        ? Font::DrawType::kGlyphsAndClusters
+                                        : Font::DrawType::kGlyphsOnly;
++        // browser: per-profile text rendering perturbations
++        // (--canvas-curve-noise). Two independent surfaces composed on the same
++        // paint:
++        //  - strokeText lw > 1 -> stroke-width sub-pixel shift. Hits Skia's
++        //     stroke-to-fill expansion; offset-curve AA varies naturally
++        //     cross-GPU. Hairline (lw == 1) takes Skia's deterministic
++        //     single-pixel fast path - never perturbed.
++        //  - fillText / strokeText non-black -> per-channel uint8 LUT
++        //     color filter applied to the paint. Operates post-shader on
++        //     pre-multiplied pixels, so it covers monochrome non-black
++        //     text (paint.color x glyph coverage) AND color emoji bitmaps
++        //     (paint.color ignored, bitmap pixels flow through the filter).
++        //     table[0]=0 invariant keeps #000 monochrome canary on both
++        //     fill and stroke paths.
++        // Both surfaces stack on strokeText: width-perturbed + color-
++        // filtered. Backend-gated to keep willReadFrequently canvases
++        // bit-identical to canonical Chrome (paint(CPU) invariance).
++        cc::PaintFlags perturbed_flags;
++        const cc::PaintFlags* effective_flags = flags;
++        if (is_accelerated && CanvasCurveNoiseActive()) {
++          perturbed_flags = *flags;
++          if (paint_type == CanvasRenderingContext2DState::kStrokePaintType &&
++              flags->getStrokeWidth() > 1.0f) {
++            perturbed_flags.setStrokeWidth(PerturbCurveCoord(
++                flags->getStrokeWidth(), kCurveNoiseSaltTextStrokeWidth,
++                kCurveNoiseTextStrokeWidthMultiplier));
++          }
++          if (sk_sp<cc::ColorFilter> color_filter =
++                  MakeCanvasTextColorPerturbFilter()) {
++            perturbed_flags.setColorFilter(std::move(color_filter));
++          }
++          effective_flags = &perturbed_flags;
++        }
+         text_painter.DrawWithBidiReorder(text_run, run_start, run_end, *font,
+                                          Font::kUseFallbackIfFontNotReady, *c,
+-                                         location, *flags, draw_type);
++                                         location, *effective_flags, draw_type);
+       },
+       NoOverdraw, bounds, paint_type, CanvasRenderingContext2DState::kNoImage,
+       CanvasPerformanceMonitor::DrawType::kText);
+diff --git a/third_party/blink/renderer/modules/canvas/canvas2d/canvas_2d_recorder_context.cc b/third_party/blink/renderer/modules/canvas/canvas2d/canvas_2d_recorder_context.cc
+index 332d1f5c54..c506eb0fd7 100644
+--- a/third_party/blink/renderer/modules/canvas/canvas2d/canvas_2d_recorder_context.cc
++++ b/third_party/blink/renderer/modules/canvas/canvas2d/canvas_2d_recorder_context.cc
+@@ -77,6 +77,7 @@
+ #include "third_party/blink/renderer/core/typed_arrays/array_buffer_view_helpers.h"
+ #include "third_party/blink/renderer/core/typed_arrays/dom_typed_array.h"
+ #include "third_party/blink/renderer/modules/canvas/canvas2d/cached_color.h"
++#include "third_party/blink/renderer/modules/canvas/canvas2d/canvas_curve_noise.h"
+ #include "third_party/blink/renderer/modules/canvas/canvas2d/canvas_filter.h"
+ #include "third_party/blink/renderer/modules/canvas/canvas2d/canvas_gradient.h"
+ #include "third_party/blink/renderer/modules/canvas/canvas2d/canvas_image_source_util.h"
+@@ -1610,11 +1611,32 @@ void Canvas2DRecorderContext::DrawPathInternal(
+       return;
+     }
+     auto line = path.line();
++    float start_x = line.start.x();
++    float start_y = line.start.y();
++    float end_x = line.end.x();
++    float end_y = line.end.y();
++    // browser: perturb non-axis-aligned lines on GPU-backed canvases.
++    // Axis-aligned lines (pure horizontal/vertical) stay canonical so
++    // paint(CPU) invariance is preserved. Covers diagonal strokes and dashed
++    // diagonals that take this single-line fast path (and thus bypass the
++    // SkPath walker entirely).
++    if (IsAccelerated() && CanvasCurveNoiseActive() && start_y != end_y &&
++        start_x != end_x) {
++      // Dashed vs plain single-line multipliers differ because a dashed line
++      // rasterizes as a sequence of small strokes (endpoint shift shifts
++      // every dash) while a plain diagonal is one AA-banded segment
++      // (amplitude over-cycles through quantization buckets).
++      const float mult = GetState().LineDash().empty()
++                             ? kCurveNoiseLineDiagPlainMultiplier
++                             : kCurveNoiseLineDiagDashedMultiplier;
++      end_x = PerturbCurveCoord(end_x, kCurveNoiseSaltLineDiagX, mult);
++      end_y = PerturbCurveCoord(end_y, kCurveNoiseSaltLineDiagY, mult);
++    }
+     Draw<OverdrawOp::kNone>(
+         /*draw_func=*/
+-        [line](MemoryManagedPaintCanvas* c, const cc::PaintFlags* flags) {
+-          c->drawLine(line.start.x(), line.start.y(), line.end.x(),
+-                      line.end.y(), *flags);
++        [start_x, start_y, end_x, end_y](MemoryManagedPaintCanvas* c,
++                                         const cc::PaintFlags* flags) {
++          c->drawLine(start_x, start_y, end_x, end_y, *flags);
+         },
+         NoOverdraw, bounds, paint_type,
+         GetState().HasPattern(paint_type)
+@@ -1626,9 +1648,30 @@ void Canvas2DRecorderContext::DrawPathInternal(
+ 
+   if (path.IsArc()) {
+     const auto& arc = path.arc();
+-    const SkRect oval =
+-        SkRect::MakeLTRB(arc.x - arc.radius, arc.y - arc.radius,
+-                         arc.x + arc.radius, arc.y + arc.radius);
++    // browser: perturb arc center/radius for GPU-backed canvases only.
++    // CPU-backed (willReadFrequently) canvases see canonical geometry so
++    // paint(CPU) stays bit-identical to upstream Chrome. Fills get the
++    // amplitude multiplier because filled arcs are interior-based and only
++    // shift rasterization when boundary perturbations cross pixel-center
++    // samples.
++    float arc_x = arc.x;
++    float arc_y = arc.y;
++    float arc_r = arc.radius;
++    // Size-guard threshold is on bounds diameter (2 * radius), matching the
++    // walker's test that either axis must be >= kCurveNoiseMinBoundsPx.
++    if (IsAccelerated() && CanvasCurveNoiseActive() &&
++        2.0f * arc.radius >= kCurveNoiseMinBoundsPx) {
++      const float mult =
++          (paint_type == CanvasRenderingContext2DState::kFillPaintType)
++              ? kCurveNoiseFillMultiplier
++              : 1.0f;
++      arc_x = PerturbCurveCoord(arc_x, kCurveNoiseSaltArcX, mult);
++      arc_y = PerturbCurveCoord(arc_y, kCurveNoiseSaltArcY, mult);
++      arc_r = PerturbCurveCoord(arc_r, kCurveNoiseSaltArcR, mult);
++      arc_r = std::max(arc_r, 0.0f);
++    }
++    const SkRect oval = SkRect::MakeLTRB(arc_x - arc_r, arc_y - arc_r,
++                                         arc_x + arc_r, arc_y + arc_r);
+     const float start_degrees =
+         ClampNonFiniteToZero(arc.start_angle_radians * 180 / kPiFloat);
+     const float sweep_degrees =
+@@ -1653,6 +1696,17 @@ void Canvas2DRecorderContext::DrawPathInternal(
+   SkPath sk_path = path.GetPath().GetSkPath();
+   sk_path.setFillType(fill_type);
+ 
++  // browser: perturb curve verbs (Quad / Conic / Cubic) for GPU-backed canvases
++  // only. Line / Move / Close verbs pass through. CPU-backed canvases
++  // (willReadFrequently) receive the canonical path so paint(CPU) output
++  // remains bit-identical to upstream Chrome. Fills get the amplitude
++  // multiplier applied to quad/cubic (and conic always carries its own).
++  if (IsAccelerated()) {
++    const bool is_fill =
++        (paint_type == CanvasRenderingContext2DState::kFillPaintType);
++    sk_path = PerturbSkPathCurves(sk_path, is_fill);
++  }
++
+   Draw<OverdrawOp::kNone>(
+       /*draw_func=*/
+       [sk_path, use_paint_cache](MemoryManagedPaintCanvas* c,
+diff --git a/third_party/blink/renderer/modules/canvas/canvas2d/canvas_2d_recorder_context.h b/third_party/blink/renderer/modules/canvas/canvas2d/canvas_2d_recorder_context.h
+index 6ee4b2b0d1..ad1cb441f8 100644
+--- a/third_party/blink/renderer/modules/canvas/canvas2d/canvas_2d_recorder_context.h
++++ b/third_party/blink/renderer/modules/canvas/canvas2d/canvas_2d_recorder_context.h
+@@ -807,6 +807,8 @@ void Canvas2DRecorderContext::DrawInternal(
+     }
+   }
+   const CanvasRenderingContext2DState& state = GetState();
++  // browser: gate the per-profile perturbations on the current backend.
++  GetState().SetBackendAccelerated(IsAccelerated());
+   SkBlendMode global_composite = state.GlobalComposite();
+   if (ShouldUseCompositedDraw(paint_type, image_type)) {
+     WillDraw(gfx::SkIRectToRect(clip_bounds), draw_type);
+@@ -900,6 +902,8 @@ void Canvas2DRecorderContext::CompositedDraw(
+ 
+   sk_sp<PaintFilter> canvas_filter = StateGetFilter();
+   const CanvasRenderingContext2DState& state = GetState();
++  // browser: gate the per-profile perturbations on the current backend.
++  GetState().SetBackendAccelerated(IsAccelerated());
+   DCHECK(ShouldUseCompositedDraw(paint_type, image_type));
+   SkM44 ctm = c->getLocalToDevice();
+   c->setMatrix(SkM44());
+diff --git a/third_party/blink/renderer/modules/canvas/canvas2d/canvas_curve_noise.cc b/third_party/blink/renderer/modules/canvas/canvas2d/canvas_curve_noise.cc
+new file mode 100644
+index 0000000000..33cc1566f1
+--- /dev/null
++++ b/third_party/blink/renderer/modules/canvas/canvas2d/canvas_curve_noise.cc
+@@ -0,0 +1,227 @@
++// Copyright 2026 The browser Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "third_party/blink/renderer/modules/canvas/canvas2d/canvas_curve_noise.h"
++
++#include <algorithm>
++#include <array>
++#include <cstdint>
++
++#include "cc/paint/color_filter.h"
++#include "components/browser/browser_switches.h"
++#include "components/browser/switch_resolver.h"
++#include "third_party/blink/renderer/platform/graphics/deterministic_noise.h"
++#include "third_party/skia/include/core/SkPathBuilder.h"
++#include "third_party/skia/include/core/SkPoint.h"
++
++namespace blink {
++
++namespace {
++
++float GetCanvasCurveNoiseScalar() {
++  static const float cached = browser::ResolveLinearNoiseSwitch(
++      ::switches::kCanvasCurveNoise, browser::kSaltCanvasCurve, 0.003, 0.015);
++  return cached;
++}
++
++float GetCanvasBlurNoiseScalar() {
++  static const float cached = browser::ResolveLinearNoiseSwitch(
++      ::switches::kCanvasBlurNoise, browser::kSaltCanvasBlur, 0.005, 0.03);
++  return cached;
++}
++
++float GetCanvasGradientNoiseScalar() {
++  static const float cached = browser::ResolveLinearNoiseSwitch(
++      ::switches::kCanvasGradientNoise, browser::kSaltCanvasGradient, 0.003,
++      0.02);
++  return cached;
++}
++
++// Per-channel salts for the text/emoji color LUT. Internal to the filter
++// builder: each channel's table is independently hashed.
++constexpr uint32_t kTextColorSaltR = 0x901u;
++constexpr uint32_t kTextColorSaltG = 0x902u;
++constexpr uint32_t kTextColorSaltB = 0x903u;
++
++// Computes the perturbed uint8 value for table index `i`. `scalar` is the
++// already-multiplied amplitude (curve_noise_scalar * multiplier).
++uint8_t PerturbTableEntry(int i, uint32_t salt, float scalar) {
++  const float normalized =
++      DeterministicSignedUnitNoise(static_cast<uint32_t>(i), salt);
++  // normalized is in [-0.5, 0.5). Final delta in uint8 units.
++  const int delta = static_cast<int>(normalized * scalar * 255.0f);
++  return static_cast<uint8_t>(std::clamp(i + delta, 0, 255));
++}
++
++}  // namespace
++
++bool CanvasCurveNoiseActive() {
++  return GetCanvasCurveNoiseScalar() != 0.0f;
++}
++
++float PerturbCurveCoord(float coord,
++                        uint32_t axis_salt,
++                        float extra_multiplier) {
++  const float scalar = GetCanvasCurveNoiseScalar();
++  if (scalar == 0.0f) {
++    return coord;
++  }
++  return coord + DeterministicSignedUnitNoise(coord, axis_salt) * scalar *
++                     extra_multiplier;
++}
++
++bool CanvasBlurNoiseActive() {
++  return GetCanvasBlurNoiseScalar() != 0.0f;
++}
++
++float PerturbBlurSigma(float sigma, uint32_t axis_salt) {
++  const float scalar = GetCanvasBlurNoiseScalar();
++  if (scalar == 0.0f || sigma == 0.0f) {
++    return sigma;
++  }
++  // The noise is in [-0.5, 0.5); scaling by 2 * scalar puts the final delta
++  // in [-scalar, +scalar). Multiplicative application keeps the perturbation
++  // proportional to sigma regardless of blur magnitude.
++  return sigma * (1.0f + DeterministicSignedUnitNoise(sigma, axis_salt) * 2.0f *
++                             scalar);
++}
++
++float GetCanvasGradientNoiseAmplitude() {
++  return GetCanvasGradientNoiseScalar();
++}
++
++sk_sp<cc::ColorFilter> MakeCanvasTextColorPerturbFilter() {
++  // Built once per process: --canvas-curve-noise is fixed at startup so the
++  // LUT is invariant and can be cached for the process lifetime.
++  static const sk_sp<cc::ColorFilter> cached = []() -> sk_sp<cc::ColorFilter> {
++    const float scalar =
++        GetCanvasCurveNoiseScalar() * kCurveNoiseTextColorMultiplier;
++    if (scalar == 0.0f) {
++      return nullptr;
++    }
++
++    std::array<uint8_t, 256> a_table;
++    std::array<uint8_t, 256> r_table;
++    std::array<uint8_t, 256> g_table;
++    std::array<uint8_t, 256> b_table;
++    for (int i = 0; i < 256; i++) {
++      a_table[i] = static_cast<uint8_t>(i);  // Alpha pass-through.
++      r_table[i] = PerturbTableEntry(i, kTextColorSaltR, scalar);
++      g_table[i] = PerturbTableEntry(i, kTextColorSaltG, scalar);
++      b_table[i] = PerturbTableEntry(i, kTextColorSaltB, scalar);
++    }
++    // table[0] = 0 invariant: pure black input stays pure black so #000
++    // monochrome glyph pixels (R=G=B=0 pre-mult) pass through unchanged
++    // and the #000 probe rows stay canary.
++    r_table[0] = 0;
++    g_table[0] = 0;
++    b_table[0] = 0;
++
++    return cc::ColorFilter::MakeTableARGB(a_table.data(), r_table.data(),
++                                          g_table.data(), b_table.data());
++  }();
++  return cached;
++}
++
++SkPath PerturbSkPathCurves(const SkPath& input, bool is_fill) {
++  if (!CanvasCurveNoiseActive()) {
++    return input;
++  }
++
++  // Size guard: skip perturbation on paths smaller than the minimum bounds
++  // threshold. Protects against the CreepJS 2x2 arc canonical-match lie
++  // detector (see the kCurveNoiseMinBoundsPx comment). Cheap: getBounds() is
++  // O(1) when Skia has cached the bounds and O(n) worst case where n is verb
++  // count.
++  const SkRect bounds = input.getBounds();
++  if (bounds.width() < kCurveNoiseMinBoundsPx ||
++      bounds.height() < kCurveNoiseMinBoundsPx) {
++    return input;
++  }
++
++  // Multipliers combine via max, not product: an arcTo fill keeps the conic
++  // multiplier rather than stacking (5 * 5 = 25x would over-perturb).
++  const float fill_mult = is_fill ? kCurveNoiseFillMultiplier : 1.0f;
++  const float conic_mult = std::max(kCurveNoiseConicMultiplier, fill_mult);
++  const float line_diag_mult =
++      std::max(kCurveNoiseLineDiagMultiplier, fill_mult);
++
++  // SkPath is immutable in this Skia version; mutations go through
++  // SkPathBuilder, with .detach() yielding the finalized SkPath.
++  SkPathBuilder builder;
++  builder.setFillType(input.getFillType());
++  SkPath::Iter iter(input, /*forceClose=*/false);
++  SkPoint pts[4];
++  SkPath::Verb verb;
++  while ((verb = iter.next(pts)) != SkPath::kDone_Verb) {
++    switch (verb) {
++      case SkPath::kMove_Verb:
++        builder.moveTo(pts[0]);
++        break;
++      case SkPath::kLine_Verb: {
++        // Axis-aligned line (pure horizontal or vertical): deterministic
++        // canary geometry. fillRect, strokeRect, axis-stroke tests all go
++        // through these; perturbing would leak paint(CPU) invariance.
++        if (pts[0].fY == pts[1].fY || pts[0].fX == pts[1].fX) {
++          builder.lineTo(pts[1]);
++          break;
++        }
++        // Non-axis-aligned line: AA coverage on the edge varies cross-GPU
++        // naturally. Perturbing the endpoint shifts the AA pattern without
++        // touching any deterministic operation. Covers polygon diagonal
++        // edges (triangle fills) and round-join diagonal body here; simple
++        // diagonal strokes go through DrawPathInternal's IsLine fast path
++        // and are perturbed there.
++        SkPoint end = {PerturbCurveCoord(pts[1].fX, kCurveNoiseSaltLineDiagX,
++                                         line_diag_mult),
++                       PerturbCurveCoord(pts[1].fY, kCurveNoiseSaltLineDiagY,
++                                         line_diag_mult)};
++        builder.lineTo(end);
++        break;
++      }
++      case SkPath::kQuad_Verb: {
++        SkPoint cp = {
++            PerturbCurveCoord(pts[1].fX, kCurveNoiseSaltQuadCpX, fill_mult),
++            PerturbCurveCoord(pts[1].fY, kCurveNoiseSaltQuadCpY, fill_mult)};
++        SkPoint end = {
++            PerturbCurveCoord(pts[2].fX, kCurveNoiseSaltQuadEndX, fill_mult),
++            PerturbCurveCoord(pts[2].fY, kCurveNoiseSaltQuadEndY, fill_mult)};
++        builder.quadTo(cp, end);
++        break;
++      }
++      case SkPath::kConic_Verb: {
++        SkPoint cp = {
++            PerturbCurveCoord(pts[1].fX, kCurveNoiseSaltConicCpX, conic_mult),
++            PerturbCurveCoord(pts[1].fY, kCurveNoiseSaltConicCpY, conic_mult)};
++        SkPoint end = {
++            PerturbCurveCoord(pts[2].fX, kCurveNoiseSaltConicEndX, conic_mult),
++            PerturbCurveCoord(pts[2].fY, kCurveNoiseSaltConicEndY, conic_mult)};
++        builder.conicTo(cp, end, iter.conicWeight());
++        break;
++      }
++      case SkPath::kCubic_Verb: {
++        SkPoint cp1 = {
++            PerturbCurveCoord(pts[1].fX, kCurveNoiseSaltBezCp1X, fill_mult),
++            PerturbCurveCoord(pts[1].fY, kCurveNoiseSaltBezCp1Y, fill_mult)};
++        SkPoint cp2 = {
++            PerturbCurveCoord(pts[2].fX, kCurveNoiseSaltBezCp2X, fill_mult),
++            PerturbCurveCoord(pts[2].fY, kCurveNoiseSaltBezCp2Y, fill_mult)};
++        SkPoint end = {
++            PerturbCurveCoord(pts[3].fX, kCurveNoiseSaltBezEndX, fill_mult),
++            PerturbCurveCoord(pts[3].fY, kCurveNoiseSaltBezEndY, fill_mult)};
++        builder.cubicTo(cp1, cp2, end);
++        break;
++      }
++      case SkPath::kClose_Verb:
++        builder.close();
++        break;
++      case SkPath::kDone_Verb:
++        // Loop sentinel; unreachable since the while-condition catches it.
++        break;
++    }
++  }
++  return builder.detach();
++}
++
++}  // namespace blink
+diff --git a/third_party/blink/renderer/modules/canvas/canvas2d/canvas_curve_noise.h b/third_party/blink/renderer/modules/canvas/canvas2d/canvas_curve_noise.h
+new file mode 100644
+index 0000000000..84037342b4
+--- /dev/null
++++ b/third_party/blink/renderer/modules/canvas/canvas2d/canvas_curve_noise.h
+@@ -0,0 +1,239 @@
++// Copyright 2026 The browser Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef THIRD_PARTY_BLINK_RENDERER_MODULES_CANVAS_CANVAS2D_CANVAS_CURVE_NOISE_H_
++#define THIRD_PARTY_BLINK_RENDERER_MODULES_CANVAS_CANVAS2D_CANVAS_CURVE_NOISE_H_
++
++#include <cstdint>
++
++#include "third_party/blink/renderer/modules/modules_export.h"
++#include "third_party/skia/include/core/SkPath.h"
++#include "third_party/skia/include/core/SkRefCnt.h"
++
++namespace cc {
++class ColorFilter;
++}  // namespace cc
++
++// Canvas 2D curve-verb coordinate perturbation (--canvas-curve-noise).
++//
++// Applied at draw-submit time inside Canvas2DRecorderContext::DrawPathInternal
++// and only when the canvas resource provider is GPU-accelerated. CPU-backed
++// canvases (e.g. willReadFrequently:true) see unperturbed geometry so their
++// output stays bit-identical to canonical Chrome/Skia-software - preserving
++// paint(CPU) invariance that fingerprint libraries like CreepJS rely on.
++//
++// Curve verbs (Quad / Conic / Cubic) are perturbed by deterministic sub-pixel
++// offsets derived from each coord's bit pattern and a per-axis salt. Line /
++// Move / Close verbs pass through unchanged. The result: curved output
++// diverges per profile on GPU, matching the natural cross-GPU variance
++// pattern of real hardware, while non-curve geometry stays canonical.
++
++namespace blink {
++
++// Minimum path-bounds dimension (in CSS pixels) for the walker to perturb at
++// all. Paths smaller than this on either axis are passed through unchanged.
++//
++// Rationale: CreepJS's "KnownImageData" lie-detector renders
++// `arc(0, 0, 2, 0, 1, true)` into a 2x2 canvas and compares the resulting
++// 4-pixel output against a hardcoded list of 8 canonical Blink outputs.
++// At such tiny scales our sub-pixel perturbation dominates the output and
++// no longer looks like natural GPU variance - the 4 pixels fall into
++// amplitude-dependent buckets that mostly miss the canonical list, setting
++// LowerEntropy.CANVAS=true (which in turn red-flags the canvas AND webgl
++// hashes in the CreepJS UI via a shared bold-fail class).
++//
++// Paths this small don't contribute meaningful variance to real fingerprint
++// surfaces anyway - skipping them preserves the canary invariant at zero
++// spoof cost.
++inline constexpr float kCurveNoiseMinBoundsPx = 5.0f;
++
++// Amplitude multipliers applied to verb/paint-type combinations where small
++// control-point offsets are naturally less visible in the rasterized output.
++//
++// Conic (arcTo) has tangent-self-correcting geometry: shifting a control
++// point by epsilon barely moves the tangent points where the arc meets its
++// adjacent edges, so small perturbations round to the same pixels. Amplify.
++//
++// Fills are topology-based - a pixel is either inside or outside the closed
++// path. Small boundary offsets rarely cross pixel-center sample points, so
++// interior pixels stay interior and the hash doesn't change. Amplify.
++//
++// Multipliers compose via std::max, not product, so an arcTo fill stays at
++// the conic amplitude rather than exploding to 25x.
++inline constexpr float kCurveNoiseConicMultiplier = 5.0f;
++inline constexpr float kCurveNoiseFillMultiplier = 5.0f;
++// Non-axis-aligned line verbs. Three distinct multipliers because the
++// rasterization characteristics differ sharply by geometry:
++//
++//  - kCurveNoiseLineDiagMultiplier (walker kLine_Verb, 3.4x) - covers
++//     multi-segment strokes like round line join where the join arc has
++//     granular AA buckets requiring moderate amplification.
++//  - kCurveNoiseLineDiagDashedMultiplier (IsLine fast path + dashed, 3x) -
++//     dashed segments are many small stroked rectangles; endpoint shifts
++//     propagate into dash pattern placement. Higher amplification.
++//   - kCurveNoiseLineDiagPlainMultiplier (IsLine fast path + no dash, 0.25x)
++//     - plain diagonals rasterize to a uniform AA band; large perturbations
++//     over-shift and the hash cycles through values that collide with
++//     previously-seen buckets. Small perturbation lands more cleanly in a
++//     single new bucket.
++inline constexpr float kCurveNoiseLineDiagMultiplier = 3.4f;
++inline constexpr float kCurveNoiseLineDiagDashedMultiplier = 3.0f;
++inline constexpr float kCurveNoiseLineDiagPlainMultiplier = 0.25f;
++
++// Per-axis salts used by PerturbCurveCoord to keep perturbations
++// de-correlated across different verb types.
++inline constexpr uint32_t kCurveNoiseSaltQuadCpX = 0x101u;
++inline constexpr uint32_t kCurveNoiseSaltQuadCpY = 0x102u;
++inline constexpr uint32_t kCurveNoiseSaltQuadEndX = 0x103u;
++inline constexpr uint32_t kCurveNoiseSaltQuadEndY = 0x104u;
++inline constexpr uint32_t kCurveNoiseSaltBezCp1X = 0x201u;
++inline constexpr uint32_t kCurveNoiseSaltBezCp1Y = 0x202u;
++inline constexpr uint32_t kCurveNoiseSaltBezCp2X = 0x203u;
++inline constexpr uint32_t kCurveNoiseSaltBezCp2Y = 0x204u;
++inline constexpr uint32_t kCurveNoiseSaltBezEndX = 0x205u;
++inline constexpr uint32_t kCurveNoiseSaltBezEndY = 0x206u;
++inline constexpr uint32_t kCurveNoiseSaltConicCpX = 0x301u;
++inline constexpr uint32_t kCurveNoiseSaltConicCpY = 0x302u;
++inline constexpr uint32_t kCurveNoiseSaltConicEndX = 0x303u;
++inline constexpr uint32_t kCurveNoiseSaltConicEndY = 0x304u;
++inline constexpr uint32_t kCurveNoiseSaltArcX = 0x401u;
++inline constexpr uint32_t kCurveNoiseSaltArcY = 0x402u;
++inline constexpr uint32_t kCurveNoiseSaltArcR = 0x403u;
++
++// Salts for non-axis-aligned line-verb endpoint perturbation. Covers
++// diagonal strokes, polygon diagonal edges (triangle fills), dashed
++// diagonal dash endpoints, and round-join diagonal body. Axis-aligned
++// line verbs (pure horizontal/vertical) are deterministic canary geometry
++// and are never perturbed.
++inline constexpr uint32_t kCurveNoiseSaltLineDiagX = 0x601u;
++inline constexpr uint32_t kCurveNoiseSaltLineDiagY = 0x602u;
++
++// Salts for blur-sigma perturbation (Gaussian blur scale parameter).
++// Shadow and filter:blur both feed sigmas through PerturbBlurSigma, with
++// different salts so the same sigma value in a shadow vs a filter produces
++// independent perturbations.
++inline constexpr uint32_t kBlurNoiseSaltShadow = 0x701u;
++inline constexpr uint32_t kBlurNoiseSaltFilterStdX = 0x702u;
++inline constexpr uint32_t kBlurNoiseSaltFilterStdY = 0x703u;
++
++// Salt for text-stroke-width perturbation. strokeText with lineWidth > 1
++// goes through Skia's stroke-to-fill expansion; the resulting offset
++// curves rasterize with cross-GPU AA variance on real hardware. A small
++// additive perturbation of the stroke width shifts those expansion edges
++// sub-pixel and produces per-profile variance that matches the natural
++// pattern. Hairline (lineWidth == 1) takes Skia's deterministic
++// single-pixel fast path and is never perturbed - guard at the call site
++// keeps that path canary. Scoped to DrawTextInternal so strokeRect and
++// stroke(SkPath) paths are untouched (axis-aligned strokes there are
++// deterministic on real hardware).
++inline constexpr uint32_t kCurveNoiseSaltTextStrokeWidth = 0x801u;
++
++// Amplitude multiplier for text-stroke-width perturbation. Calibrated so
++// that the derived base scalar (0.003 .. 0.015) maps into the natural cross-GPU
++// variance band for strokeText with lineWidth > 1.
++// Empirically: with multiplier=1.0, the hash flips at --canvas-curve-noise
++// = 5e-7 and steps to a new distinct hash about every 7e-7. Sitting at
++// the bare minimum (5e-7) wastes the range. Anchoring the minimum
++// at 1.5e-6 instead (multiplier = 1.5e-6 / 0.003 = 5e-4) maps the
++// minimum 0.003 -> 1.5e-6 and 0.015 (max) -> 7.5e-6, yielding distinct
++// hash buckets across the 201 seed steps while staying inside the
++// natural variance band.
++inline constexpr float kCurveNoiseTextStrokeWidthMultiplier = 5e-4f;
++
++// Amplitude multiplier for text/emoji color perturbation. Applied at
++// fillText / strokeText draw time via a per-channel uint8 LUT
++// (cc::ColorFilter TableARGB) on the paint. Backend-gated by setting
++// the filter only on GPU canvases - willReadFrequently canvases skip
++// the setColorFilter call so paint(CPU) output stays bit-identical to
++// canonical Chrome.
++//
++// Covers two surfaces in one mechanism:
++//  - Non-black monochrome text - shader output is paint.color x glyph
++//     coverage (pre-multiplied). Per-channel LUT shifts RGB by +/-N LSB
++//     where the input is non-zero; sub-pixel coverage edges flip.
++//  - Color emoji bitmaps - shader output is bitmap_pixel pre-multiplied
++//     (paint.color is ignored for color glyphs, but the paint's
++//     ColorFilter still applies). LUT shifts non-black bitmap pixels;
++//     transparent/black bitmap regions stay canonical.
++//
++// table[0] = 0 invariant on R/G/B preserves the #000 canary: pure black
++// monochrome glyph pixels (R=G=B=0 pre-mult, any alpha) pass through
++// unchanged.
++//
++// Empirically: with multiplier=1.0, the 8 basic-fill #069 rows + the 3
++// emoji rows all start flipping at --canvas-curve-noise = 0.01. So
++// multiplier = 0.01 / 0.003 ~= 3.333 maps the minimum 0.003 -> 0.01
++// (effective threshold, +/-1 LSB max shift) and 0.015 (max) -> 0.05
++// (+/-6 LSB max shift) - still within the natural cross-vendor band for
++// color emoji and non-black text.
++inline constexpr float kCurveNoiseTextColorMultiplier = 3.333f;
++
++// Returns a per-channel uint8 LUT color filter that perturbs RGB output
++// sub-LSB per --canvas-curve-noise. Returns nullptr when the switch is
++// inactive (call site can pass nullptr to setColorFilter safely).
++// Filter is built once and cached for the process lifetime - the switch
++// value is fixed at startup.
++MODULES_EXPORT sk_sp<cc::ColorFilter> MakeCanvasTextColorPerturbFilter();
++
++// True when --canvas-curve-noise is set to a non-zero scalar. Cheap - the
++// switch is parsed once and cached. Call this as a fast-path guard before
++// doing any work that would be wasted when noise is off.
++MODULES_EXPORT bool CanvasCurveNoiseActive();
++
++// Returns `coord` plus a deterministic perturbation bounded in amplitude by
++// (--canvas-curve-noise scalar) * extra_multiplier. Same (coord, axis_salt,
++// extra_multiplier) always yields the same result - per-machine calibration
++// depends on this reproducibility. When the switch is unset or 0, returns
++// `coord` unchanged. extra_multiplier defaults to 1.0 for bezier/quad strokes
++// which don't need amplification.
++MODULES_EXPORT float PerturbCurveCoord(float coord,
++                                       uint32_t axis_salt,
++                                       float extra_multiplier = 1.0f);
++
++// Returns a copy of `input` with Quad / Conic / Cubic verbs' control points
++// perturbed via PerturbCurveCoord. Move / Line / Close verbs pass through
++// unchanged. When --canvas-curve-noise is inactive, returns `input` unchanged
++// (no allocation, no walk).
++//
++// Pass is_fill=true for fill operations so cubic/quad verbs get amplified
++// perturbation (fills are interior-based and need a bigger offset to cross
++// pixel-center sample boundaries). Conic verbs always get the conic
++// multiplier (arcTo tangent self-correction) regardless of is_fill.
++MODULES_EXPORT SkPath PerturbSkPathCurves(const SkPath& input,
++                                          bool is_fill = false);
++
++// Canvas 2D Gaussian-blur sigma perturbation (--canvas-blur-noise).
++//
++// Covers shadowBlur (via ShadowBlurAsSigma) and ctx.filter = 'blur(...)'
++// (via BlurFilterOperation's stdDeviation). Applied at draw-time in the
++// CanvasRenderingContext2DState flag-build path, gated on the state's
++// backend_accelerated_ flag so CPU-backed (willReadFrequently) canvases
++// produce canonical output.
++//
++// Sigmas are scale parameters spanning orders of magnitude (0.5 for subtle
++// shadows, 50+ for heavy blurs). Perturbation is multiplicative - the sigma
++// is scaled by (1 + delta) where delta is in [-amplitude, +amplitude]. Keeps
++// the perturbation magnitude consistent relative to input at all scales.
++
++// True when --canvas-blur-noise is set to a non-zero scalar.
++MODULES_EXPORT bool CanvasBlurNoiseActive();
++
++// Returns `sigma` multiplied by a deterministic factor in
++// [1 - amplitude, 1 + amplitude] derived from (sigma, axis_salt). When the
++// switch is unset or sigma is zero, returns sigma unchanged.
++MODULES_EXPORT float PerturbBlurSigma(float sigma, uint32_t axis_salt);
++
++// Canvas 2D gradient stop-offset perturbation (--canvas-gradient-noise).
++//
++// Consumed by platform/graphics/gradient.cc via Gradient::SetStopPerturbation.
++// Canvas-side code reads the amplitude here and passes it to Gradient; the
++// platform Gradient class does the perturbation math itself (so platform
++// doesn't depend on this modules-layer header).
++
++// Returns the current --canvas-gradient-noise scalar (0 if unset).
++MODULES_EXPORT float GetCanvasGradientNoiseAmplitude();
++
++}  // namespace blink
++
++#endif  // THIRD_PARTY_BLINK_RENDERER_MODULES_CANVAS_CANVAS2D_CANVAS_CURVE_NOISE_H_
+diff --git a/third_party/blink/renderer/modules/canvas/canvas2d/canvas_rendering_context_2d_state.cc b/third_party/blink/renderer/modules/canvas/canvas2d/canvas_rendering_context_2d_state.cc
+index b61f3d6bbd..cc59d7a05b 100644
+--- a/third_party/blink/renderer/modules/canvas/canvas2d/canvas_rendering_context_2d_state.cc
++++ b/third_party/blink/renderer/modules/canvas/canvas2d/canvas_rendering_context_2d_state.cc
+@@ -36,9 +36,11 @@
+ #include "third_party/blink/renderer/core/layout/layout_view.h"
+ #include "third_party/blink/renderer/core/paint/filter_effect_builder.h"
+ #include "third_party/blink/renderer/core/style/computed_style.h"
++#include "third_party/blink/renderer/core/style/filter_operation.h"
+ #include "third_party/blink/renderer/core/style/filter_operations.h"
+ #include "third_party/blink/renderer/core/style/shadow_data.h"
+ #include "third_party/blink/renderer/modules/canvas/canvas2d/canvas_2d_recorder_context.h"
++#include "third_party/blink/renderer/modules/canvas/canvas2d/canvas_curve_noise.h"
+ #include "third_party/blink/renderer/modules/canvas/canvas2d/canvas_filter.h"
+ #include "third_party/blink/renderer/modules/canvas/canvas2d/canvas_rendering_context_2d.h"
+ #include "third_party/blink/renderer/modules/canvas/canvas2d/canvas_style.h"
+@@ -143,6 +145,35 @@ TextRenderingMode CanvasTextRenderingToTextRenderingMode(
+   NOTREACHED();
+ }
+ 
++// browser: returns a copy of `input` with each BlurFilterOperation's
++// stdDeviation perturbed per --canvas-blur-noise. Other FilterOperation
++// subclasses pass through unchanged. Returns `input` unchanged when the switch
++// is off.
++//
++// Used by GetFilter() and GetFilterForOffscreenCanvas() to apply the same
++// backend-gated perturbation to ctx.filter = 'blur(...)' that
++// ShadowBlurAsSigma() applies to shadowBlur.
++FilterOperations PerturbBlurFilterOperations(const FilterOperations& input) {
++  if (!CanvasBlurNoiseActive()) {
++    return input;
++  }
++  FilterOperations perturbed;
++  for (const auto& op : input.Operations()) {
++    auto* blur = DynamicTo<BlurFilterOperation>(op.Get());
++    if (blur) {
++      const LengthPoint& xy = blur->StdDeviationXY();
++      float px = PerturbBlurSigma(xy.X().Pixels(), kBlurNoiseSaltFilterStdX);
++      float py = PerturbBlurSigma(xy.Y().Pixels(), kBlurNoiseSaltFilterStdY);
++      perturbed.Operations().push_back(
++          MakeGarbageCollected<BlurFilterOperation>(Length::Fixed(px),
++                                                    Length::Fixed(py)));
++    } else {
++      perturbed.Operations().push_back(op);
++    }
++  }
++  return perturbed;
++}
++
+ }  // namespace
+ 
+ CanvasRenderingContext2DState::CanvasRenderingContext2DState()
+@@ -201,6 +232,7 @@ CanvasRenderingContext2DState::CanvasRenderingContext2DState(
+       shadow_only_image_filter_(other.shadow_only_image_filter_),
+       shadow_and_foreground_image_filter_(
+           other.shadow_and_foreground_image_filter_),
++      backend_accelerated_(other.backend_accelerated_),
+       global_alpha_(other.global_alpha_),
+       global_hdr_headroom_(other.global_hdr_headroom_),
+       transform_(other.transform_),
+@@ -329,8 +361,9 @@ bool CanvasRenderingContext2DState::ShouldAntialias() const {
+ 
+ void CanvasRenderingContext2DState::SetGlobalAlpha(double alpha) {
+   global_alpha_ = alpha;
+-  stroke_style_.ApplyToFlags(stroke_flags_, global_alpha_);
+-  fill_style_.ApplyToFlags(fill_flags_, global_alpha_);
++  stroke_style_.ApplyToFlags(stroke_flags_, global_alpha_,
++                             backend_accelerated_);
++  fill_style_.ApplyToFlags(fill_flags_, global_alpha_, backend_accelerated_);
+   // TODO: Don't quantize the alpha to 8-bit.
+   image_flags_.setAlphaf(
+       base::ClampRound<uint8_t>(ClampTo<float>(alpha, 0.0f, 1.0f) * 255) /
+@@ -516,6 +549,8 @@ void CanvasRenderingContext2DState::ValidateFilterState() const {
+ sk_sp<PaintFilter> CanvasRenderingContext2DState::GetFilterForOffscreenCanvas(
+     gfx::Size canvas_size,
+     Canvas2DRecorderContext* context) {
++  SetBackendAccelerated(context && context->IsAccelerated());
++
+   ValidateFilterState();
+   if (filter_state_ != FilterState::kUnresolved)
+     return resolved_filter_;
+@@ -528,12 +563,21 @@ sk_sp<PaintFilter> CanvasRenderingContext2DState::GetFilterForOffscreenCanvas(
+         *css_filter_value_, font_for_filter_);
+   }
+ 
++  // browser: backend-gated blur-sigma perturbation for ctx.filter =
++  // 'blur(...)'.
++  if (backend_accelerated_) {
++    operations = PerturbBlurFilterOperations(operations);
++  }
++
+   // We can't reuse m_fillFlags and m_strokeFlags for the filter, since these
+   // incorporate the global alpha, which isn't applicable here.
++  // browser: filter paints keep canonical gradient stops.
+   cc::PaintFlags fill_flags_for_filter;
+-  fill_style_.ApplyToFlags(fill_flags_for_filter, 1.0f);
++  fill_style_.ApplyToFlags(fill_flags_for_filter, 1.0f,
++                           /*accelerated=*/false);
+   cc::PaintFlags stroke_flags_for_filter;
+-  stroke_style_.ApplyToFlags(stroke_flags_for_filter, 1.0f);
++  stroke_style_.ApplyToFlags(stroke_flags_for_filter, 1.0f,
++                             /*accelerated=*/false);
+ 
+   const gfx::SizeF canvas_viewport(canvas_size);
+   FilterEffectBuilder filter_effect_builder(
+@@ -562,6 +606,9 @@ sk_sp<PaintFilter> CanvasRenderingContext2DState::GetFilter(
+     CanvasRenderingContext2D* context) {
+   // TODO(1189879): Investigate refactoring all filter logic into the
+   // CanvasFilterOperationResolver class
++
++  SetBackendAccelerated(context && context->IsAccelerated());
++
+   ValidateFilterState();
+ 
+   if (filter_state_ != FilterState::kUnresolved)
+@@ -600,12 +647,21 @@ sk_sp<PaintFilter> CanvasRenderingContext2DState::GetFilter(
+         style_resolution_host, *font, *css_filter_value_);
+   }
+ 
++  // browser: backend-gated blur-sigma perturbation for ctx.filter =
++  // 'blur(...)'.
++  if (backend_accelerated_) {
++    operations = PerturbBlurFilterOperations(operations);
++  }
++
+   // We can't reuse m_fillFlags and m_strokeFlags for the filter, since these
+   // incorporate the global alpha, which isn't applicable here.
++  // browser: filter paints keep canonical gradient stops.
+   cc::PaintFlags fill_flags_for_filter;
+-  fill_style_.ApplyToFlags(fill_flags_for_filter, 1.0f);
++  fill_style_.ApplyToFlags(fill_flags_for_filter, 1.0f,
++                           /*accelerated=*/false);
+   cc::PaintFlags stroke_flags_for_filter;
+-  stroke_style_.ApplyToFlags(stroke_flags_for_filter, 1.0f);
++  stroke_style_.ApplyToFlags(stroke_flags_for_filter, 1.0f,
++                             /*accelerated=*/false);
+ 
+   const gfx::SizeF canvas_viewport(canvas_size);
+   FilterEffectBuilder filter_effect_builder(
+@@ -648,7 +704,16 @@ sk_sp<cc::DrawLooper>& CanvasRenderingContext2DState::EmptyDrawLooper() const {
+ }
+ 
+ float CanvasRenderingContext2DState::ShadowBlurAsSigma() const {
+-  return ShadowData::BlurRadiusToStdDev(ClampTo<float>(shadow_blur_));
++  float sigma = ShadowData::BlurRadiusToStdDev(ClampTo<float>(shadow_blur_));
++  // browser: backend-gated perturbation. Only GPU-accelerated canvases pick up
++  // the
++  // --canvas-blur-noise offset. CPU-backed (willReadFrequently) canvases
++  // produce canonical sigma so paint(CPU) output stays bit-identical to
++  // upstream Chrome.
++  if (backend_accelerated_ && CanvasBlurNoiseActive()) {
++    sigma = PerturbBlurSigma(sigma, kBlurNoiseSaltShadow);
++  }
++  return sigma;
+ }
+ 
+ sk_sp<cc::DrawLooper>& CanvasRenderingContext2DState::ShadowOnlyDrawLooper()
+@@ -811,6 +876,20 @@ void CanvasRenderingContext2DState::UpdateFilterQuality(
+   image_flags_.setFilterQuality(filter_quality);
+ }
+ 
++void CanvasRenderingContext2DState::SetBackendAccelerated(bool accelerated) {
++  if (accelerated == backend_accelerated_) {
++    return;
++  }
++  backend_accelerated_ = accelerated;
++  shadow_only_draw_looper_.reset();
++  shadow_and_foreground_draw_looper_.reset();
++  shadow_only_image_filter_.reset();
++  shadow_and_foreground_image_filter_.reset();
++  if (filter_state_ == FilterState::kResolved) {
++    ClearResolvedFilter();
++  }
++}
++
+ const cc::PaintFlags* CanvasRenderingContext2DState::GetFlags(
+     PaintType paint_type,
+     ShadowMode shadow_mode,
+@@ -819,13 +898,14 @@ const cc::PaintFlags* CanvasRenderingContext2DState::GetFlags(
+   switch (paint_type) {
+     case kStrokePaintType:
+       UpdateLineDash();
+-      stroke_style_.SyncFlags(stroke_flags_, global_alpha_);
++      stroke_style_.SyncFlags(stroke_flags_, global_alpha_,
++                              backend_accelerated_);
+       flags = &stroke_flags_;
+       break;
+     default:
+       NOTREACHED();
+     case kFillPaintType:
+-      fill_style_.SyncFlags(fill_flags_, global_alpha_);
++      fill_style_.SyncFlags(fill_flags_, global_alpha_, backend_accelerated_);
+       flags = &fill_flags_;
+       break;
+     case kImagePaintType:
+diff --git a/third_party/blink/renderer/modules/canvas/canvas2d/canvas_rendering_context_2d_state.h b/third_party/blink/renderer/modules/canvas/canvas2d/canvas_rendering_context_2d_state.h
+index 40784dbf0a..93118d5cf8 100644
+--- a/third_party/blink/renderer/modules/canvas/canvas2d/canvas_rendering_context_2d_state.h
++++ b/third_party/blink/renderer/modules/canvas/canvas2d/canvas_rendering_context_2d_state.h
+@@ -338,6 +338,14 @@ class MODULES_EXPORT CanvasRenderingContext2DState final
+                                  ShadowMode,
+                                  ImageType = kNoImage) const;
+ 
++  // browser: records whether the owning canvas is GPU-accelerated at draw
++  // time. Gates the fingerprint perturbations of shadow and filter sigmas
++  // (--canvas-blur-noise) and gradient stops (--canvas-gradient-noise), so
++  // CPU-backed (willReadFrequently) canvases keep canonical output. On a
++  // transition the cached shadow loopers/filters and the resolved CSS
++  // filter are invalidated so they rebuild with the right sigma.
++  void SetBackendAccelerated(bool accelerated);
++
+   static_assert(static_cast<int>(SaveType::kBeginEndLayerOneSave) + 1 ==
+                 static_cast<int>(SaveType::kBeginEndLayerTwoSaves));
+   static_assert(static_cast<int>(SaveType::kBeginEndLayerTwoSaves) + 1 ==
+@@ -392,6 +400,9 @@ class MODULES_EXPORT CanvasRenderingContext2DState final
+   mutable sk_sp<PaintFilter> shadow_only_image_filter_;
+   mutable sk_sp<PaintFilter> shadow_and_foreground_image_filter_;
+ 
++  // browser: see SetBackendAccelerated().
++  bool backend_accelerated_ = false;
++
+   double global_alpha_ = 1.f;
+   // The default behavior of a 2D canvas is to tone map to SDR (HDR headroom
+   // zero).
+diff --git a/third_party/blink/renderer/modules/canvas/canvas2d/canvas_style.cc b/third_party/blink/renderer/modules/canvas/canvas2d/canvas_style.cc
+index fb6ee2f9c8..31b22406bb 100644
+--- a/third_party/blink/renderer/modules/canvas/canvas2d/canvas_style.cc
++++ b/third_party/blink/renderer/modules/canvas/canvas2d/canvas_style.cc
+@@ -42,6 +42,7 @@
+ #include "third_party/blink/renderer/core/dom/text_link_colors.h"
+ #include "third_party/blink/renderer/core/execution_context/security_context.h"
+ #include "third_party/blink/renderer/core/html/parser/html_parser_idioms.h"
++#include "third_party/blink/renderer/modules/canvas/canvas2d/canvas_curve_noise.h"
+ #include "third_party/blink/renderer/modules/canvas/canvas2d/canvas_gradient.h"
+ #include "third_party/blink/renderer/modules/canvas/canvas2d/canvas_pattern.h"
+ #include "third_party/blink/renderer/platform/graphics/gradient.h"
+@@ -126,16 +127,24 @@ bool ParseCanvasColorString(const String& color_string, Color& parsed_color) {
+ }
+ 
+ void CanvasStyle::ApplyToFlags(cc::PaintFlags& flags,
+-                               float global_alpha) const {
++                               float global_alpha,
++                               bool accelerated) const {
+   switch (type_) {
+     case kColor:
+       ApplyColorToFlags(flags, global_alpha);
+       break;
+-    case kGradient:
+-      GetCanvasGradient()->GetGradient()->ApplyToFlags(flags, SkMatrix::I(),
+-                                                       ImageDrawOptions());
++    case kGradient: {
++      Gradient* gradient = GetCanvasGradient()->GetGradient();
++      // browser: backend-gated stop-offset perturbation. CPU-backed canvases
++      // get amplitude 0 -> canonical Skia output. GPU-backed canvases get the
++      // --canvas-gradient-noise amplitude -> per-profile variance that
++      // rides on top of the natural cross-GPU gradient divergence.
++      gradient->SetStopPerturbation(
++          accelerated ? GetCanvasGradientNoiseAmplitude() : 0.0f);
++      gradient->ApplyToFlags(flags, SkMatrix::I(), ImageDrawOptions());
+       flags.setColor(SkColor4f(0.0f, 0.0f, 0.0f, global_alpha));
+       break;
++    }
+     case kImagePattern:
+       GetCanvasPattern()->GetPattern()->ApplyToFlags(
+           flags, GetCanvasPattern()->GetTransform().ToSkMatrix());
+diff --git a/third_party/blink/renderer/modules/canvas/canvas2d/canvas_style.h b/third_party/blink/renderer/modules/canvas/canvas2d/canvas_style.h
+index c3ff40da8b..e7812c38fc 100644
+--- a/third_party/blink/renderer/modules/canvas/canvas2d/canvas_style.h
++++ b/third_party/blink/renderer/modules/canvas/canvas2d/canvas_style.h
+@@ -68,13 +68,20 @@ class CanvasStyle final {
+ 
+   // Applies the CanvasStyle to PaintFlags. This is the slow path to be used
+   // in cases where PaintFlags has never been initialized and no assumptions
+-  // can be made about the CanvasStyle's type
+-  void ApplyToFlags(cc::PaintFlags&, float global_alpha) const;
++  // can be made about the CanvasStyle's type.
++  //
++  // browser: `accelerated` indicates whether the owning canvas is GPU-backed;
++  // it gates the Canvas 2D gradient stop-offset perturbation
++  // (--canvas-gradient-noise). CPU-backed (willReadFrequently) canvases
++  // pass `false` to preserve paint(CPU) canonicity.
++  void ApplyToFlags(cc::PaintFlags&,
++                    float global_alpha,
++                    bool accelerated) const;
+ 
+   // Like ApplyFlags, but does nothing if type is Color. This method is called
+   // at draw time to synchronize the states of live CanvasPattern and
+   // CanvasGradientObjects.
+-  void SyncFlags(cc::PaintFlags&, float global_alpha) const;
++  void SyncFlags(cc::PaintFlags&, float global_alpha, bool accelerated) const;
+ 
+   // FastPath: Call this instead of ApplyToFlags when the CanvasStyle is known
+   // to be of type kColor.
+@@ -134,12 +141,13 @@ ALWAYS_INLINE void CanvasStyle::ApplyColorToFlags(cc::PaintFlags& flags,
+ }
+ 
+ ALWAYS_INLINE void CanvasStyle::SyncFlags(cc::PaintFlags& flags,
+-                                          float global_alpha) const {
++                                          float global_alpha,
++                                          bool accelerated) const {
+   if (type_ == kColor) [[likely]] {
+     // Color values are immutable so they never need to be sync'ed at draw time.
+     return;
+   }
+-  ApplyToFlags(flags, global_alpha);
++  ApplyToFlags(flags, global_alpha, accelerated);
+ }
+ 
+ enum class ColorParseResult {
+diff --git a/third_party/blink/renderer/platform/BUILD.gn b/third_party/blink/renderer/platform/BUILD.gn
+index 6eed09d66d..be7ee8792b 100644
+--- a/third_party/blink/renderer/platform/BUILD.gn
++++ b/third_party/blink/renderer/platform/BUILD.gn
+@@ -976,6 +976,7 @@ component("platform") {
+     "graphics/dark_mode_image_classifier.h",
+     "graphics/dark_mode_lab_color_space.h",
+     "graphics/dark_mode_settings.h",
++    "graphics/deterministic_noise.h",
+     "graphics/dark_mode_settings_builder.cc",
+     "graphics/dark_mode_settings_builder.h",
+     "graphics/dark_mode_types.h",
+diff --git a/third_party/blink/renderer/platform/graphics/deterministic_noise.h b/third_party/blink/renderer/platform/graphics/deterministic_noise.h
+new file mode 100644
+index 0000000000..b4d2bb5225
+--- /dev/null
++++ b/third_party/blink/renderer/platform/graphics/deterministic_noise.h
+@@ -0,0 +1,40 @@
++// Copyright 2026 The browser Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef THIRD_PARTY_BLINK_RENDERER_PLATFORM_GRAPHICS_DETERMINISTIC_NOISE_H_
++#define THIRD_PARTY_BLINK_RENDERER_PLATFORM_GRAPHICS_DETERMINISTIC_NOISE_H_
++
++#include <cstdint>
++#include <cstring>
++
++namespace blink {
++
++// Deterministic sub-unit noise for the per-profile rendering perturbations
++// (canvas curve coordinates, blur sigmas, gradient stops, text color LUTs).
++//
++// Mixes `bits` with `salt` through a 32-bit integer hash and maps the result
++// onto [-0.5, 0.5). The same (bits, salt) pair always yields the same value,
++// which the per-machine calibration of every consumer depends on; distinct
++// salts keep the perturbations of different surfaces uncorrelated.
++inline float DeterministicSignedUnitNoise(uint32_t bits, uint32_t salt) {
++  uint32_t h = bits ^ salt;
++  h ^= h >> 16;
++  h *= 0x7feb352du;
++  h ^= h >> 15;
++  h *= 0x846ca68bu;
++  h ^= h >> 16;
++  return static_cast<float>(static_cast<int32_t>(h)) / 4294967296.0f;
++}
++
++// Same, keyed on the bit pattern of a float value.
++inline float DeterministicSignedUnitNoise(float value, uint32_t salt) {
++  uint32_t bits;
++  static_assert(sizeof(bits) == sizeof(value));
++  std::memcpy(&bits, &value, sizeof(bits));
++  return DeterministicSignedUnitNoise(bits, salt);
++}
++
++}  // namespace blink
++
++#endif  // THIRD_PARTY_BLINK_RENDERER_PLATFORM_GRAPHICS_DETERMINISTIC_NOISE_H_
+diff --git a/third_party/blink/renderer/platform/graphics/gradient.cc b/third_party/blink/renderer/platform/graphics/gradient.cc
+index 71c0d5fbb9..bd67c68411 100644
+--- a/third_party/blink/renderer/platform/graphics/gradient.cc
++++ b/third_party/blink/renderer/platform/graphics/gradient.cc
+@@ -28,12 +28,14 @@
+ #include "third_party/blink/renderer/platform/graphics/gradient.h"
+ 
+ #include <algorithm>
++#include <cstdint>
+ #include <optional>
+ 
+ #include "third_party/blink/renderer/platform/geometry/blend.h"
+ #include "third_party/blink/renderer/platform/geometry/skia_geometry_utils.h"
+ #include "third_party/blink/renderer/platform/graphics/color.h"
+ #include "third_party/blink/renderer/platform/graphics/dark_mode_settings_builder.h"
++#include "third_party/blink/renderer/platform/graphics/deterministic_noise.h"
+ #include "third_party/blink/renderer/platform/graphics/graphics_context.h"
+ #include "third_party/blink/renderer/platform/graphics/paint/paint_shader.h"
+ #include "third_party/blink/renderer/platform/wtf/wtf_size_t.h"
+@@ -43,6 +45,13 @@
+ 
+ namespace blink {
+ 
++namespace {
++
++// browser: base salt for the per-stop perturbation; stop i uses base + i.
++constexpr uint32_t kStopPerturbationSalt = 0xA17E5u;
++
++}  // namespace
++
+ Gradient::Gradient(Type type,
+                    SpreadMethod spread_method,
+                    PremultipliedAlpha premultiplied_alpha,
+@@ -318,6 +327,20 @@ sk_sp<PaintShader> Gradient::CreateShaderInternal(
+   DCHECK_GE(colors.size(), 1ul);
+   DCHECK_EQ(pos.size(), colors.size());
+ 
++  // browser: additive sub-unit perturbation of stop offsets for Canvas 2D
++  // per-profile fingerprint variation (see Gradient::SetStopPerturbation).
++  // No-op when the amplitude is 0 (the default for SVG/CSS-on-HTML
++  // gradients). Each stop gets its own salt so stops move independently.
++  if (stop_perturbation_amplitude_ != 0.0f) {
++    for (size_t i = 0; i < pos.size(); ++i) {
++      const float noise = DeterministicSignedUnitNoise(
++          pos[i], kStopPerturbationSalt + static_cast<uint32_t>(i));
++      // Keep within [0, 1] so Skia doesn't reject the gradient.
++      pos[i] = std::clamp(pos[i] + noise * 2.0f * stop_perturbation_amplitude_,
++                          0.0f, 1.0f);
++    }
++  }
++
+   SkTileMode tile = SkTileMode::kClamp;
+   switch (spread_method_) {
+     case SpreadMethod::kReflect:
+diff --git a/third_party/blink/renderer/platform/graphics/gradient.h b/third_party/blink/renderer/platform/graphics/gradient.h
+index a908e6fb5c..c1a5d0fb31 100644
+--- a/third_party/blink/renderer/platform/graphics/gradient.h
++++ b/third_party/blink/renderer/platform/graphics/gradient.h
+@@ -138,6 +138,20 @@ class PLATFORM_EXPORT Gradient {
+     cached_shader_.reset();
+   }
+ 
++  // browser: sets a sub-unit additive perturbation amplitude applied to each
++  // color stop's offset when the gradient's shader is built. 0 disables. Set by
++  // Canvas 2D code based on --canvas-gradient-noise + backend state; other
++  // gradient users (SVG, CSS on HTML) leave this 0 and get canonical output.
++  // Invalidates cached_shader_ on transition so a stale shader with
++  // different perturbation doesn't get reused.
++  void SetStopPerturbation(float amplitude) {
++    if (amplitude == stop_perturbation_amplitude_) {
++      return;
++    }
++    stop_perturbation_amplitude_ = amplitude;
++    cached_shader_.reset();
++  }
++
+   DarkModeFilter& EnsureDarkModeFilter();
+ 
+  protected:
+@@ -180,6 +194,10 @@ class PLATFORM_EXPORT Gradient {
+   const bool allow_degenerate_;
+ 
+   mutable bool stops_sorted_ = true;
++  // browser: sub-unit additive amplitude for per-profile color-stop
++  // perturbation. 0 = no perturbation (default). Set via SetStopPerturbation()
++  // from canvas code.
++  float stop_perturbation_amplitude_ = 0.0f;
+   bool is_dark_mode_enabled_ = false;
+ };
+ 

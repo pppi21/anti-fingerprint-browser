@@ -1,0 +1,59 @@
+From 265fe562fa979215fa4b92b6f32a7b6b4f9a5781 Mon Sep 17 00:00:00 2001
+From: Leo Rodarte <leorodarte07@gmail.com>
+Date: Sat, 19 Sep 2026 23:45:09 -0400
+Subject: [PATCH 08/41] webgpu-spoof
+
+WebGPU adapter identity spoof.
+---
+ .../blink/renderer/modules/webgpu/BUILD.gn     |  1 +
+ .../renderer/modules/webgpu/gpu_adapter.cc     | 18 ++++++++++++++++++
+ 2 files changed, 19 insertions(+)
+
+diff --git a/third_party/blink/renderer/modules/webgpu/BUILD.gn b/third_party/blink/renderer/modules/webgpu/BUILD.gn
+index f883ab27a4..f5ee9bebce 100644
+--- a/third_party/blink/renderer/modules/webgpu/BUILD.gn
++++ b/third_party/blink/renderer/modules/webgpu/BUILD.gn
+@@ -111,6 +111,7 @@ blink_modules_sources("webgpu") {
+     "wgsl_language_features.h",
+   ]
+   deps = [
++    "//components/browser:browser_switches",
+     "//gpu/command_buffer/client:webgpu_interface",
+     "//services/metrics/public/cpp:ukm_builders",
+     "//skia",
+diff --git a/third_party/blink/renderer/modules/webgpu/gpu_adapter.cc b/third_party/blink/renderer/modules/webgpu/gpu_adapter.cc
+index 5d35a355c7..cc598c6e8b 100644
+--- a/third_party/blink/renderer/modules/webgpu/gpu_adapter.cc
++++ b/third_party/blink/renderer/modules/webgpu/gpu_adapter.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "third_party/blink/renderer/modules/webgpu/gpu_adapter.h"
+ 
++#include "components/browser/browser_runtime.h"
+ #include "services/metrics/public/cpp/ukm_builders.h"
+ #include "third_party/blink/renderer/bindings/core/v8/script_promise_resolver.h"
+ #include "third_party/blink/renderer/bindings/core/v8/v8_object_builder.h"
+@@ -97,6 +98,23 @@ GPUAdapter::GPUAdapter(
+ 
+   vendor_ = String::FromUtf8(info.vendor);
+   architecture_ = String::FromUtf8(info.architecture);
++  // browser: override adapter.info.vendor / adapter.info.architecture from the
++  // command line when fingerprint switches are present. Patching here (right
++  // after Dawn's info is copied into the member variables) means every
++  // downstream consumer - including CreateAdapterInfoForAdapter() below and the
++  // GPUAdapterInfo getters exposed to JS - observes the spoofed values without
++  // needing separate patches. Timing note: JS-visible adapter.info getters
++  // read the cached GPUAdapterInfo fields with no IPC, so this overlay has no
++  // per-call cost relative to stock; the switch read itself is paid once,
++  // during the GPUAdapter constructor (off the JS-observable timing path).
++  const std::string& spoof_vendor = browser::SpoofedWebgpuVendor();
++  if (!spoof_vendor.empty()) {
++    vendor_ = String::FromUtf8(spoof_vendor);
++  }
++  const std::string& spoof_arch = browser::SpoofedWebgpuArchitecture();
++  if (!spoof_arch.empty()) {
++    architecture_ = String::FromUtf8(spoof_arch);
++  }
+   if (info.deviceID <= 0xffff) {
+     device_ = Format("0x{:04x}", info.deviceID);
+   } else {

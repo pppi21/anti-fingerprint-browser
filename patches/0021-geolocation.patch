@@ -1,0 +1,263 @@
+From 82ab1bcd35be3022fb66a251823a088ab366bd7f Mon Sep 17 00:00:00 2001
+From: Leo Rodarte <leorodarte07@gmail.com>
+Date: Sat, 19 Sep 2026 23:45:38 -0400
+Subject: [PATCH 21/41] geolocation
+
+Geolocation coordinate spoof + permission wiring.
+---
+ .../geolocation/geolocation_service_impl.cc   | 23 +++++++
+ .../permissions/permission_controller_impl.cc |  8 +++
+ .../geolocation/location_provider_manager.cc  | 52 +++++++++++++++
+ .../geolocation/geolocation_coordinates.cc    | 66 ++++++++++++++++++-
+ .../geolocation/geolocation_coordinates.h     |  7 +-
+ 5 files changed, 150 insertions(+), 6 deletions(-)
+
+diff --git a/content/browser/geolocation/geolocation_service_impl.cc b/content/browser/geolocation/geolocation_service_impl.cc
+index d7bca56dcc..82ac9dad52 100644
+--- a/content/browser/geolocation/geolocation_service_impl.cc
++++ b/content/browser/geolocation/geolocation_service_impl.cc
+@@ -7,7 +7,9 @@
+ #include <utility>
+ 
+ #include "base/check.h"
++#include "base/command_line.h"
+ #include "base/functional/bind.h"
++#include "components/browser/browser_switches.h"
+ #include "components/content_settings/core/common/content_settings.h"
+ #include "components/content_settings/core/common/features.h"
+ #include "content/browser/permissions/permission_controller_impl.h"
+@@ -188,6 +190,27 @@ void GeolocationServiceImpl::CreateGeolocation(
+     return;
+   }
+ 
++  // browser: with a spoofed position the permission is granted without a
++  // prompt.
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch(
++          switches::kFingerprintGeolocation)) {
++    device::mojom::GeolocationContext* geolocation_context =
++        GetGeolocationContext();
++    if (!geolocation_context) {
++      std::move(callback).Run(blink::mojom::PermissionStatus::DENIED);
++      return;
++    }
++    std::move(callback).Run(blink::mojom::PermissionStatus::GRANTED);
++    IncrementActivityCount();
++    requesting_origin_ =
++        render_frame_host_->GetMainFrame()->GetLastCommittedOrigin();
++    geolocation_context->BindGeolocation(
++        std::move(receiver), requesting_origin_,
++        device::mojom::GeolocationClientId::kGeolocationServiceImpl,
++        /*has_precise_permission=*/true);
++    return;
++  }
++
+   // If the geolocation service is destroyed before the callback is run, ensure
+   // it is called with DENIED status.
+   auto scoped_callback = mojo::WrapCallbackWithDefaultInvokeIfNotRun(
+diff --git a/content/browser/permissions/permission_controller_impl.cc b/content/browser/permissions/permission_controller_impl.cc
+index 454bcb2466..0334eaefd2 100644
+--- a/content/browser/permissions/permission_controller_impl.cc
++++ b/content/browser/permissions/permission_controller_impl.cc
+@@ -10,8 +10,10 @@
+ #include <vector>
+ 
+ #include "base/barrier_closure.h"
++#include "base/command_line.h"
+ #include "base/functional/bind.h"
+ #include "base/types/optional_ref.h"
++#include "components/browser/browser_switches.h"
+ #include "components/content_settings/core/common/content_settings.h"
+ #include "components/content_settings/core/common/content_settings_types.h"
+ #include "content/browser/permissions/permission_service_context.h"
+@@ -636,6 +638,12 @@ PermissionControllerImpl::GetPermissionResultForCurrentDocumentInternal(
+     bool should_include_device_status) {
+   auto permission_type =
+       blink::PermissionDescriptorToPermissionType(permission_descriptor);
++  // browser: a spoofed position reports geolocation as granted.
++  if (permission_type == blink::PermissionType::GEOLOCATION &&
++      base::CommandLine::ForCurrentProcess()->HasSwitch(
++          switches::kFingerprintGeolocation)) {
++    return PermissionResult(PermissionStatus::GRANTED);
++  }
+   std::optional<PermissionResult> permission_result = permission_overrides_.Get(
+       render_frame_host->GetLastCommittedOrigin(),
+       render_frame_host->GetMainFrame()->GetLastCommittedOrigin(),
+diff --git a/services/device/geolocation/location_provider_manager.cc b/services/device/geolocation/location_provider_manager.cc
+index fc299cb971..91802b1a2d 100644
+--- a/services/device/geolocation/location_provider_manager.cc
++++ b/services/device/geolocation/location_provider_manager.cc
+@@ -6,13 +6,17 @@
+ 
+ #include <map>
+ #include <memory>
++#include <optional>
+ #include <utility>
+ 
+ #include "base/check.h"
++#include "base/command_line.h"
+ #include "base/functional/bind.h"
+ #include "base/functional/callback_helpers.h"
+ #include "base/memory/ptr_util.h"
+ #include "base/metrics/histogram_functions.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_split.h"
+ #include "base/strings/stringprintf.h"
+ #include "base/task/single_thread_task_runner.h"
+ #include "build/build_config.h"
+@@ -136,6 +140,54 @@ void LocationProviderManager::OnPermissionManagerShuttingDown() {
+ }
+ 
+ void LocationProviderManager::StartProvider(bool enable_high_accuracy) {
++  // browser: --fingerprint-geolocation ("latitude,longitude[,accuracy]")
++  // replaces the real providers with a single fixed position. The parser is
++  // spelled out here because services/device cannot depend on
++  // components/browser.
++  struct SpoofedPosition {
++    double latitude = 0;
++    double longitude = 0;
++    double accuracy = 100.0;
++  };
++  static const std::optional<SpoofedPosition> spoofed_position =
++      []() -> std::optional<SpoofedPosition> {
++    const std::string value =
++        base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
++            "fingerprint-geolocation");
++    if (value.empty()) {
++      return std::nullopt;
++    }
++    std::vector<std::string> parts = base::SplitString(
++        value, ",", base::TRIM_WHITESPACE, base::SPLIT_WANT_NONEMPTY);
++    SpoofedPosition result;
++    if (parts.size() < 2 || !base::StringToDouble(parts[0], &result.latitude) ||
++        !base::StringToDouble(parts[1], &result.longitude)) {
++      return std::nullopt;
++    }
++    if (parts.size() >= 3) {
++      base::StringToDouble(parts[2], &result.accuracy);
++    }
++    return result;
++  }();
++  if (spoofed_position) {
++    is_running_ = true;
++    base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE,
++        base::BindOnce(
++            [](LocationProviderManager* self, SpoofedPosition spoofed) {
++              auto position = mojom::Geoposition::New();
++              position->latitude = spoofed.latitude;
++              position->longitude = spoofed.longitude;
++              position->accuracy = spoofed.accuracy;
++              position->timestamp = base::Time::Now();
++              self->location_update_callback_.Run(
++                  self,
++                  mojom::GeopositionResult::NewPosition(std::move(position)));
++            },
++            base::Unretained(this), *spoofed_position));
++    return;
++  }
++
+   // Ensure a provider is created successfully before starting.
+   if (!InitializeProvider()) {
+     // If no location providers are available, report a "Position Unavailable"
+diff --git a/third_party/blink/renderer/core/geolocation/geolocation_coordinates.cc b/third_party/blink/renderer/core/geolocation/geolocation_coordinates.cc
+index 4c5336c6a6..091307e761 100644
+--- a/third_party/blink/renderer/core/geolocation/geolocation_coordinates.cc
++++ b/third_party/blink/renderer/core/geolocation/geolocation_coordinates.cc
+@@ -25,15 +25,75 @@
+ 
+ #include "third_party/blink/renderer/core/geolocation/geolocation_coordinates.h"
+ 
++#include <optional>
++
++#include "base/command_line.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_split.h"
++#include "components/browser/browser_switches.h"
+ #include "third_party/blink/renderer/bindings/core/v8/v8_object_builder.h"
+ 
+ namespace blink {
+ 
++namespace {
++
++// browser: --fingerprint-geolocation ("latitude,longitude[,accuracy]"),
++// parsed once per process. The position itself comes from the spoofed
++// provider in services/device; these getters make the values consistent
++// for any Coordinates object, whatever produced it. An accuracy of 0 or an
++// absent accuracy keeps the real value.
++struct GeoOverride {
++  double latitude = 0;
++  double longitude = 0;
++  double accuracy = 0;
++};
++
++const std::optional<GeoOverride>& GetGeoOverride() {
++  static const std::optional<GeoOverride> spoof =
++      []() -> std::optional<GeoOverride> {
++    const std::string value =
++        base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
++            switches::kFingerprintGeolocation);
++    if (value.empty()) {
++      return std::nullopt;
++    }
++    std::vector<std::string> parts = base::SplitString(
++        value, ",", base::TRIM_WHITESPACE, base::SPLIT_WANT_NONEMPTY);
++    GeoOverride result;
++    if (parts.size() < 2 || !base::StringToDouble(parts[0], &result.latitude) ||
++        !base::StringToDouble(parts[1], &result.longitude)) {
++      return std::nullopt;
++    }
++    if (parts.size() >= 3) {
++      base::StringToDouble(parts[2], &result.accuracy);
++    }
++    return result;
++  }();
++  return spoof;
++}
++
++}  // namespace
++
++double GeolocationCoordinates::latitude() const {
++  const std::optional<GeoOverride>& spoof = GetGeoOverride();
++  return spoof ? spoof->latitude : latitude_;
++}
++
++double GeolocationCoordinates::longitude() const {
++  const std::optional<GeoOverride>& spoof = GetGeoOverride();
++  return spoof ? spoof->longitude : longitude_;
++}
++
++double GeolocationCoordinates::accuracy() const {
++  const std::optional<GeoOverride>& spoof = GetGeoOverride();
++  return spoof && spoof->accuracy > 0 ? spoof->accuracy : accuracy_;
++}
++
+ ScriptObject GeolocationCoordinates::toJSON(ScriptState* script_state) const {
+   V8ObjectBuilder builder(script_state);
+-  builder.AddNumber("accuracy", accuracy_);
+-  builder.AddNumber("latitude", latitude_);
+-  builder.AddNumber("longitude", longitude_);
++  builder.AddNumber("accuracy", accuracy());
++  builder.AddNumber("latitude", latitude());
++  builder.AddNumber("longitude", longitude());
+   builder.AddNumberOrNull("altitude", altitude_);
+   builder.AddNumberOrNull("altitudeAccuracy", altitude_accuracy_);
+   builder.AddNumberOrNull("heading", heading_);
+diff --git a/third_party/blink/renderer/core/geolocation/geolocation_coordinates.h b/third_party/blink/renderer/core/geolocation/geolocation_coordinates.h
+index e9af0f363a..1e26e6869b 100644
+--- a/third_party/blink/renderer/core/geolocation/geolocation_coordinates.h
++++ b/third_party/blink/renderer/core/geolocation/geolocation_coordinates.h
+@@ -52,10 +52,11 @@ class CORE_EXPORT GeolocationCoordinates : public ScriptWrappable {
+         heading_(heading),
+         speed_(speed) {}
+ 
+-  double latitude() const { return latitude_; }
+-  double longitude() const { return longitude_; }
++  // browser: these three honour --fingerprint-geolocation.
++  double latitude() const;
++  double longitude() const;
+   std::optional<double> altitude() const { return altitude_; }
+-  double accuracy() const { return accuracy_; }
++  double accuracy() const;
+   std::optional<double> altitudeAccuracy() const { return altitude_accuracy_; }
+   std::optional<double> heading() const { return heading_; }
+   std::optional<double> speed() const { return speed_; }

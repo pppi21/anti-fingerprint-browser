@@ -1,0 +1,75 @@
+From 5c6962bb1d83fa33b313294ff24ed5bcd75d8a03 Mon Sep 17 00:00:00 2001
+From: Leo Rodarte <leorodarte07@gmail.com>
+Date: Sat, 19 Sep 2026 23:45:48 -0400
+Subject: [PATCH 27/41] text-rendering
+
+Renderer text-rendering preferences.
+---
+ .../browser/renderer_preferences_util.cc      | 38 +++++++++++++++++++
+ 1 file changed, 38 insertions(+)
+
+diff --git a/content/public/browser/renderer_preferences_util.cc b/content/public/browser/renderer_preferences_util.cc
+index dee0a71935..76b51fe291 100644
+--- a/content/public/browser/renderer_preferences_util.cc
++++ b/content/public/browser/renderer_preferences_util.cc
+@@ -4,15 +4,27 @@
+ 
+ #include "content/public/browser/renderer_preferences_util.h"
+ 
++#include <algorithm>
++#include <string>
++
+ #include "base/command_line.h"
+ #include "base/strings/string_number_conversions.h"
++#include "base/strings/string_split.h"
+ #include "build/build_config.h"
++#include "components/browser/browser_switches.h"
+ #include "content/public/common/content_switches.h"
+ #include "third_party/blink/public/common/renderer_preferences/renderer_preferences.h"
+ #include "ui/gfx/font_render_params.h"
+ 
+ namespace content {
+ 
++#if BUILDFLAG(IS_WIN)
++// browser: Skia stores the device gamma in a byte with 1/64 resolution and
++// the contrast in [0, 1], so these are the largest representable values.
++constexpr double kMaxTextGamma = 255.0 / 64;
++constexpr double kMaxTextContrast = 1.0;
++#endif  // BUILDFLAG(IS_WIN)
++
+ void UpdateFontRendererPreferencesFromSystemSettings(
+     blink::RendererPreferences* prefs) {
+   static const gfx::FontRenderParams params(
+@@ -26,6 +38,32 @@ void UpdateFontRendererPreferencesFromSystemSettings(
+ #if BUILDFLAG(IS_WIN)
+   prefs->text_contrast = params.text_contrast;
+   prefs->text_gamma = params.text_gamma;
++
++  // browser: --fingerprint-text-rendering=gamma:<float>,contrast:<float>
++  // overrides the values read from the system. Explicit only: the switch does
++  // not take part in auto/seed derivation because it does not model real
++  // cross-GPU variation well enough to be on by default.
++  const std::string text_rendering =
++      base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
++          switches::kFingerprintTextRendering);
++  for (const std::string& token :
++       base::SplitString(text_rendering, ",", base::TRIM_WHITESPACE,
++                         base::SPLIT_WANT_NONEMPTY)) {
++    const size_t colon = token.find(':');
++    double value;
++    if (colon == std::string::npos ||
++        !base::StringToDouble(token.substr(colon + 1), &value)) {
++      continue;
++    }
++    const std::string key = token.substr(0, colon);
++    if (key == "gamma") {
++      prefs->text_gamma =
++          static_cast<float>(std::clamp(value, 0.0, kMaxTextGamma));
++    } else if (key == "contrast") {
++      prefs->text_contrast =
++          static_cast<float>(std::clamp(value, 0.0, kMaxTextContrast));
++    }
++  }
+ #endif  // BUILDFLAG(IS_WIN)
+ }
+ 

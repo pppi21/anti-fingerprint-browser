@@ -1,0 +1,106 @@
+From f634190b82b68195b7f31c5014f1c4c1a5c3da88 Mon Sep 17 00:00:00 2001
+From: Leo Rodarte <leorodarte07@gmail.com>
+Date: Sat, 19 Sep 2026 13:48:47 -0400
+Subject: [PATCH] v8-inspector-neuter
+
+Neuter the V8 inspector runtime agent hooks (enable(), addBindings,
+messageAdded) that leak automation timing through CDP.
+---
+ src/inspector/v8-runtime-agent-impl.cc | 42 +++++---------------------
+ src/inspector/v8-runtime-agent-impl.h  |  2 +-
+ 2 files changed, 8 insertions(+), 36 deletions(-)
+
+diff --git a/src/inspector/v8-runtime-agent-impl.cc b/src/inspector/v8-runtime-agent-impl.cc
+index b17432ca..2d6e4cd3 100644
+--- a/src/inspector/v8-runtime-agent-impl.cc
++++ b/src/inspector/v8-runtime-agent-impl.cc
+@@ -678,7 +678,7 @@ Response V8RuntimeAgentImpl::setMaxCallStackSizeToCapture(int size) {
+               "size", size);
+   if (!m_enabled) return Response::ServerError("Runtime agent is not enabled");
+   m_state->setInteger(V8RuntimeAgentImplState::maxCallStackSizeToCapture, size);
+-  m_inspector->debugger()->setMaxCallStackSizeToCapture(this, size);
++  // Removed: m_inspector->debugger()->setMaxCallStackSizeToCapture(this, size);
+   return Response::Success();
+ }
+ 
+@@ -1071,32 +1071,7 @@ void V8RuntimeAgentImpl::bindingCalled(const String16& name,
+ }
+ 
+ void V8RuntimeAgentImpl::addBindings(InspectedContext* context) {
+-  int contextGroupId = context->contextGroupId();
+-  int contextId = context->contextId();
+-  const String16 contextName = context->humanReadableName();
+-  if (!m_enabled) return;
+-
+-  protocol::DictionaryValue* globalBindings =
+-      m_state->getObject(V8RuntimeAgentImplState::globalBindings);
+-  if (globalBindings) {
+-    for (size_t i = 0; i < globalBindings->size(); ++i) {
+-      addBinding(context, globalBindings->at(i).first);
+-      if (!m_inspector->getContext(contextGroupId, contextId)) return;
+-    }
+-  }
+-
+-  protocol::DictionaryValue* contextBindings =
+-      m_state->getObject(V8RuntimeAgentImplState::contextBindings);
+-  if (contextBindings) {
+-    protocol::DictionaryValue* bindings =
+-        contextBindings->getObject(contextName);
+-    if (bindings) {
+-      for (size_t i = 0; i < bindings->size(); ++i) {
+-        addBinding(context, bindings->at(i).first);
+-        if (!m_inspector->getContext(contextGroupId, contextId)) return;
+-      }
+-    }
+-  }
++  return;
+ }
+ 
+ void V8RuntimeAgentImpl::restore() {
+@@ -1111,11 +1086,7 @@ void V8RuntimeAgentImpl::restore() {
+     m_session->setCustomObjectFormatterEnabled(true);
+   }
+ 
+-  int size;
+-  if (m_state->getInteger(V8RuntimeAgentImplState::maxCallStackSizeToCapture,
+-                          &size)) {
+-    m_inspector->debugger()->setMaxCallStackSizeToCapture(this, size);
+-  }
++  // Removed: setMaxCallStackSizeToCapture bypass
+ 
+   m_inspector->forEachContext(
+       m_session->contextGroupId(),
+@@ -1131,8 +1102,9 @@ Response V8RuntimeAgentImpl::enable() {
+       m_session->contextGroupId());
+   m_enabled = true;
+   m_state->setBoolean(V8RuntimeAgentImplState::runtimeEnabled, true);
+-  m_inspector->debugger()->setMaxCallStackSizeToCapture(
+-      this, V8StackTraceImpl::kDefaultMaxCallStackSizeToCapture);
++  // Removed: setMaxCallStackSizeToCapture — prevents V8 isolate-level
++  // SetCaptureStackTraceForUncaughtExceptions(true, 200) which adds
++  // measurable overhead to all JS execution.
+   m_session->reportAllContexts(this);
+   V8ConsoleMessageStorage* storage =
+       m_inspector->ensureConsoleMessageStorage(m_session->contextGroupId());
+@@ -1229,7 +1201,7 @@ void V8RuntimeAgentImpl::inspect(
+ }
+ 
+ void V8RuntimeAgentImpl::messageAdded(V8ConsoleMessage* message) {
+-  if (m_enabled) reportMessage(message, true);
++  return;
+ }
+ 
+ bool V8RuntimeAgentImpl::reportMessage(V8ConsoleMessage* message,
+diff --git a/src/inspector/v8-runtime-agent-impl.h b/src/inspector/v8-runtime-agent-impl.h
+index b0efbe69..88bd126d 100644
+--- a/src/inspector/v8-runtime-agent-impl.h
++++ b/src/inspector/v8-runtime-agent-impl.h
+@@ -160,7 +160,7 @@ class V8RuntimeAgentImpl : public protocol::Runtime::Backend {
+                std::unique_ptr<protocol::DictionaryValue> hints,
+                int executionContextId);
+   void messageAdded(V8ConsoleMessage*);
+-  bool enabled() const { return m_enabled; }
++  bool enabled() const { return false; }
+ 
+  private:
+   bool reportMessage(V8ConsoleMessage*, bool generatePreview);

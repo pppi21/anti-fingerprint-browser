@@ -1,0 +1,92 @@
+From 92bff1b38483d21d2ae7f6c00173110acae299da Mon Sep 17 00:00:00 2001
+From: Leo Rodarte <leorodarte07@gmail.com>
+Date: Sat, 19 Sep 2026 23:45:01 -0400
+Subject: [PATCH 04/41] gesture-plumbing
+
+Synthetic-gesture overload that resolves its completion callback once
+events are dispatched, skipping the renderer input-processed round-trip.
+---
+ .../browser/renderer_host/render_widget_host_impl.cc  | 11 +++++++++++
+ .../browser/renderer_host/render_widget_host_impl.h   |  5 +++++
+ content/common/input/synthetic_gesture_controller.cc  |  8 ++++++++
+ content/common/input/synthetic_gesture_controller.h   | 10 ++++++++++
+ 4 files changed, 34 insertions(+)
+
+diff --git a/content/browser/renderer_host/render_widget_host_impl.cc b/content/browser/renderer_host/render_widget_host_impl.cc
+index 29ec13460d..f7232ead11 100644
+--- a/content/browser/renderer_host/render_widget_host_impl.cc
++++ b/content/browser/renderer_host/render_widget_host_impl.cc
+@@ -1911,6 +1911,17 @@ void RenderWidgetHostImpl::QueueSyntheticGestureCompleteImmediately(
+   }
+ }
+ 
++// browser: completion-callback variant used by Input.dispatchMousePath.
++void RenderWidgetHostImpl::QueueSyntheticGestureCompleteImmediately(
++    std::unique_ptr<SyntheticGesture> synthetic_gesture,
++    base::OnceCallback<void(SyntheticGesture::Result)> on_complete) {
++  CreateSyntheticGestureControllerIfNecessary();
++  if (synthetic_gesture_controller_) {
++    synthetic_gesture_controller_->QueueSyntheticGestureCompleteImmediately(
++        std::move(synthetic_gesture), std::move(on_complete));
++  }
++}
++
+ void RenderWidgetHostImpl::EnsureReadyForSyntheticGestures(
+     base::OnceClosure on_ready) {
+   CreateSyntheticGestureControllerIfNecessary();
+diff --git a/content/browser/renderer_host/render_widget_host_impl.h b/content/browser/renderer_host/render_widget_host_impl.h
+index 0016174ffc..e64cf5c870 100644
+--- a/content/browser/renderer_host/render_widget_host_impl.h
++++ b/content/browser/renderer_host/render_widget_host_impl.h
+@@ -649,6 +649,11 @@ class CONTENT_EXPORT RenderWidgetHostImpl
+       base::OnceCallback<void(SyntheticGesture::Result)> on_complete);
+   void QueueSyntheticGestureCompleteImmediately(
+       std::unique_ptr<SyntheticGesture> synthetic_gesture);
++  // browser: as above, but runs on_complete as soon as the gesture's events
++  // are dispatched, skipping the renderer input-processed round trip.
++  void QueueSyntheticGestureCompleteImmediately(
++      std::unique_ptr<SyntheticGesture> synthetic_gesture,
++      base::OnceCallback<void(SyntheticGesture::Result)> on_complete);
+ 
+   // Ensures the renderer is in a state ready to receive synthetic input. The
+   // SyntheticGestureController will normally ensure this before sending the
+diff --git a/content/common/input/synthetic_gesture_controller.cc b/content/common/input/synthetic_gesture_controller.cc
+index 9832b71ace..c4a93169dd 100644
+--- a/content/common/input/synthetic_gesture_controller.cc
++++ b/content/common/input/synthetic_gesture_controller.cc
+@@ -95,6 +95,14 @@ void SyntheticGestureController::QueueSyntheticGestureCompleteImmediately(
+   QueueSyntheticGesture(std::move(synthetic_gesture), base::DoNothing(), true);
+ }
+ 
++// browser: completion-callback variant.
++void SyntheticGestureController::QueueSyntheticGestureCompleteImmediately(
++    std::unique_ptr<SyntheticGesture> synthetic_gesture,
++    OnGestureCompleteCallback completion_callback) {
++  QueueSyntheticGesture(std::move(synthetic_gesture),
++                        std::move(completion_callback), true);
++}
++
+ void SyntheticGestureController::QueueSyntheticGesture(
+     std::unique_ptr<SyntheticGesture> synthetic_gesture,
+     OnGestureCompleteCallback completion_callback,
+diff --git a/content/common/input/synthetic_gesture_controller.h b/content/common/input/synthetic_gesture_controller.h
+index de6c3634a9..8947ec8de6 100644
+--- a/content/common/input/synthetic_gesture_controller.h
++++ b/content/common/input/synthetic_gesture_controller.h
+@@ -61,6 +61,16 @@ class CONTENT_EXPORT SyntheticGestureController {
+   void QueueSyntheticGestureCompleteImmediately(
+       std::unique_ptr<SyntheticGesture> synthetic_gesture);
+ 
++  // browser: like QueueSyntheticGesture(gesture, callback), but runs the
++  // completion callback as soon as the gesture's input events are dispatched,
++  // without the WaitForTargetAck round trip that waits for the renderer to
++  // process them. For latency-sensitive gestures such as cursor movement,
++  // where the caller does not depend on the events having been processed
++  // and that round trip can lag by seconds on a busy or occluded page.
++  void QueueSyntheticGestureCompleteImmediately(
++      std::unique_ptr<SyntheticGesture> synthetic_gesture,
++      OnGestureCompleteCallback completion_callback);
++
+   // Returns true if there are more gestures in the queue after processing the
+   // current one.
+   bool DispatchNextEvent(base::TimeTicks = base::TimeTicks::Now());

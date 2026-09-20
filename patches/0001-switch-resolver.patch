@@ -1,0 +1,763 @@
+From 9f2e37c0b071fed60d907861be1cb2737610c716 Mon Sep 17 00:00:00 2001
+From: Leo Rodarte <leorodarte07@gmail.com>
+Date: Sat, 19 Sep 2026 23:44:53 -0400
+Subject: [PATCH 01/41] switch-resolver
+
+browser switch resolver + component scaffolding and switches-dep plumbing.
+---
+ chrome/browser/BUILD.gn                       |   1 +
+ components/browser/BUILD.gn                   |  73 ++++++++
+ components/browser/browser_switches.cc        | 163 +++++++++++++++++
+ components/browser/browser_switches.h         |  72 ++++++++
+ components/browser/switch_resolver.cc         | 135 ++++++++++++++
+ components/browser/switch_resolver.h          | 169 ++++++++++++++++++
+ .../renderer_host/render_process_host_impl.cc |  31 ++++
+ content/public/browser/BUILD.gn               |   1 +
+ third_party/blink/common/BUILD.gn             |   1 +
+ third_party/blink/renderer/core/BUILD.gn      |   1 +
+ 10 files changed, 647 insertions(+)
+ create mode 100644 components/browser/BUILD.gn
+ create mode 100644 components/browser/browser_switches.cc
+ create mode 100644 components/browser/browser_switches.h
+ create mode 100644 components/browser/switch_resolver.cc
+ create mode 100644 components/browser/switch_resolver.h
+
+diff --git a/chrome/browser/BUILD.gn b/chrome/browser/BUILD.gn
+index cf53f5fa3d..2b0150cab3 100644
+--- a/chrome/browser/BUILD.gn
++++ b/chrome/browser/BUILD.gn
+@@ -2362,6 +2362,7 @@ source_set("browser") {
+     "//components/autofill/content/browser",
+     "//components/autofill/core/browser",
+     "//components/background_task_scheduler",
++    "//components/browser:browser_switches",
+     "//components/browser_sync",
+     "//components/certificate_transparency",
+     "//components/certificate_transparency:proto",
+diff --git a/components/browser/BUILD.gn b/components/browser/BUILD.gn
+new file mode 100644
+index 0000000000..a73550aa08
+--- /dev/null
++++ b/components/browser/BUILD.gn
+@@ -0,0 +1,73 @@
++# Copyright 2026 The browser Authors
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++
++# Embeds data/fingerprints.jsonl as browser::kFingerprintsJsonl. The
++# renderer sandbox blocks file reads, so the pool has to live in the binary.
++# See embedded_data.h for the contract.
++action("embed_fingerprints_jsonl") {
++  script = "embed_text.py"
++  sources = [ "data/fingerprints.jsonl" ]
++  outputs = [ "$target_gen_dir/embedded_fingerprints_jsonl.cc" ]
++  args = [
++    "--input",
++    rebase_path(sources[0], root_build_dir),
++    "--output",
++    rebase_path(outputs[0], root_build_dir),
++    "--var",
++    "FingerprintsJsonl",
++  ]
++}
++
++# Same for data/dawn-gpu-info.json, which webgpu_identity reads in the
++# renderer when deriving adapter.info.{vendor,architecture}.
++action("embed_dawn_gpu_info_json") {
++  script = "embed_text.py"
++  sources = [ "data/dawn-gpu-info.json" ]
++  outputs = [ "$target_gen_dir/embedded_dawn_gpu_info_json.cc" ]
++  args = [
++    "--input",
++    rebase_path(sources[0], root_build_dir),
++    "--output",
++    rebase_path(outputs[0], root_build_dir),
++    "--var",
++    "DawnGpuInfoJson",
++  ]
++}
++
++component("browser_switches") {
++  sources = [
++    "audio_override.cc",
++    "audio_override.h",
++    "browser_runtime.cc",
++    "browser_runtime.h",
++    "browser_switches.cc",
++    "browser_switches.h",
++    "connection_override.cc",
++    "connection_override.h",
++    "default_voices.cc",
++    "default_voices.h",
++    "embedded_data.h",
++    "fingerprint_pool.cc",
++    "fingerprint_pool.h",
++    "font_bundles.cc",
++    "font_bundles.h",
++    "pref_names.h",
++    "switch_resolver.cc",
++    "switch_resolver.h",
++    "webgpu_identity.cc",
++    "webgpu_identity.h",
++    "webrtc_ip_spoofer.cc",
++    "webrtc_ip_spoofer.h",
++  ]
++  sources += get_target_outputs(":embed_fingerprints_jsonl")
++  sources += get_target_outputs(":embed_dawn_gpu_info_json")
++
++  defines = [ "IS_BROWSER_IMPL" ]
++
++  deps = [
++    ":embed_dawn_gpu_info_json",
++    ":embed_fingerprints_jsonl",
++    "//base",
++  ]
++}
+diff --git a/components/browser/browser_switches.cc b/components/browser/browser_switches.cc
+new file mode 100644
+index 0000000000..b9b2f90a67
+--- /dev/null
++++ b/components/browser/browser_switches.cc
+@@ -0,0 +1,163 @@
++// Copyright 2026 The browser Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/browser/browser_switches.h"
++
++namespace switches {
++
++// Master seed driving every per-switch "auto" / absent-value derivation.
++// Accepts "auto" (a per-process random seed, pinned to an integer in the
++// browser process so children inherit it) or a 32-bit signed integer. When
++// absent, per-switch resolvers keep their stock behaviour. See
++// switch_resolver.h for the resolution rules.
++const char kFingerprintSeed[] = "fingerprint-seed";
++
++// Presence-only opt-out. The browser-defaults preset (telemetry off,
++// privacy-positive features; see browser::MaybeExpandBrowserDefaults) is
++// applied on every launch; this switch skips it so the browser behaves like
++// stock Chromium.
++const char kUseChromiumDefaults[] = "use-chromium-defaults";
++
++// Browser brand (e.g. "Chrome").
++const char kFingerprintBrand[] = "fingerprint-brand";
++
++// Browser major version (e.g. "145").
++const char kFingerprintBrandVersion[] = "fingerprint-brand-version";
++
++// Full browser version (e.g. "145.0.7309.92").
++const char kFingerprintBrandVersionLong[] = "fingerprint-brand-version-long";
++
++// WebGL UNMASKED_VENDOR_WEBGL string. Also selects the per-vendor parameter
++// quirks (e.g. MAX_VERTEX_UNIFORM_VECTORS).
++const char kFingerprintGpuVendor[] = "fingerprint-gpu-vendor";
++
++// WebGL UNMASKED_RENDERER_WEBGL string, normally an ANGLE renderer string.
++const char kFingerprintGpuRenderer[] = "fingerprint-gpu-renderer";
++
++// WebGPU adapter.info.vendor, using Dawn's public token vocabulary
++// ("nvidia", "intel", "amd", "apple", "arm", "qualcomm").
++const char kFingerprintWebgpuVendor[] = "fingerprint-webgpu-vendor";
++
++// WebGPU adapter.info.architecture ("ampere", "ada", "rdna-3", "xe-lpg", ...).
++const char kFingerprintWebgpuArchitecture[] = "fingerprint-webgpu-architecture";
++
++// navigator.deviceMemory in GB. The value is snapped to the set of values
++// stock Chromium can report.
++const char kFingerprintDeviceMemory[] = "fingerprint-device-memory";
++
++// navigator.hardwareConcurrency.
++const char kFingerprintHardwareConcurrency[] =
++    "fingerprint-hardware-concurrency";
++
++// Screen geometry:
++// "width,height,availWidth,availHeight,availTop,colorDepth[,devicePixelRatio]".
++const char kFingerprintScreen[] = "fingerprint-screen";
++
++// Window position on the screen: "x,y".
++const char kFingerprintScreenPosition[] = "fingerprint-screen-position";
++
++// Media device counts: "mics,webcams,speakers" (e.g. "1,1,3").
++const char kFingerprintMedia[] = "fingerprint-media";
++
++// Battery status: "charging,level,chargingTime,dischargingTime".
++const char kFingerprintBattery[] = "fingerprint-battery";
++
++// Network Information API: "effectiveType,downlink,rtt,saveData,type".
++const char kFingerprintConnection[] = "fingerprint-connection";
++
++// CSS media features:
++// "colorScheme,reducedMotion,contrast,forcedColors,colorGamut".
++const char kFingerprintMediaFeatures[] = "fingerprint-media-features";
++
++// IANA timezone (e.g. "America/New_York").
++const char kFingerprintTimezone[] = "fingerprint-timezone";
++
++// Geolocation: "latitude,longitude,accuracy".
++const char kFingerprintGeolocation[] = "fingerprint-geolocation";
++
++// history.length.
++const char kFingerprintHistoryLength[] = "fingerprint-history-length";
++
++// Forces the HTTP Accept-Language header to a fixed value (e.g. "en")
++// regardless of the language pref and of any ReduceAcceptLanguage
++// negotiation. Chrome stable sends a single-token header to most sites, so
++// without this the verbose "en-US,en;q=0.9" form stands out on the wire.
++// Only the header changes; navigator.languages stays pref-driven. Has no
++// effect while a font bundle is active, because the bundle owns the header.
++const char kFingerprintAcceptLanguage[] = "fingerprint-accept-language";
++
++// Seed selecting a font bundle and its derived Accept-Language /
++// navigator.languages. Any string; it is hashed to seed a PRNG. When set,
++// the browser loads .ttf/.ttc files exclusively from
++// <chrome.exe dir>/browser_fonts/<bundle>/ instead of the system collection.
++const char kBrowserFontBundle[] = "browser-font-bundle";
++
++// AudioContext properties:
++// "sampleRate,baseLatency,outputLatency,maxChannelCount".
++const char kFingerprintAudioContext[] = "fingerprint-audio-context";
++
++// Skia text rasterization override applied through RendererPreferences:
++// "gamma:<float>,contrast:<float>" (either or both). Windows only.
++const char kFingerprintTextRendering[] = "fingerprint-text-rendering";
++
++// Sub-pixel perturbation amplitude (float, e.g. "0.005") for Canvas 2D
++// curve-verb control points (bezierCurveTo, quadraticCurveTo, arc, arcTo,
++// ellipse). Line verbs, text, rects and other axis-aligned geometry are
++// untouched, so CPU-canvas output stays canonical while curves pick up the
++// per-profile variance seen across real GPUs.
++const char kCanvasCurveNoise[] = "canvas-curve-noise";
++
++// Multiplicative perturbation amplitude (float, e.g. "0.01") for Gaussian
++// blur sigmas (shadowBlur and ctx.filter = 'blur(...)'). Only applied on
++// GPU-accelerated canvases so willReadFrequently contexts stay canonical.
++// The value is the maximum fractional offset: 0.01 scales sigma by a
++// factor in [0.99, 1.01].
++const char kCanvasBlurNoise[] = "canvas-blur-noise";
++
++// Additive perturbation amplitude (float, e.g. "0.005") for Canvas 2D
++// gradient color-stop offsets. GPU-only, like the blur noise. Each stop
++// moves by up to +/- the value within the [0, 1] stop range.
++const char kCanvasGradientNoise[] = "canvas-gradient-noise";
++
++// Per-profile sub-LSB perturbation amplitude (float, e.g. "5e-6") for WebGL
++// fragment shaders. The GLSL source is rewritten at shaderSource() time so
++// transcendental functions, texture sampling coordinates, gl_FragCoord and
++// the final color pick up the noise before the shader reaches ANGLE.
++// Shaders made only of constants, uniform reads and flat-color writes pass
++// through unchanged. Because the rewrite happens in the shader itself,
++// readPixels output is consistent with what the shader computes.
++const char kWebglShaderNoise[] = "webgl-shader-noise";
++
++// Per-surface multiplier overrides for the shader-noise rewriter, as
++// comma-separated name=value pairs (e.g. "klg=0,kt=0.01"). Names are the
++// nd_k* suffixes: kt kt2 kp ke klg kl kn kr kx kss km kf kc. Unset names
++// keep their calibrated default; unknown names and malformed values are
++// ignored. A tuning aid, not derived from the fingerprint seed.
++const char kWebglShaderNoiseK[] = "webgl-shader-noise-k";
++
++// IPv4 address reported in WebRTC ICE candidates and SDP.
++const char kWebrtcIP4[] = "webrtc-ip4";
++
++// IPv6 address reported in WebRTC ICE candidates and SDP.
++const char kWebrtcIP6[] = "webrtc-ip6";
++
++// Comma-separated hosts (subdomains included) that may use the software
++// secure PlayReady CDM in addition to primevideo.com and amazon.com; "*"
++// allows every origin. Other origins see the EME answers of stock Chrome.
++const char kSoftwarePlayreadySites[] = "software-playready-sites";
++
++// Presence-only. Draws a cursor overlay while a DevTools client is attached.
++const char kShowCdpCursor[] = "show-cdp-cursor";
++
++// Presence-only. navigator.credentials.create() and .get() with a publicKey
++// option short-circuit in the browser process before any platform
++// authenticator UI (Windows Hello, Touch ID) appears. After a random 1-5 s
++// delay, mimicking a user dismissing the prompt, the request rejects with
++// NotAllowedError, the same DOMException a site sees after a real cancel.
++// isUserVerifyingPlatformAuthenticatorAvailable() and
++// isConditionalMediationAvailable() keep their truthful answers so the site
++// sees no inconsistency between "authenticator available" and "declined".
++const char kAutoDeclineWebauthn[] = "auto-decline-webauthn";
++
++}  // namespace switches
+diff --git a/components/browser/browser_switches.h b/components/browser/browser_switches.h
+new file mode 100644
+index 0000000000..f31529c98e
+--- /dev/null
++++ b/components/browser/browser_switches.h
+@@ -0,0 +1,72 @@
++// Copyright 2026 The browser Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// Command-line switches for the fingerprint surface. Each switch is
++// documented next to its definition in browser_switches.cc. Most value
++// switches also accept "auto" and "seed:<N>"; see switch_resolver.h.
++
++#ifndef COMPONENTS_BROWSER_BROWSER_SWITCHES_H_
++#define COMPONENTS_BROWSER_BROWSER_SWITCHES_H_
++
++#include "base/component_export.h"
++
++namespace switches {
++
++// Master seed and presets.
++COMPONENT_EXPORT(BROWSER) extern const char kFingerprintSeed[];
++COMPONENT_EXPORT(BROWSER) extern const char kUseChromiumDefaults[];
++
++// Brand and version.
++COMPONENT_EXPORT(BROWSER) extern const char kFingerprintBrand[];
++COMPONENT_EXPORT(BROWSER) extern const char kFingerprintBrandVersion[];
++COMPONENT_EXPORT(BROWSER) extern const char kFingerprintBrandVersionLong[];
++
++// GPU.
++COMPONENT_EXPORT(BROWSER) extern const char kFingerprintGpuVendor[];
++COMPONENT_EXPORT(BROWSER) extern const char kFingerprintGpuRenderer[];
++COMPONENT_EXPORT(BROWSER) extern const char kFingerprintWebgpuVendor[];
++COMPONENT_EXPORT(BROWSER) extern const char kFingerprintWebgpuArchitecture[];
++
++// Hardware, screen and devices.
++COMPONENT_EXPORT(BROWSER) extern const char kFingerprintDeviceMemory[];
++COMPONENT_EXPORT(BROWSER) extern const char kFingerprintHardwareConcurrency[];
++COMPONENT_EXPORT(BROWSER) extern const char kFingerprintScreen[];
++COMPONENT_EXPORT(BROWSER) extern const char kFingerprintScreenPosition[];
++COMPONENT_EXPORT(BROWSER) extern const char kFingerprintMedia[];
++COMPONENT_EXPORT(BROWSER) extern const char kFingerprintBattery[];
++COMPONENT_EXPORT(BROWSER) extern const char kFingerprintConnection[];
++COMPONENT_EXPORT(BROWSER) extern const char kFingerprintMediaFeatures[];
++
++// Locale and environment.
++COMPONENT_EXPORT(BROWSER) extern const char kFingerprintTimezone[];
++COMPONENT_EXPORT(BROWSER) extern const char kFingerprintGeolocation[];
++COMPONENT_EXPORT(BROWSER) extern const char kFingerprintHistoryLength[];
++COMPONENT_EXPORT(BROWSER) extern const char kFingerprintAcceptLanguage[];
++COMPONENT_EXPORT(BROWSER) extern const char kBrowserFontBundle[];
++
++// Audio.
++COMPONENT_EXPORT(BROWSER) extern const char kFingerprintAudioContext[];
++
++// Rendering noise.
++COMPONENT_EXPORT(BROWSER) extern const char kFingerprintTextRendering[];
++COMPONENT_EXPORT(BROWSER) extern const char kCanvasCurveNoise[];
++COMPONENT_EXPORT(BROWSER) extern const char kCanvasBlurNoise[];
++COMPONENT_EXPORT(BROWSER) extern const char kCanvasGradientNoise[];
++COMPONENT_EXPORT(BROWSER) extern const char kWebglShaderNoise[];
++COMPONENT_EXPORT(BROWSER) extern const char kWebglShaderNoiseK[];
++
++// Networking.
++COMPONENT_EXPORT(BROWSER) extern const char kWebrtcIP4[];
++COMPONENT_EXPORT(BROWSER) extern const char kWebrtcIP6[];
++
++// Media.
++COMPONENT_EXPORT(BROWSER) extern const char kSoftwarePlayreadySites[];
++
++// Automation.
++COMPONENT_EXPORT(BROWSER) extern const char kShowCdpCursor[];
++COMPONENT_EXPORT(BROWSER) extern const char kAutoDeclineWebauthn[];
++
++}  // namespace switches
++
++#endif  // COMPONENTS_BROWSER_BROWSER_SWITCHES_H_
+diff --git a/components/browser/switch_resolver.cc b/components/browser/switch_resolver.cc
+new file mode 100644
+index 0000000000..87386d0e39
+--- /dev/null
++++ b/components/browser/switch_resolver.cc
+@@ -0,0 +1,135 @@
++// Copyright 2026 The browser Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/browser/switch_resolver.h"
++
++#include <optional>
++#include <string>
++#include <string_view>
++
++#include "base/command_line.h"
++#include "base/rand_util.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_util.h"
++#include "components/browser/browser_switches.h"
++
++namespace browser {
++
++namespace {
++
++constexpr std::string_view kAutoLiteral = "auto";
++constexpr std::string_view kSeedPrefix = "seed:";
++
++// What --fingerprint-seed said on the command line. Trivially destructible,
++// so it lives in a plain function-local static rather than
++// base::NoDestructor.
++struct MasterSeedSwitch {
++  bool requested = false;
++  std::optional<int32_t> explicit_seed;
++};
++
++const MasterSeedSwitch& GetMasterSeedSwitch() {
++  static const MasterSeedSwitch state = []() {
++    MasterSeedSwitch s;
++    const base::CommandLine* cl = base::CommandLine::ForCurrentProcess();
++    if (!cl->HasSwitch(switches::kFingerprintSeed)) {
++      return s;
++    }
++    s.requested = true;
++    const std::string value =
++        cl->GetSwitchValueASCII(switches::kFingerprintSeed);
++    int parsed = 0;
++    if (value != kAutoLiteral && base::StringToInt(value, &parsed)) {
++      s.explicit_seed = parsed;
++    }
++    // "auto" and unparseable values leave explicit_seed empty; MasterSeed()
++    // then allocates a random seed. The switch still counts as requested,
++    // so per-switch resolvers derive on absence.
++    return s;
++  }();
++  return state;
++}
++
++}  // namespace
++
++uint32_t DeterministicBucket(int32_t seed, int32_t salt, uint32_t range) {
++  constexpr int64_t kKnuth = 2654435761LL;
++  const int64_t masked =
++      (static_cast<int64_t>(seed) * kKnuth + static_cast<int64_t>(salt)) &
++      0x7FFFFFFFLL;
++  return static_cast<uint32_t>(masked) % range;
++}
++
++float ResolveLinearNoiseSwitch(const char* switch_name,
++                               int32_t salt,
++                               double lo,
++                               double hi) {
++  return ResolveSwitch<float>(
++             switch_name,
++             [](const std::string& value) -> std::optional<float> {
++               double parsed = 0.0;
++               if (!base::StringToDouble(value, &parsed)) {
++                 return std::nullopt;
++               }
++               return static_cast<float>(parsed);
++             },
++             [salt, lo, hi](int32_t seed) -> float {
++               const uint32_t step = DeterministicBucket(seed, salt, 201);
++               return static_cast<float>(lo + step * (hi - lo) / 200.0);
++             },
++             /*fallback_when_absent=*/0.0f)
++      .value;
++}
++
++bool MasterSeedRequested() {
++  return GetMasterSeedSwitch().requested;
++}
++
++int32_t MasterSeed() {
++  // Thread-safe local-static initialization: base::RandUint64() runs at
++  // most once per process.
++  static const int32_t seed = []() {
++    const MasterSeedSwitch& s = GetMasterSeedSwitch();
++    if (s.explicit_seed.has_value()) {
++      return *s.explicit_seed;
++    }
++    // Masked to 31 bits so a random seed sits in the same non-negative
++    // range the launcher generates. Negative explicit seeds still work,
++    // since DeterministicBucket promotes to int64.
++    return static_cast<int32_t>(base::RandUint64() & 0x7FFFFFFFu);
++  }();
++  return seed;
++}
++
++namespace internal {
++
++RawSwitch ParseRawSwitch(const char* switch_name) {
++  RawSwitch out;
++  const base::CommandLine* cl = base::CommandLine::ForCurrentProcess();
++  if (!cl->HasSwitch(switch_name)) {
++    return out;
++  }
++  std::string raw = cl->GetSwitchValueASCII(switch_name);
++  if (raw == kAutoLiteral) {
++    out.mode = RawMode::kAuto;
++    return out;
++  }
++  int parsed = 0;
++  if (base::StartsWith(raw, kSeedPrefix) &&
++      base::StringToInt(std::string_view(raw).substr(kSeedPrefix.size()),
++                        &parsed)) {
++    out.mode = RawMode::kSeed;
++    out.seed = parsed;
++    return out;
++  }
++  // Anything else, including a "seed:" prefix with an unparseable suffix,
++  // is handed to the caller's explicit parser.
++  out.mode = RawMode::kExplicit;
++  out.explicit_value = std::move(raw);
++  return out;
++}
++
++}  // namespace internal
++
++}  // namespace browser
+diff --git a/components/browser/switch_resolver.h b/components/browser/switch_resolver.h
+new file mode 100644
+index 0000000000..1d21233df0
+--- /dev/null
++++ b/components/browser/switch_resolver.h
+@@ -0,0 +1,169 @@
++// Copyright 2026 The browser Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// Lets every fingerprint switch accept three input forms, an explicit value,
++// "auto" or "seed:<N>", without changing the explicit-value parse path.
++//
++// ResolveSwitch<T>() walks this hierarchy:
++//
++//   1. Explicit value (anything but "auto" / "seed:<N>"): parse_explicit()
++//      runs. A value that fails to parse counts as absent rather than
++//      falling through to derivation, so a typo never silently becomes a
++//      different spoofed value.
++//   2. "auto": derive_from_seed(MasterSeed()). Allocates the random master
++//      seed if --fingerprint-seed is absent.
++//   3. "seed:<N>": derive_from_seed(N).
++//   4. Absent with --fingerprint-seed set: derive_from_seed(MasterSeed()),
++//      unless inherit_from_master_seed is false. That opt-out is for
++//      surfaces that should not activate merely because a master seed
++//      exists (history length, media counts, screen, screen position, media
++//      features); they then behave like (5).
++//   5. Absent with --fingerprint-seed absent: fallback_when_absent, with no
++//      derivation and no RNG allocation. Stock behaviour for users who set
++//      no fingerprint switch at all.
++
++#ifndef COMPONENTS_BROWSER_SWITCH_RESOLVER_H_
++#define COMPONENTS_BROWSER_SWITCH_RESOLVER_H_
++
++#include <cstdint>
++#include <optional>
++#include <string>
++#include <utility>
++
++#include "base/component_export.h"
++#include "base/functional/function_ref.h"
++#include "base/notreached.h"
++
++namespace browser {
++
++// Salts for the deterministic per-surface derivations. Values below 79 are
++// shared with the launcher, which derives some surfaces itself, so a given
++// seed produces the same result on both sides; 41 (text rendering) and 61
++// are reserved there. Values from 79 on are browser-only.
++inline constexpr int32_t kSaltCanvasCurve = 47;
++inline constexpr int32_t kSaltCanvasBlur = 59;
++inline constexpr int32_t kSaltCanvasGradient = 67;
++inline constexpr int32_t kSaltFontBundle = 71;
++inline constexpr int32_t kSaltWebglShaderNoise = 73;
++inline constexpr int32_t kSaltHistoryLength = 79;
++inline constexpr int32_t kSaltMediaMics = 83;
++inline constexpr int32_t kSaltMediaWebcams = 89;
++inline constexpr int32_t kSaltMediaSpeakers = 97;
++// Picks a coherent profile from the embedded pool (fingerprint_pool.h).
++inline constexpr int32_t kSaltProfilePick = 101;
++// Window position on the screen.
++inline constexpr int32_t kSaltScreenPosX = 103;
++inline constexpr int32_t kSaltScreenPosY = 107;
++// Battery, only used when the profile's device type is "laptop".
++inline constexpr int32_t kSaltBatteryCharging = 109;
++inline constexpr int32_t kSaltBatteryLevel = 113;
++inline constexpr int32_t kSaltBatteryTime = 127;
++// Network conditions.
++inline constexpr int32_t kSaltConnectionType = 131;
++inline constexpr int32_t kSaltConnectionDownlink = 137;
++inline constexpr int32_t kSaltConnectionRtt = 139;
++
++// Returns a deterministic bucket in [0, range) by mixing `seed` and `salt`
++// with Knuth's multiplicative hash, `(seed * 2654435761 + salt) & 0x7FFFFFFF`
++// in 64-bit arithmetic, taken modulo `range`. The launcher reproduces it
++// bit for bit. `range` must be > 0.
++COMPONENT_EXPORT(BROWSER)
++uint32_t DeterministicBucket(int32_t seed, int32_t salt, uint32_t range);
++
++// Resolves a float noise-amplitude switch. An explicit value is parsed as a
++// decimal number; "auto", "seed:<N>" and an inherited master seed derive a
++// value in [lo, hi] in 201 linear steps from (seed, salt); an absent switch
++// resolves to 0 (noise off).
++COMPONENT_EXPORT(BROWSER)
++float ResolveLinearNoiseSwitch(const char* switch_name,
++                               int32_t salt,
++                               double lo,
++                               double hi);
++
++// True iff --fingerprint-seed is on the command line at all, as "auto" or
++// as an integer. Per-switch resolvers branch on this when their own switch
++// is absent: it is the opt-in that lets them derive without changing stock
++// behaviour for users who set neither switch.
++COMPONENT_EXPORT(BROWSER) bool MasterSeedRequested();
++
++// Returns the master seed:
++//   --fingerprint-seed=<int>  -> that integer;
++//   --fingerprint-seed=auto   -> a random seed allocated on the first call
++//                                and cached for the process lifetime;
++//   absent or unparseable     -> the same lazy random allocation.
++// Gate on MasterSeedRequested() first unless a random seed is acceptable.
++COMPONENT_EXPORT(BROWSER) int32_t MasterSeed();
++
++// Where a resolved value came from.
++enum class SwitchSource {
++  // Switch absent and --fingerprint-seed absent; `value` is the fallback.
++  kAbsent,
++  // Switch had an explicit value that parsed successfully.
++  kExplicit,
++  // Switch was "auto", or absent with --fingerprint-seed set.
++  kAuto,
++  // Switch was "seed:<N>".
++  kSeedOverride,
++};
++
++template <typename T>
++struct ResolvedSwitch {
++  SwitchSource source;
++  T value;
++};
++
++namespace internal {
++
++// Classification of a single switch's raw command-line value.
++enum class RawMode {
++  kAbsent,
++  kAuto,
++  kSeed,      // "seed:<N>" with N parseable as int32
++  kExplicit,  // anything else
++};
++
++struct RawSwitch {
++  RawMode mode = RawMode::kAbsent;
++  std::string explicit_value;  // populated for kExplicit
++  int32_t seed = 0;            // populated for kSeed
++};
++
++COMPONENT_EXPORT(BROWSER) RawSwitch ParseRawSwitch(const char* switch_name);
++
++}  // namespace internal
++
++template <typename T>
++ResolvedSwitch<T> ResolveSwitch(
++    const char* switch_name,
++    base::FunctionRef<std::optional<T>(const std::string&)> parse_explicit,
++    base::FunctionRef<T(int32_t seed)> derive_from_seed,
++    T fallback_when_absent,
++    bool inherit_from_master_seed = true) {
++  const internal::RawSwitch raw = internal::ParseRawSwitch(switch_name);
++  switch (raw.mode) {
++    case internal::RawMode::kExplicit: {
++      std::optional<T> parsed = parse_explicit(raw.explicit_value);
++      if (parsed.has_value()) {
++        return {SwitchSource::kExplicit, std::move(*parsed)};
++      }
++      return {SwitchSource::kAbsent, std::move(fallback_when_absent)};
++    }
++    case internal::RawMode::kSeed:
++      return {SwitchSource::kSeedOverride, derive_from_seed(raw.seed)};
++    case internal::RawMode::kAuto:
++      // An explicit "auto" always derives: the user opted in for this
++      // surface specifically, whatever inherit_from_master_seed says.
++      return {SwitchSource::kAuto, derive_from_seed(MasterSeed())};
++    case internal::RawMode::kAbsent:
++      if (!inherit_from_master_seed || !MasterSeedRequested()) {
++        return {SwitchSource::kAbsent, std::move(fallback_when_absent)};
++      }
++      return {SwitchSource::kAuto, derive_from_seed(MasterSeed())};
++  }
++  NOTREACHED();
++}
++
++}  // namespace browser
++
++#endif  // COMPONENTS_BROWSER_SWITCH_RESOLVER_H_
+diff --git a/content/browser/renderer_host/render_process_host_impl.cc b/content/browser/renderer_host/render_process_host_impl.cc
+index 0bdd753a19..6ed881c753 100644
+--- a/content/browser/renderer_host/render_process_host_impl.cc
++++ b/content/browser/renderer_host/render_process_host_impl.cc
+@@ -72,6 +72,7 @@
+ #include "base/tracing/protos/chrome_track_event.pbzero.h"
+ #include "build/build_config.h"
+ #include "cc/base/switches.h"
++#include "components/browser/browser_switches.h"
+ #include "components/embedder_support/switches.h"
+ #include "components/input/features.h"
+ #include "components/input/utils.h"
+@@ -3891,6 +3892,36 @@ void RenderProcessHostImpl::PropagateBrowserCommandLineToRenderer(
+       switches::kEnableWebGLDraftExtensions,
+       switches::kEnableWebGPUDeveloperFeatures,
+       switches::kFileUrlPathAlias,
++      // browser: fingerprint switches every renderer must see.
++      switches::kFingerprintBrand,
++      switches::kFingerprintBrandVersion,
++      switches::kFingerprintBrandVersionLong,
++      switches::kFingerprintGpuVendor,
++      switches::kFingerprintGpuRenderer,
++      switches::kFingerprintWebgpuVendor,
++      switches::kFingerprintWebgpuArchitecture,
++      switches::kFingerprintDeviceMemory,
++      switches::kFingerprintHardwareConcurrency,
++      switches::kFingerprintMedia,
++      switches::kBrowserFontBundle,
++      switches::kFingerprintSeed,
++      switches::kFingerprintTextRendering,
++      switches::kCanvasCurveNoise,
++      switches::kCanvasBlurNoise,
++      switches::kCanvasGradientNoise,
++      switches::kWebglShaderNoise,
++      switches::kWebglShaderNoiseK,
++      switches::kFingerprintTimezone,
++      switches::kFingerprintGeolocation,
++      switches::kFingerprintScreen,
++      switches::kFingerprintScreenPosition,
++      switches::kFingerprintHistoryLength,
++      switches::kFingerprintAudioContext,
++      switches::kFingerprintBattery,
++      switches::kWebrtcIP4,
++      switches::kWebrtcIP6,
++      switches::kFingerprintConnection,
++      switches::kFingerprintMediaFeatures,
+       switches::kForceDeviceScaleFactor,
+       switches::kForceDisplayColorProfile,
+       switches::kForceHighContrast,
+diff --git a/content/public/browser/BUILD.gn b/content/public/browser/BUILD.gn
+index 746dd6b3e6..eaa4664880 100644
+--- a/content/public/browser/BUILD.gn
++++ b/content/public/browser/BUILD.gn
+@@ -627,6 +627,7 @@ source_set("browser_sources") {
+   ]
+   deps = [
+     "//cc",
++    "//components/browser:browser_switches",
+     "//components/input",
+     "//components/language_detection/content/browser",
+     "//components/language_detection/content/common",
+diff --git a/third_party/blink/common/BUILD.gn b/third_party/blink/common/BUILD.gn
+index 37ca8d47e3..e7ccea8ada 100644
+--- a/third_party/blink/common/BUILD.gn
++++ b/third_party/blink/common/BUILD.gn
+@@ -306,6 +306,7 @@ source_set("common") {
+     "//base",
+     "//build:android_buildflags",
+     "//build:chromecast_buildflags",
++    "//components/browser:browser_switches",
+     "//media/capture:capture_base",
+     "//media/capture/mojom:video_capture_mojom_support",
+     "//mojo/public/cpp/system",
+diff --git a/third_party/blink/renderer/core/BUILD.gn b/third_party/blink/renderer/core/BUILD.gn
+index 8969a71c82..f28bb0e093 100644
+--- a/third_party/blink/renderer/core/BUILD.gn
++++ b/third_party/blink/renderer/core/BUILD.gn
+@@ -408,6 +408,7 @@ component("core") {
+     ":make_deprecation_info",
+     ":xml_ffi",
+     "//base",
++    "//components/browser:browser_switches",
+     "//components/paint_preview/common",
+     "//components/performance_manager/public/mojom:mojom_blink",
+     "//components/shared_highlighting/core/common",

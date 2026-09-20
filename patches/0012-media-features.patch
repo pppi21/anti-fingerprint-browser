@@ -1,0 +1,296 @@
+From 0c7c0fb67b8429569e611d87ebbc0f00c3203918 Mon Sep 17 00:00:00 2001
+From: Leo Rodarte <leorodarte07@gmail.com>
+Date: Sat, 19 Sep 2026 23:45:20 -0400
+Subject: [PATCH 12/41] media-features
+
+CSS media-features spoof.
+---
+ .../blink/renderer/core/css/media_values.cc   | 219 +++++++++++++++++-
+ 1 file changed, 209 insertions(+), 10 deletions(-)
+
+diff --git a/third_party/blink/renderer/core/css/media_values.cc b/third_party/blink/renderer/core/css/media_values.cc
+index 0d60244742..a91e58aac6 100644
+--- a/third_party/blink/renderer/core/css/media_values.cc
++++ b/third_party/blink/renderer/core/css/media_values.cc
+@@ -4,6 +4,13 @@
+ 
+ #include "third_party/blink/renderer/core/css/media_values.h"
+ 
++#include <optional>
++
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_split.h"
++#include "components/browser/browser_switches.h"
++#include "components/browser/fingerprint_pool.h"
++#include "components/browser/switch_resolver.h"
+ #include "third_party/blink/public/common/css/scripting.h"
+ #include "third_party/blink/renderer/core/css/css_resolution_units.h"
+ #include "third_party/blink/renderer/core/css/css_to_length_conversion_data.h"
+@@ -33,6 +40,152 @@
+ 
+ namespace blink {
+ 
++namespace {
++
++// browser: the CSS media features reported to pages, resolved once per
++// process from --fingerprint-media-features
++// ("colorScheme,reducedMotion,contrast,forcedColors,colorGamut", "auto" or
++// "seed:<N>"). Cached because every style recalc evaluating these features
++// would otherwise pay the parse.
++struct FingerprintMediaFeatures {
++  bool active = false;
++  // nullopt passes color_scheme through to stock; the other fields always
++  // override while active.
++  std::optional<mojom::blink::PreferredColorScheme> color_scheme;
++  bool reduced_motion = false;
++  mojom::blink::PreferredContrast contrast =
++      mojom::blink::PreferredContrast::kNoPreference;
++  ForcedColors forced_colors = ForcedColors::kNone;
++  ColorSpaceGamut color_gamut = ColorSpaceGamut::SRGB;
++};
++
++std::optional<mojom::blink::PreferredColorScheme> ParseColorScheme(
++    const std::string& value) {
++  if (value == "dark") {
++    return mojom::blink::PreferredColorScheme::kDark;
++  }
++  if (value == "light") {
++    return mojom::blink::PreferredColorScheme::kLight;
++  }
++  return std::nullopt;
++}
++
++mojom::blink::PreferredContrast ParseContrast(const std::string& value) {
++  if (value == "more") {
++    return mojom::blink::PreferredContrast::kMore;
++  }
++  if (value == "less") {
++    return mojom::blink::PreferredContrast::kLess;
++  }
++  if (value == "custom") {
++    return mojom::blink::PreferredContrast::kCustom;
++  }
++  return mojom::blink::PreferredContrast::kNoPreference;
++}
++
++ColorSpaceGamut ParseColorGamut(const std::string& value) {
++  if (value == "rec2020") {
++    return ColorSpaceGamut::BT2020;
++  }
++  if (value == "p3") {
++    return ColorSpaceGamut::P3;
++  }
++  return ColorSpaceGamut::SRGB;
++}
++
++const FingerprintMediaFeatures& CachedFingerprintMediaFeatures() {
++  static const FingerprintMediaFeatures features =
++      browser::ResolveSwitch<FingerprintMediaFeatures>(
++          ::switches::kFingerprintMediaFeatures,
++          [](const std::string& value)
++              -> std::optional<FingerprintMediaFeatures> {
++            std::vector<std::string> parts = base::SplitString(
++                value, ",", base::TRIM_WHITESPACE, base::SPLIT_WANT_NONEMPTY);
++            if (parts.size() != 5) {
++              return std::nullopt;
++            }
++            FingerprintMediaFeatures result;
++            result.active = true;
++            result.color_scheme = ParseColorScheme(parts[0]);
++            result.reduced_motion = parts[1] == "reduce";
++            result.contrast = ParseContrast(parts[2]);
++            result.forced_colors = parts[3] == "active" ? ForcedColors::kActive
++                                                        : ForcedColors::kNone;
++            result.color_gamut = ParseColorGamut(parts[4]);
++            return result;
++          },
++          [](int32_t seed) -> FingerprintMediaFeatures {
++            // Only the color scheme and gamut come from the profile; the
++            // other fields keep their defaults.
++            const browser::FingerprintProfile* profile =
++                browser::ProfileForSeed(seed);
++            if (!profile) {
++              return {};
++            }
++            FingerprintMediaFeatures result;
++            result.active = true;
++            result.color_scheme =
++                ParseColorScheme(profile->prefers_color_scheme);
++            result.color_gamut = ParseColorGamut(profile->color_gamut);
++            return result;
++          },
++          FingerprintMediaFeatures{},
++          /*inherit_from_master_seed=*/false)
++          .value;
++  return features;
++}
++
++// browser: the screen size fields of --fingerprint-screen, for the
++// device-width and device-height media features. Each field is optional on
++// its own; a field that is absent or fails to parse stays real.
++struct DeviceSize {
++  std::optional<int> width;
++  std::optional<int> height;
++};
++
++const DeviceSize& CachedDeviceSize() {
++  static const DeviceSize size =
++      browser::ResolveSwitch<DeviceSize>(
++          ::switches::kFingerprintScreen,
++          [](const std::string& value) -> std::optional<DeviceSize> {
++            std::vector<std::string> parts = base::SplitString(
++                value, ",", base::TRIM_WHITESPACE, base::SPLIT_WANT_NONEMPTY);
++            if (parts.size() < 6) {
++              return std::nullopt;
++            }
++            DeviceSize result;
++            int width = -1;
++            int height = -1;
++            base::StringToInt(parts[0], &width);
++            base::StringToInt(parts[1], &height);
++            if (width >= 0) {
++              result.width = width;
++            }
++            if (height >= 0) {
++              result.height = height;
++            }
++            return result;
++          },
++          [](int32_t seed) -> DeviceSize {
++            const browser::FingerprintProfile* profile =
++                browser::ProfileForSeed(seed);
++            DeviceSize result;
++            if (profile && profile->screen_width >= 0) {
++              result.width = profile->screen_width;
++            }
++            if (profile && profile->screen_height >= 0) {
++              result.height = profile->screen_height;
++            }
++            return result;
++          },
++          DeviceSize(),
++          /*inherit_from_master_seed=*/false)
++          .value;
++  return size;
++}
++
++}  // namespace
++
+ ForcedColors CSSValueIDToForcedColors(CSSValueID id) {
+   switch (id) {
+     case CSSValueID::kActive:
+@@ -164,6 +317,11 @@ double MediaValues::CalculateDynamicViewportHeight(LocalFrame* frame) {
+ 
+ int MediaValues::CalculateDeviceWidth(LocalFrame* frame) {
+   DCHECK(frame && frame->View() && frame->GetSettings() && frame->GetPage());
++
++  if (const std::optional<int>& width = CachedDeviceSize().width) {
++    return *width;
++  }
++
+   const display::ScreenInfo& screen_info =
+       frame->GetPage()->GetChromeClient().GetScreenInfo(*frame);
+   int device_width = screen_info.rect.width();
+@@ -176,6 +334,11 @@ int MediaValues::CalculateDeviceWidth(LocalFrame* frame) {
+ 
+ int MediaValues::CalculateDeviceHeight(LocalFrame* frame) {
+   DCHECK(frame && frame->View() && frame->GetSettings() && frame->GetPage());
++
++  if (const std::optional<int>& height = CachedDeviceSize().height) {
++    return *height;
++  }
++
+   const display::ScreenInfo& screen_info =
+       frame->GetPage()->GetChromeClient().GetScreenInfo(*frame);
+   int device_height = screen_info.rect.height();
+@@ -389,8 +552,16 @@ ColorSpaceGamut MediaValues::CalculateColorGamut(LocalFrame* frame) {
+       frame->GetPage()->GetMediaFeatureOverrides();
+   std::optional<ColorSpaceGamut> override_value =
+       overrides ? overrides->GetColorGamut() : std::nullopt;
+-  return override_value.value_or(color_space_utilities::GetColorSpaceGamut(
+-      frame->GetPage()->GetChromeClient().GetScreenInfo(*frame)));
++  if (override_value.has_value()) {
++    return override_value.value();
++  }
++  // browser
++  if (const FingerprintMediaFeatures& spoof = CachedFingerprintMediaFeatures();
++      spoof.active) {
++    return spoof.color_gamut;
++  }
++  return color_space_utilities::GetColorSpaceGamut(
++      frame->GetPage()->GetChromeClient().GetScreenInfo(*frame));
+ }
+ 
+ mojom::blink::PreferredColorScheme MediaValues::CalculatePreferredColorScheme(
+@@ -412,8 +583,15 @@ mojom::blink::PreferredColorScheme MediaValues::CalculatePreferredColorScheme(
+   std::optional<mojom::blink::PreferredColorScheme> preference_override_value =
+       preference_overrides ? preference_overrides->GetPreferredColorScheme()
+                            : std::nullopt;
+-  return preference_override_value.value_or(
+-      frame->GetDocument()->GetStyleEngine().GetPreferredColorScheme());
++  if (preference_override_value.has_value()) {
++    return preference_override_value.value();
++  }
++  // browser
++  if (const FingerprintMediaFeatures& spoof = CachedFingerprintMediaFeatures();
++      spoof.active && spoof.color_scheme.has_value()) {
++    return spoof.color_scheme.value();
++  }
++  return frame->GetDocument()->GetStyleEngine().GetPreferredColorScheme();
+ }
+ 
+ mojom::blink::PreferredContrast MediaValues::CalculatePreferredContrast(
+@@ -434,8 +612,15 @@ mojom::blink::PreferredContrast MediaValues::CalculatePreferredContrast(
+   std::optional<mojom::blink::PreferredContrast> preference_override_value =
+       preference_overrides ? preference_overrides->GetPreferredContrast()
+                            : std::nullopt;
+-  return preference_override_value.value_or(
+-      frame->GetSettings()->GetPreferredContrast());
++  if (preference_override_value.has_value()) {
++    return preference_override_value.value();
++  }
++  // browser
++  if (const FingerprintMediaFeatures& spoof = CachedFingerprintMediaFeatures();
++      spoof.active) {
++    return spoof.contrast;
++  }
++  return frame->GetSettings()->GetPreferredContrast();
+ }
+ 
+ bool MediaValues::CalculatePrefersReducedMotion(LocalFrame* frame) {
+@@ -454,8 +639,15 @@ bool MediaValues::CalculatePrefersReducedMotion(LocalFrame* frame) {
+   std::optional<bool> preference_override_value =
+       preference_overrides ? preference_overrides->GetPrefersReducedMotion()
+                            : std::nullopt;
+-  return preference_override_value.value_or(
+-      frame->GetSettings()->GetPrefersReducedMotion());
++  if (preference_override_value.has_value()) {
++    return preference_override_value.value();
++  }
++  // browser
++  if (const FingerprintMediaFeatures& spoof = CachedFingerprintMediaFeatures();
++      spoof.active) {
++    return spoof.reduced_motion;
++  }
++  return frame->GetSettings()->GetPrefersReducedMotion();
+ }
+ 
+ bool MediaValues::CalculatePrefersReducedData(LocalFrame* frame) {
+@@ -506,8 +698,15 @@ ForcedColors MediaValues::CalculateForcedColors(LocalFrame* frame) {
+       frame->GetPage()->GetMediaFeatureOverrides();
+   std::optional<ForcedColors> override_value =
+       overrides ? overrides->GetForcedColors() : std::nullopt;
+-  return override_value.value_or(
+-      frame->GetDocument()->GetStyleEngine().GetForcedColors());
++  if (override_value.has_value()) {
++    return override_value.value();
++  }
++  // browser
++  if (const FingerprintMediaFeatures& spoof = CachedFingerprintMediaFeatures();
++      spoof.active) {
++    return spoof.forced_colors;
++  }
++  return frame->GetDocument()->GetStyleEngine().GetForcedColors();
+ }
+ 
+ NavigationControls MediaValues::CalculateNavigationControls(LocalFrame* frame) {

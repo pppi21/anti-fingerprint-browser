@@ -1,0 +1,422 @@
+From cf869a28c0d57b4204ad31b8bce359516e9a4be8 Mon Sep 17 00:00:00 2001
+From: Leo Rodarte <leorodarte07@gmail.com>
+Date: Sat, 19 Sep 2026 23:45:31 -0400
+Subject: [PATCH 18/41] screen
+
+screen/window geometry spoof.
+---
+ .../renderer/core/frame/local_dom_window.cc   | 81 ++++++++++++---
+ .../blink/renderer/core/frame/screen.cc       | 98 +++++++++++++++++--
+ ui/display/BUILD.gn                           |  1 +
+ ui/display/display.cc                         | 65 ++++++++++--
+ 4 files changed, 215 insertions(+), 30 deletions(-)
+
+diff --git a/third_party/blink/renderer/core/frame/local_dom_window.cc b/third_party/blink/renderer/core/frame/local_dom_window.cc
+index 74cc1c0b51..eb187c9ef8 100644
+--- a/third_party/blink/renderer/core/frame/local_dom_window.cc
++++ b/third_party/blink/renderer/core/frame/local_dom_window.cc
+@@ -32,11 +32,16 @@
+ 
+ #include "base/command_line.h"
+ #include "base/metrics/histogram_macros.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_split.h"
+ #include "base/task/single_thread_task_runner.h"
+ #include "base/trace_event/trace_id_helper.h"
+ #include "base/trace_event/typed_macros.h"
+ #include "build/build_config.h"
+ #include "cc/input/snap_selection_strategy.h"
++#include "components/browser/browser_switches.h"
++#include "components/browser/fingerprint_pool.h"
++#include "components/browser/switch_resolver.h"
+ #include "net/base/registry_controlled_domains/registry_controlled_domain.h"
+ #include "net/storage_access_api/status.h"
+ #include "third_party/blink/public/common/features.h"
+@@ -201,6 +206,45 @@ int RequestAnimationFrame(Document* document,
+                                          FrameCallbackType::kWebExposed);
+ }
+ 
++// browser: window.screenX/screenY, resolved once per process from
++// --fingerprint-screen-position ("x,y", "auto" or "seed:<N>"); nullopt when
++// not spoofed. The derived position is that of a maximized window, x and y
++// in [0, 8].
++struct ScreenPosition {
++  int x = 0;
++  int y = 0;
++};
++
++const std::optional<ScreenPosition>& GetScreenPosition() {
++  static const std::optional<ScreenPosition> spoof =
++      browser::ResolveSwitch<std::optional<ScreenPosition>>(
++          ::switches::kFingerprintScreenPosition,
++          [](const std::string& value)
++              -> std::optional<std::optional<ScreenPosition>> {
++            std::vector<std::string> parts = base::SplitString(
++                value, ",", base::TRIM_WHITESPACE, base::SPLIT_WANT_NONEMPTY);
++            ScreenPosition result;
++            if (parts.size() != 2 || !base::StringToInt(parts[0], &result.x) ||
++                !base::StringToInt(parts[1], &result.y)) {
++              return std::nullopt;
++            }
++            return result;
++          },
++          [](int32_t seed) -> std::optional<ScreenPosition> {
++            if (!browser::ProfileForSeed(seed)) {
++              return std::nullopt;
++            }
++            return ScreenPosition{static_cast<int>(browser::DeterministicBucket(
++                                      seed, browser::kSaltScreenPosX, 9)),
++                                  static_cast<int>(browser::DeterministicBucket(
++                                      seed, browser::kSaltScreenPosY, 9))};
++          },
++          std::nullopt,
++          /*inherit_from_master_seed=*/false)
++          .value;
++  return spoof;
++}
++
+ }  // namespace
+ 
+ class LocalDOMWindow::NetworkStateObserver final
+@@ -1785,23 +1829,28 @@ int LocalDOMWindow::screenX() const {
+     return 0;
+   }
+ 
++  // browser: the real value is computed first so the per-call cost matches
++  // stock.
+   Page* page = frame->GetPage();
+   if (!page) {
+     return 0;
+   }
+ 
+   ChromeClient& chrome_client = page->GetChromeClient();
++  int real;
+   if (page->GetSettings().GetReportScreenSizeInPhysicalPixelsQuirk()) {
+-    return static_cast<int>(
++    real = static_cast<int>(
+         lroundf(chrome_client.RootWindowRect(*frame).x() *
+                 chrome_client.GetScreenInfo(*frame).device_scale_factor));
++  } else {
++    real = chrome_client.RootWindowRect(*frame).x();
++    if (document() && document()->TextScaleMetaTagPresent()) {
++      real = static_cast<int>(lroundf(
++          real * chrome_client.GetScreenInfo(*frame).text_scale_multiplier));
++    }
+   }
+-  int screenX = chrome_client.RootWindowRect(*frame).x();
+-  if (document() && document()->TextScaleMetaTagPresent()) {
+-    screenX = static_cast<int>(lroundf(
+-        screenX * chrome_client.GetScreenInfo(*frame).text_scale_multiplier));
+-  }
+-  return screenX;
++  const std::optional<ScreenPosition>& spoof = GetScreenPosition();
++  return spoof ? spoof->x : real;
+ }
+ 
+ int LocalDOMWindow::screenY() const {
+@@ -1810,23 +1859,27 @@ int LocalDOMWindow::screenY() const {
+     return 0;
+   }
+ 
++  // browser: see screenX().
+   Page* page = frame->GetPage();
+   if (!page) {
+     return 0;
+   }
+ 
+   ChromeClient& chrome_client = page->GetChromeClient();
++  int real;
+   if (page->GetSettings().GetReportScreenSizeInPhysicalPixelsQuirk()) {
+-    return static_cast<int>(
++    real = static_cast<int>(
+         lroundf(chrome_client.RootWindowRect(*frame).y() *
+                 chrome_client.GetScreenInfo(*frame).device_scale_factor));
++  } else {
++    real = chrome_client.RootWindowRect(*frame).y();
++    if (document() && document()->TextScaleMetaTagPresent()) {
++      real = static_cast<int>(lroundf(
++          real * chrome_client.GetScreenInfo(*frame).text_scale_multiplier));
++    }
+   }
+-  int screenY = chrome_client.RootWindowRect(*frame).y();
+-  if (document() && document()->TextScaleMetaTagPresent()) {
+-    screenY = static_cast<int>(lroundf(
+-        screenY * chrome_client.GetScreenInfo(*frame).text_scale_multiplier));
+-  }
+-  return screenY;
++  const std::optional<ScreenPosition>& spoof = GetScreenPosition();
++  return spoof ? spoof->y : real;
+ }
+ 
+ double LocalDOMWindow::scrollX() const {
+diff --git a/third_party/blink/renderer/core/frame/screen.cc b/third_party/blink/renderer/core/frame/screen.cc
+index ed5028943e..2f37a5cc92 100644
+--- a/third_party/blink/renderer/core/frame/screen.cc
++++ b/third_party/blink/renderer/core/frame/screen.cc
+@@ -28,7 +28,14 @@
+ 
+ #include "third_party/blink/renderer/core/frame/screen.h"
+ 
++#include <optional>
++
+ #include "base/numerics/safe_conversions.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_split.h"
++#include "components/browser/browser_switches.h"
++#include "components/browser/fingerprint_pool.h"
++#include "components/browser/switch_resolver.h"
+ #include "services/network/public/mojom/permissions_policy/permissions_policy_feature.mojom-blink.h"
+ #include "third_party/blink/renderer/core/dom/document.h"
+ #include "third_party/blink/renderer/core/event_target_names.h"
+@@ -41,6 +48,63 @@
+ 
+ namespace blink {
+ 
++namespace {
++
++// browser: the screen geometry reported to pages, resolved once per process
++// from --fingerprint-screen
++// ("width,height,availWidth,availHeight,availTop,colorDepth[,dpr]", "auto"
++// or "seed:<N>"). The seventh field, devicePixelRatio, is applied through
++// the forced device-scale-factor pipeline in ui/display/display.cc so
++// layout picks it up too; nullopt when not spoofed.
++struct ScreenOverride {
++  int width = 0;
++  int height = 0;
++  int avail_width = 0;
++  int avail_height = 0;
++  int avail_top = 0;
++  int color_depth = 0;
++};
++
++const std::optional<ScreenOverride>& GetScreenOverride() {
++  static const std::optional<ScreenOverride> spoof =
++      browser::ResolveSwitch<std::optional<ScreenOverride>>(
++          ::switches::kFingerprintScreen,
++          [](const std::string& value)
++              -> std::optional<std::optional<ScreenOverride>> {
++            std::vector<std::string> parts = base::SplitString(
++                value, ",", base::TRIM_WHITESPACE, base::SPLIT_WANT_NONEMPTY);
++            if (parts.size() < 6 || parts.size() > 7) {
++              return std::nullopt;
++            }
++            ScreenOverride result;
++            if (!base::StringToInt(parts[0], &result.width) ||
++                !base::StringToInt(parts[1], &result.height) ||
++                !base::StringToInt(parts[2], &result.avail_width) ||
++                !base::StringToInt(parts[3], &result.avail_height) ||
++                !base::StringToInt(parts[4], &result.avail_top) ||
++                !base::StringToInt(parts[5], &result.color_depth)) {
++              return std::nullopt;
++            }
++            return result;
++          },
++          [](int32_t seed) -> std::optional<ScreenOverride> {
++            const browser::FingerprintProfile* profile =
++                browser::ProfileForSeed(seed);
++            if (!profile) {
++              return std::nullopt;
++            }
++            return ScreenOverride{profile->screen_width, profile->screen_height,
++                                  profile->avail_width,  profile->avail_height,
++                                  profile->avail_top,    profile->color_depth};
++          },
++          std::nullopt,
++          /*inherit_from_master_seed=*/false)
++          .value;
++  return spoof;
++}
++
++}  // namespace
++
+ Screen::Screen(LocalDOMWindow* window, int64_t display_id)
+     : ExecutionContextClient(window), display_id_(display_id) {}
+ 
+@@ -90,13 +154,19 @@ bool Screen::AreWebExposedScreenPropertiesEqual(
+ int Screen::height() const {
+   if (!DomWindow())
+     return 0;
+-  return GetRect(/*available=*/false).height();
++  // browser: the real value is computed first in every getter so the
++  // per-call cost matches stock.
++  const int real = GetRect(/*available=*/false).height();
++  const std::optional<ScreenOverride>& spoof = GetScreenOverride();
++  return spoof ? spoof->height : real;
+ }
+ 
+ int Screen::width() const {
+   if (!DomWindow())
+     return 0;
+-  return GetRect(/*available=*/false).width();
++  const int real = GetRect(/*available=*/false).width();
++  const std::optional<ScreenOverride>& spoof = GetScreenOverride();
++  return spoof ? spoof->width : real;
+ }
+ 
+ unsigned Screen::colorDepth() const {
+@@ -109,9 +179,12 @@ unsigned Screen::colorDepth() const {
+   if (!DomWindow()) {
+     return unknown_color_depth;
+   }
+-  return GetScreenInfo().depth == 0
+-             ? unknown_color_depth
+-             : base::saturated_cast<unsigned>(GetScreenInfo().depth);
++  const unsigned real =
++      GetScreenInfo().depth == 0
++          ? unknown_color_depth
++          : base::saturated_cast<unsigned>(GetScreenInfo().depth);
++  const std::optional<ScreenOverride>& spoof = GetScreenOverride();
++  return spoof ? base::saturated_cast<unsigned>(spoof->color_depth) : real;
+ }
+ 
+ unsigned Screen::pixelDepth() const {
+@@ -121,25 +194,32 @@ unsigned Screen::pixelDepth() const {
+ int Screen::availLeft() const {
+   if (!DomWindow())
+     return 0;
+-  return GetRect(/*available=*/true).x();
++  const int real = GetRect(/*available=*/true).x();
++  return GetScreenOverride() ? 0 : real;
+ }
+ 
+ int Screen::availTop() const {
+   if (!DomWindow())
+     return 0;
+-  return GetRect(/*available=*/true).y();
++  const int real = GetRect(/*available=*/true).y();
++  const std::optional<ScreenOverride>& spoof = GetScreenOverride();
++  return spoof ? spoof->avail_top : real;
+ }
+ 
+ int Screen::availHeight() const {
+   if (!DomWindow())
+     return 0;
+-  return GetRect(/*available=*/true).height();
++  const int real = GetRect(/*available=*/true).height();
++  const std::optional<ScreenOverride>& spoof = GetScreenOverride();
++  return spoof ? spoof->avail_height : real;
+ }
+ 
+ int Screen::availWidth() const {
+   if (!DomWindow())
+     return 0;
+-  return GetRect(/*available=*/true).width();
++  const int real = GetRect(/*available=*/true).width();
++  const std::optional<ScreenOverride>& spoof = GetScreenOverride();
++  return spoof ? spoof->avail_width : real;
+ }
+ 
+ void Screen::Trace(Visitor* visitor) const {
+diff --git a/ui/display/BUILD.gn b/ui/display/BUILD.gn
+index c09f41bea0..73d4ba9744 100644
+--- a/ui/display/BUILD.gn
++++ b/ui/display/BUILD.gn
+@@ -133,6 +133,7 @@ component("display") {
+   deps = [
+     "//base",
+     "//base:i18n",
++    "//components/browser:browser_switches",
+     "//components/device_event_log",
+     "//components/viz/common/resources:shared_image_format",
+     "//mojo/public/cpp/bindings:struct_traits",
+diff --git a/ui/display/display.cc b/ui/display/display.cc
+index ec7fc0631d..6b0ab60e7f 100644
+--- a/ui/display/display.cc
++++ b/ui/display/display.cc
+@@ -5,14 +5,21 @@
+ #include "ui/display/display.h"
+ 
+ #include <algorithm>
++#include <optional>
++#include <string>
++#include <vector>
+ 
+ #include "base/command_line.h"
+ #include "base/logging.h"
+ #include "base/no_destructor.h"
+ #include "base/notreached.h"
+ #include "base/strings/string_number_conversions.h"
++#include "base/strings/string_split.h"
+ #include "base/strings/stringprintf.h"
+ #include "build/build_config.h"
++#include "components/browser/browser_switches.h"
++#include "components/browser/fingerprint_pool.h"
++#include "components/browser/switch_resolver.h"
+ #include "ui/display/display_switches.h"
+ #include "ui/display/util/display_util.h"
+ #include "ui/gfx/geometry/insets.h"
+@@ -38,23 +45,67 @@ float g_forced_device_scale_factor = -1.0;
+ // expected DP display size.
+ constexpr float kDisplaySizeAllowanceEpsilon = 0.01f;
+ 
++// browser: the optional seventh field of --fingerprint-screen, the device
++// pixel ratio. It goes through the same forced-scale-factor path as
++// --force-device-scale-factor so layout, DOMRect and the compositor all see
++// it; "auto" and "seed:<N>" take it from the profile, so a spoofed
++// screen.width never pairs with the real window.devicePixelRatio.
++std::optional<double> ParseFingerprintScreenDpr() {
++  static const double cached_dpr =
++      browser::ResolveSwitch<double>(
++          switches::kFingerprintScreen,
++          [](const std::string& value) -> std::optional<double> {
++            std::vector<std::string> parts = base::SplitString(
++                value, ",", base::TRIM_WHITESPACE, base::SPLIT_WANT_NONEMPTY);
++            double dpr = 0.0;
++            if (parts.size() != 7 || !base::StringToDouble(parts[6], &dpr) ||
++                dpr <= 0.0) {
++              return std::nullopt;
++            }
++            return dpr;
++          },
++          [](int32_t seed) -> double {
++            const browser::FingerprintProfile* profile =
++                browser::ProfileForSeed(seed);
++            if (!profile || !profile->device_pixel_ratio ||
++                *profile->device_pixel_ratio <= 0.0) {
++              return -1.0;
++            }
++            return *profile->device_pixel_ratio;
++          },
++          /*fallback_when_absent=*/-1.0,
++          /*inherit_from_master_seed=*/false)
++          .value;
++  if (cached_dpr > 0.0) {
++    return cached_dpr;
++  }
++  return std::nullopt;
++}
++
+ bool HasForceDeviceScaleFactorImpl() {
+-  return base::CommandLine::ForCurrentProcess()->HasSwitch(
+-      switches::kForceDeviceScaleFactor);
++  // browser: a spoofed pixel ratio counts as a forced scale factor.
++  const base::CommandLine* cl = base::CommandLine::ForCurrentProcess();
++  return cl->HasSwitch(switches::kForceDeviceScaleFactor) ||
++         ParseFingerprintScreenDpr().has_value();
+ }
+ 
+ float GetForcedDeviceScaleFactorImpl() {
+-  double scale_in_double = 1.0;
+-  if (HasForceDeviceScaleFactorImpl()) {
++  // browser: --force-device-scale-factor wins over the spoofed ratio.
++  const base::CommandLine* cl = base::CommandLine::ForCurrentProcess();
++  if (cl->HasSwitch(switches::kForceDeviceScaleFactor)) {
++    double scale_in_double = 1.0;
+     std::string value =
+-        base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
+-            switches::kForceDeviceScaleFactor);
++        cl->GetSwitchValueASCII(switches::kForceDeviceScaleFactor);
+     if (!base::StringToDouble(value, &scale_in_double)) {
+       LOG(ERROR) << "Failed to parse the default device scale factor:" << value;
+       scale_in_double = 1.0;
+     }
++    return static_cast<float>(scale_in_double);
++  }
++  if (std::optional<double> dpr = ParseFingerprintScreenDpr()) {
++    return static_cast<float>(*dpr);
+   }
+-  return static_cast<float>(scale_in_double);
++  return 1.0f;
+ }
+ 
+ const char* ToRotationString(display::Display::Rotation rotation) {

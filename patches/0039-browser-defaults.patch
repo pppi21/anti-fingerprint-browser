@@ -1,0 +1,151 @@
+From 413044288f6ef6cd0190f95128bc6f7f7136245c Mon Sep 17 00:00:00 2001
+From: Leo Rodarte <leorodarte07@gmail.com>
+Date: Sat, 19 Sep 2026 23:46:22 -0400
+Subject: [PATCH 39/41] browser-defaults
+
+Browser default overrides. Also applies the persisted fingerprint seed and
+pins a random seed to a concrete integer so children inherit one identity.
+---
+ chrome/BUILD.gn                    |  1 +
+ chrome/app/BUILD.gn                |  1 +
+ chrome/app/chrome_main_delegate.cc | 74 ++++++++++++++++++++++++++++++
+ 3 files changed, 76 insertions(+)
+
+diff --git a/chrome/BUILD.gn b/chrome/BUILD.gn
+index d87f1ca998..5f9cb0d84d 100644
+--- a/chrome/BUILD.gn
++++ b/chrome/BUILD.gn
+@@ -1296,6 +1296,7 @@ if (is_win) {
+       "//chrome/common:buildflags",
+       "//chrome/common:version_header",
+       "//chrome/common/profiler",
++      "//components/browser:browser_switches",
+       "//components/crash/core/app",
+       "//components/memory_system",
+       "//components/policy:generated",
+diff --git a/chrome/app/BUILD.gn b/chrome/app/BUILD.gn
+index 5d87ae2183..623c23c685 100644
+--- a/chrome/app/BUILD.gn
++++ b/chrome/app/BUILD.gn
+@@ -162,6 +162,7 @@ static_library("test_support") {
+     "//chrome/gpu",
+     "//chrome/renderer",
+     "//chrome/utility",
++    "//components/browser:browser_switches",
+     "//components/crash/core/app",
+     "//components/crash/core/app:test_support",
+     "//components/devtools/devtools_pipe",
+diff --git a/chrome/app/chrome_main_delegate.cc b/chrome/app/chrome_main_delegate.cc
+index 5655d73273..ce550708c2 100644
+--- a/chrome/app/chrome_main_delegate.cc
++++ b/chrome/app/chrome_main_delegate.cc
+@@ -21,6 +21,7 @@
+ #include "base/functional/bind.h"
+ #include "base/i18n/rtl.h"
+ #include "base/immediate_crash.h"
++#include "base/json/json_reader.h"
+ #include "base/lazy_instance.h"
+ #include "base/metrics/histogram_macros.h"
+ #include "base/notreached.h"
+@@ -30,6 +31,7 @@
+ #include "base/process/process_handle.h"
+ #include "base/profiler/thread_group_profiler.h"
+ #include "base/rand_util.h"
++#include "base/strings/string_number_conversions.h"
+ #include "base/strings/string_util.h"
+ #include "base/strings/sys_string_conversions.h"
+ #include "base/strings/utf_string_conversions.h"
+@@ -37,6 +39,7 @@
+ #include "base/threading/hang_watcher.h"
+ #include "base/time/time.h"
+ #include "base/timer/timer.h"
++#include "base/values.h"
+ #include "build/build_config.h"
+ #include "chrome/common/buildflags.h"
+ #include "chrome/common/channel_info.h"
+@@ -57,6 +60,10 @@
+ #include "chrome/common/url_constants.h"
+ #include "chrome/grit/generated_resources.h"
+ #include "chrome/renderer/chrome_content_renderer_client.h"
++#include "components/browser/browser_runtime.h"
++#include "components/browser/browser_switches.h"
++#include "components/browser/pref_names.h"
++#include "components/browser/switch_resolver.h"
+ #include "components/component_updater/component_updater_paths.h"
+ #include "components/content_settings/core/common/content_settings_pattern.h"
+ #include "components/crash/core/app/crash_reporter_client.h"
+@@ -1100,7 +1107,74 @@ void ChromeMainDelegate::SetupTracing() {
+           std::move(tracing_factory), unwinder_type);
+ }
+ 
++namespace {
++
++// browser: chrome://browser-settings stores the fingerprint seed in Local
++// State. It is applied here, before anything reads the command line, so it
++// works however the browser was started. The pref service does not exist
++// this early, so the file is read directly. An explicit --fingerprint-seed
++// wins.
++void ApplyPersistedFingerprintSeed(base::CommandLine* command_line) {
++  if (command_line->HasSwitch(switches::kFingerprintSeed)) {
++    return;
++  }
++  base::FilePath user_data_dir =
++      command_line->GetSwitchValuePath(switches::kUserDataDir)
++          .StripTrailingSeparators();
++  if (user_data_dir.empty()) {
++    chrome::GetDefaultUserDataDirectory(&user_data_dir);
++  }
++  std::string json;
++  if (user_data_dir.empty() ||
++      !base::ReadFileToString(user_data_dir.Append(chrome::kLocalStateFilename),
++                              &json)) {
++    return;
++  }
++  std::optional<base::Value> parsed =
++      base::JSONReader::Read(json, base::JSON_PARSE_RFC);
++  const base::DictValue* dict = parsed ? parsed->GetIfDict() : nullptr;
++  const std::string* seed =
++      dict ? dict->FindStringByDottedPath(browser::prefs::kFingerprintSeed)
++           : nullptr;
++  if (seed && !seed->empty()) {
++    command_line->AppendSwitchASCII(switches::kFingerprintSeed, *seed);
++  }
++}
++
++// browser: child processes receive --fingerprint-seed verbatim, and a value
++// such as "auto" would make each of them draw its own random seed, giving
++// every site its own identity under site isolation. Resolving the seed once
++// in the browser process and writing the integer back gives every process
++// the same identity for the session. Runs after the persisted seed is
++// applied so a persisted "auto" is pinned too.
++void PinFingerprintSeed(base::CommandLine* command_line) {
++  if (!command_line->HasSwitch(switches::kFingerprintSeed)) {
++    return;
++  }
++  int seed = 0;
++  if (!base::StringToInt(
++          command_line->GetSwitchValueASCII(switches::kFingerprintSeed),
++          &seed)) {
++    command_line->AppendSwitchASCII(
++        switches::kFingerprintSeed,
++        base::NumberToString(browser::MasterSeed()));
++  }
++}
++
++}  // namespace
++
+ std::optional<int> ChromeMainDelegate::BasicStartupComplete() {
++  // browser: expand the browser-defaults preset (opt out with
++  // --use-chromium-defaults) before anything reads the command line, then
++  // settle the fingerprint seed. Both are browser-process only.
++  browser::MaybeExpandBrowserDefaults();
++  base::CommandLine* startup_command_line =
++      base::CommandLine::ForCurrentProcess();
++  if (!startup_command_line->HasSwitch(switches::kProcessType)) {
++    ApplyPersistedFingerprintSeed(startup_command_line);
++    PinFingerprintSeed(startup_command_line);
++  }
++
+ #if BUILDFLAG(IS_CHROMEOS)
+   ash::BootTimesRecorder::Get()->SaveChromeMainStats();
+ #endif

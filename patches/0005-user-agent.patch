@@ -1,0 +1,288 @@
+From 17a12f9c32a5f187ecd0bee8a3e11b85c81f484d Mon Sep 17 00:00:00 2001
+From: Leo Rodarte <leorodarte07@gmail.com>
+Date: Sat, 19 Sep 2026 23:45:04 -0400
+Subject: [PATCH 05/41] user-agent
+
+User-agent + UA client-hints spoof; HeadlessChrome->Chrome product name.
+---
+ components/embedder_support/BUILD.gn          |   1 +
+ .../embedder_support/user_agent_utils.cc      | 108 ++++++++++++++++--
+ headless/lib/browser/headless_browser_impl.cc |   3 +-
+ .../common/user_agent/user_agent_metadata.cc  |  41 +++++++
+ .../common/user_agent/user_agent_metadata.h   |   5 +
+ 5 files changed, 147 insertions(+), 11 deletions(-)
+
+diff --git a/components/embedder_support/BUILD.gn b/components/embedder_support/BUILD.gn
+index 847ba42327..96d0bea951 100644
+--- a/components/embedder_support/BUILD.gn
++++ b/components/embedder_support/BUILD.gn
+@@ -58,6 +58,7 @@ static_library("user_agent") {
+   deps = [
+     ":embedder_support",
+     "//build:branding_buildflags",
++    "//components/browser:browser_switches",
+     "//components/policy/core/common",
+     "//components/prefs",
+     "//components/version_info",
+diff --git a/components/embedder_support/user_agent_utils.cc b/components/embedder_support/user_agent_utils.cc
+index 3f87ec84fb..625ffa2fc1 100644
+--- a/components/embedder_support/user_agent_utils.cc
++++ b/components/embedder_support/user_agent_utils.cc
+@@ -10,6 +10,7 @@
+ #include <cstddef>
+ #include <optional>
+ #include <string>
++#include <string_view>
+ #include <vector>
+ 
+ #include "base/android/device_info.h"
+@@ -26,6 +27,7 @@
+ #include "base/version.h"
+ #include "build/branding_buildflags.h"
+ #include "build/build_config.h"
++#include "components/browser/browser_runtime.h"
+ #include "components/embedder_support/pref_names.h"
+ #include "components/embedder_support/switches.h"
+ #include "components/policy/core/common/policy_pref_names.h"
+@@ -154,23 +156,97 @@ const std::string& GetWindowsPlatformVersion() {
+ }
+ #endif  // BUILDFLAG(IS_WIN)
+ 
++// browser: brand and version overrides, shared by the UA string, the brand
++// list and the full-version client hint.
++struct FingerprintBrandConfig {
++  bool active = false;
++  // True when a version switch is set, not only the brand.
++  bool version_spoofed = false;
++  std::string major_version;
++  std::string full_version;
++  std::string display_brand;
++};
++
++struct BrandDisplayName {
++  std::string_view key;
++  std::string_view name;
++};
++constexpr BrandDisplayName kBrandDisplayNames[] = {
++    {"Chrome", "Google Chrome"},
++    {"Edge", "Microsoft Edge"},
++    {"Opera", "Opera"},
++    {"Vivaldi", "Vivaldi"},
++};
++
++std::string MajorVersionOf(std::string_view version) {
++  return std::string(version.substr(0, version.find('.')));
++}
++
++const FingerprintBrandConfig& GetFingerprintBrandConfig() {
++  static const base::NoDestructor<FingerprintBrandConfig> config([] {
++    FingerprintBrandConfig result;
++    if (!browser::BrandSpoofActive()) {
++      return result;
++    }
++    const std::string& brand_key = browser::SpoofedBrand();
++    const std::string& short_version = browser::SpoofedBrandVersion();
++    const std::string& long_version = browser::SpoofedBrandVersionLong();
++    result.active = true;
++    result.version_spoofed = !short_version.empty() || !long_version.empty();
++
++    if (!short_version.empty()) {
++      result.major_version = short_version;
++    } else if (!long_version.empty()) {
++      result.major_version = MajorVersionOf(long_version);
++    } else {
++      result.major_version = version_info::GetMajorVersionNumber();
++    }
++    if (!long_version.empty()) {
++      result.full_version = long_version;
++    } else if (!short_version.empty()) {
++      result.full_version = result.major_version + ".0.0.0";
++    } else {
++      result.full_version = std::string(version_info::GetVersionNumber());
++    }
++    result.display_brand = brand_key.empty() ? "Google Chrome" : brand_key;
++    for (const BrandDisplayName& entry : kBrandDisplayNames) {
++      if (entry.key == brand_key) {
++        result.display_brand = std::string(entry.name);
++      }
++    }
++    return result;
++  }());
++  return *config;
++}
++
+ const blink::UserAgentBrandList GetUserAgentBrandList(
+     const std::string& major_version,
+     const std::string& full_version,
+     blink::UserAgentBrandVersionType output_version_type,
+     std::optional<blink::UserAgentBrandVersion> additional_brand_version) {
++  // browser: the spoofed brand and versions replace the real ones.
++  const FingerprintBrandConfig& config = GetFingerprintBrandConfig();
++  const std::string& effective_major =
++      config.active ? config.major_version : major_version;
++  const std::string& effective_full =
++      config.active ? config.full_version : full_version;
++
+   int major_version_number;
+-  bool parse_result = base::StringToInt(major_version, &major_version_number);
++  bool parse_result = base::StringToInt(effective_major, &major_version_number);
+   DCHECK(parse_result);
+   std::optional<std::string> brand;
++  if (config.active) {
++    brand = config.display_brand;
++  } else {
+ #if !BUILDFLAG(CHROMIUM_BRANDING)
+-  brand = version_info::GetProductName();
++    brand = version_info::GetProductName();
+ #endif
++  }
+ 
+   std::string brand_version =
+       output_version_type == blink::UserAgentBrandVersionType::kFullVersion
+-          ? full_version
+-          : major_version;
++          ? effective_full
++          : effective_major;
+ 
+   return GenerateBrandVersionList(major_version_number, brand, brand_version,
+                                   output_version_type,
+@@ -215,8 +291,12 @@ const blink::UserAgentBrandList GetUserAgentBrandFullVersionListInternal(
+ // depending on the Reduce User-Agent reduction phase features.
+ std::string GetUserAgentInternal() {
+   std::string product = GetProductAndVersion();
+-  if (base::CommandLine::ForCurrentProcess()->HasSwitch(kHeadless)) {
+-    product.insert(0, "Headless");
++  // browser: the UA string always carries the reduced Chrome/MAJOR.0.0.0
++  // token; the full version only appears in client hints. The "Headless"
++  // prefix is never added.
++  const FingerprintBrandConfig& config = GetFingerprintBrandConfig();
++  if (config.version_spoofed) {
++    product = "Chrome/" + config.major_version + ".0.0.0";
+   }
+ 
+ #if BUILDFLAG(IS_ANDROID) || BUILDFLAG(IS_IOS)
+@@ -225,9 +305,13 @@ std::string GetUserAgentInternal() {
+   }
+ #endif
+ 
+-  return ShouldSendUserAgentUnifiedPlatform()
+-             ? BuildUnifiedPlatformUserAgentFromProduct(product)
+-             : BuildUserAgentFromProduct(product);
++  std::string user_agent =
++      ShouldSendUserAgentUnifiedPlatform()
++          ? BuildUnifiedPlatformUserAgentFromProduct(product)
++          : BuildUserAgentFromProduct(product);
++  // browser: non-Chrome brands add their own product token.
++  user_agent += blink::GetUserAgentFingerprintBrandInfo();
++  return user_agent;
+ }
+ 
+ // Generate random order list based on the input size and seed.
+@@ -674,7 +758,11 @@ blink::UserAgentMetadata GetUserAgentMetadata(bool only_low_entropy_ch) {
+   // High entropy client hints.
+   metadata.brand_full_version_list =
+       GetUserAgentBrandFullVersionListInternal(std::nullopt);
+-  metadata.full_version = std::string(version_info::GetVersionNumber());
++  // browser: the spoofed full version.
++  const FingerprintBrandConfig& config = GetFingerprintBrandConfig();
++  metadata.full_version = config.active
++                              ? config.full_version
++                              : std::string(version_info::GetVersionNumber());
+   metadata.architecture = GetCpuArchitecture();
+   metadata.model = BuildModelInfo();
+   metadata.form_factors = GetFormFactorsClientHint(metadata, metadata.mobile);
+diff --git a/headless/lib/browser/headless_browser_impl.cc b/headless/lib/browser/headless_browser_impl.cc
+index 999d93f956..e2a112be0a 100644
+--- a/headless/lib/browser/headless_browser_impl.cc
++++ b/headless/lib/browser/headless_browser_impl.cc
+@@ -64,7 +64,8 @@ namespace headless {
+ namespace {
+ 
+ // Product name for building the default user agent string.
+-const char kHeadlessProductName[] = "HeadlessChrome";
++// browser: never "HeadlessChrome".
++const char kHeadlessProductName[] = "Chrome";
+ 
+ #if defined(HEADLESS_USE_PREFS)
+ const base::FilePath::CharType kLocalStateFilename[] =
+diff --git a/third_party/blink/common/user_agent/user_agent_metadata.cc b/third_party/blink/common/user_agent/user_agent_metadata.cc
+index 4eab85a17e..d01340d6d3 100644
+--- a/third_party/blink/common/user_agent/user_agent_metadata.cc
++++ b/third_party/blink/common/user_agent/user_agent_metadata.cc
+@@ -7,7 +7,10 @@
+ #include <algorithm>
+ 
+ #include "base/containers/span.h"
++#include "base/no_destructor.h"
+ #include "base/pickle.h"
++#include "base/strings/strcat.h"
++#include "components/browser/browser_runtime.h"
+ #include "net/http/structured_headers.h"
+ #include "third_party/blink/public/common/features.h"
+ 
+@@ -24,6 +27,19 @@ constexpr std::string_view kValidFormFactors[] = {
+     blink::kXRFormFactor,      blink::kEInkFormFactor,
+     blink::kWatchFormFactor};
+ 
++// browser: UA-string product tokens for non-Chrome brands, with the version
++// used when no version switch is set.
++struct BrandSuffix {
++  std::string_view key;
++  std::string_view token;
++  std::string_view default_version;
++};
++constexpr BrandSuffix kBrandSuffixes[] = {
++    {"Edge", "Edg", "145.0.0.0"},
++    {"Opera", "OPR", "123.0.0.0"},
++    {"Vivaldi", "Vivaldi", "7.5.3735.66"},
++};
++
+ }  // namespace
+ 
+ UserAgentBrandVersion::UserAgentBrandVersion(const std::string& ua_brand,
+@@ -232,4 +248,29 @@ bool operator==(const UserAgentOverride& a, const UserAgentOverride& b) {
+          a.ua_metadata_override == b.ua_metadata_override;
+ }
+ 
++// browser
++std::string GetUserAgentFingerprintBrandInfo() {
++  static const base::NoDestructor<std::string> cached([]() -> std::string {
++    const std::string& brand_key = browser::SpoofedBrand();
++    if (brand_key.empty() || brand_key == "Chrome") {
++      return std::string();
++    }
++    std::string version = browser::SpoofedBrandVersionLong();
++    if (version.empty() && !browser::SpoofedBrandVersion().empty()) {
++      version = browser::SpoofedBrandVersion() + ".0.0.0";
++    }
++    std::string_view token = brand_key;
++    std::string_view default_version = "0.0.0.0";
++    for (const BrandSuffix& entry : kBrandSuffixes) {
++      if (entry.key == brand_key) {
++        token = entry.token;
++        default_version = entry.default_version;
++      }
++    }
++    return base::StrCat(
++        {" ", token, "/", version.empty() ? default_version : version});
++  }());
++  return *cached;
++}
++
+ }  // namespace blink
+diff --git a/third_party/blink/public/common/user_agent/user_agent_metadata.h b/third_party/blink/public/common/user_agent/user_agent_metadata.h
+index fda7b49c11..78b4971e5e 100644
+--- a/third_party/blink/public/common/user_agent/user_agent_metadata.h
++++ b/third_party/blink/public/common/user_agent/user_agent_metadata.h
+@@ -106,6 +106,11 @@ bool BLINK_COMMON_EXPORT operator==(const UserAgentMetadata& a,
+ bool BLINK_COMMON_EXPORT operator==(const UserAgentOverride& a,
+                                     const UserAgentOverride& b);
+ 
++// browser: the product token appended to the UA string for a spoofed
++// non-Chrome brand (e.g. " Edg/131.0.0.0"); empty for Chrome or when no
++// brand is spoofed.
++std::string BLINK_COMMON_EXPORT GetUserAgentFingerprintBrandInfo();
++
+ }  // namespace blink
+ 
+ #endif  // THIRD_PARTY_BLINK_PUBLIC_COMMON_USER_AGENT_USER_AGENT_METADATA_H_

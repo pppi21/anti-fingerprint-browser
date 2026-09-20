@@ -1,0 +1,355 @@
+From 9bc01c0866169debc60f935fb4205c10a9eb9b91 Mon Sep 17 00:00:00 2001
+From: Leo Rodarte <leorodarte07@gmail.com>
+Date: Sat, 19 Sep 2026 23:45:56 -0400
+Subject: [PATCH 29/41] mouse-path
+
+Synthetic human mouse-path gesture + route observer.
+---
+ .../render_widget_host_input_event_router.cc  | 14 +++
+ .../render_widget_host_input_event_router.h   | 14 +++
+ content/common/BUILD.gn                       |  4 +
+ .../common/input/synthetic_gesture_params.h   |  3 +-
+ .../input/synthetic_mouse_path_gesture.cc     | 97 +++++++++++++++++++
+ .../input/synthetic_mouse_path_gesture.h      | 51 ++++++++++
+ .../synthetic_mouse_path_gesture_params.cc    | 28 ++++++
+ .../synthetic_mouse_path_gesture_params.h     | 41 ++++++++
+ 8 files changed, 251 insertions(+), 1 deletion(-)
+ create mode 100644 content/common/input/synthetic_mouse_path_gesture.cc
+ create mode 100644 content/common/input/synthetic_mouse_path_gesture.h
+ create mode 100644 content/common/input/synthetic_mouse_path_gesture_params.cc
+ create mode 100644 content/common/input/synthetic_mouse_path_gesture_params.h
+
+diff --git a/components/input/render_widget_host_input_event_router.cc b/components/input/render_widget_host_input_event_router.cc
+index d029a262f7..f8215f9ad3 100644
+--- a/components/input/render_widget_host_input_event_router.cc
++++ b/components/input/render_widget_host_input_event_router.cc
+@@ -637,9 +637,23 @@ void RenderWidgetHostInputEventRouter::RouteMouseEvent(
+     RenderWidgetHostViewInput* root_view,
+     const blink::WebMouseEvent* event,
+     const ui::LatencyInfo& latency) {
++  // browser: observers see the event in root-view coordinates.
++  for (MouseEventRouteObserver* observer : mouse_event_route_observers_) {
++    observer->OnMouseEventRouted(*event);
++  }
+   event_targeter_->FindTargetAndDispatch(root_view, *event, latency);
+ }
+ 
++void RenderWidgetHostInputEventRouter::AddMouseEventRouteObserver(
++    MouseEventRouteObserver* observer) {
++  mouse_event_route_observers_.push_back(observer);
++}
++
++void RenderWidgetHostInputEventRouter::RemoveMouseEventRouteObserver(
++    MouseEventRouteObserver* observer) {
++  std::erase(mouse_event_route_observers_, observer);
++}
++
+ void RenderWidgetHostInputEventRouter::DispatchMouseEvent(
+     RenderWidgetHostViewInput* root_view,
+     RenderWidgetHostViewInput* target,
+diff --git a/components/input/render_widget_host_input_event_router.h b/components/input/render_widget_host_input_event_router.h
+index 64f38be540..040d86af5d 100644
+--- a/components/input/render_widget_host_input_event_router.h
++++ b/components/input/render_widget_host_input_event_router.h
+@@ -120,6 +120,17 @@ class COMPONENT_EXPORT(INPUT) RenderWidgetHostInputEventRouter final
+     virtual void CancelAutoscroll(RenderWidgetHostViewInput* view) = 0;
+   };
+ 
++  // browser: notified of every routed mouse event in root-view coordinates,
++  // before the event is transformed to target-frame coordinates.
++  class COMPONENT_EXPORT(INPUT) MouseEventRouteObserver {
++   public:
++    virtual ~MouseEventRouteObserver() = default;
++    virtual void OnMouseEventRouted(const blink::WebMouseEvent& event) = 0;
++  };
++
++  void AddMouseEventRouteObserver(MouseEventRouteObserver* observer);
++  void RemoveMouseEventRouteObserver(MouseEventRouteObserver* observer);
++
+   explicit RenderWidgetHostInputEventRouter(viz::HitTestDataProvider* provider,
+                                             Delegate* delegate);
+ 
+@@ -544,6 +555,9 @@ class COMPONENT_EXPORT(INPUT) RenderWidgetHostInputEventRouter final
+   // impact performance due to the IPC overhead.
+   bool ended_delegated_ink_trail_ = false;
+ 
++  // browser: see MouseEventRouteObserver.
++  std::vector<raw_ptr<MouseEventRouteObserver>> mouse_event_route_observers_;
++
+   base::WeakPtrFactory<RenderWidgetHostInputEventRouter> weak_ptr_factory_{
+       this};
+   friend class content::RenderWidgetHostInputEventRouterTest;
+diff --git a/content/common/BUILD.gn b/content/common/BUILD.gn
+index 6db21bbde5..9df283da22 100644
+--- a/content/common/BUILD.gn
++++ b/content/common/BUILD.gn
+@@ -106,6 +106,10 @@ source_set("common") {
+     "input/synthetic_gesture_target.h",
+     "input/synthetic_mouse_driver.cc",
+     "input/synthetic_mouse_driver.h",
++    "input/synthetic_mouse_path_gesture.cc",
++    "input/synthetic_mouse_path_gesture.h",
++    "input/synthetic_mouse_path_gesture_params.cc",
++    "input/synthetic_mouse_path_gesture_params.h",
+     "input/synthetic_pen_driver.cc",
+     "input/synthetic_pen_driver.h",
+     "input/synthetic_pinch_gesture.cc",
+diff --git a/content/common/input/synthetic_gesture_params.h b/content/common/input/synthetic_gesture_params.h
+index e9683d0546..750bba17ca 100644
+--- a/content/common/input/synthetic_gesture_params.h
++++ b/content/common/input/synthetic_gesture_params.h
+@@ -30,11 +30,12 @@ struct CONTENT_EXPORT SyntheticGestureParams {
+     PINCH_GESTURE,
+     TAP_GESTURE,
+     POINTER_ACTION_LIST,
++    MOUSE_PATH_GESTURE,  // browser: Input.dispatchMousePath
+ 
+     // Used to synchronize with the renderer to a known state. See
+     // WaitForInputProcessed in input_handler.mojom.
+     WAIT_FOR_INPUT_PROCESSED,
+-    SYNTHETIC_GESTURE_TYPE_MAX = POINTER_ACTION_LIST
++    SYNTHETIC_GESTURE_TYPE_MAX = MOUSE_PATH_GESTURE
+   };
+ 
+   static constexpr int kDefaultSpeedInPixelsPerSec = 800;
+diff --git a/content/common/input/synthetic_mouse_path_gesture.cc b/content/common/input/synthetic_mouse_path_gesture.cc
+new file mode 100644
+index 0000000000..eb17c82add
+--- /dev/null
++++ b/content/common/input/synthetic_mouse_path_gesture.cc
+@@ -0,0 +1,97 @@
++// Copyright 2026 The browser Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "content/common/input/synthetic_mouse_path_gesture.h"
++
++#include <algorithm>
++
++#include "base/check_op.h"
++#include "content/common/input/input_injector.mojom-shared.h"
++
++namespace content {
++
++SyntheticMousePathGesture::SyntheticMousePathGesture(
++    const SyntheticMousePathGestureParams& gesture_params)
++    : SyntheticGestureBase(gesture_params) {
++  CHECK_EQ(SyntheticGestureParams::MOUSE_PATH_GESTURE,
++           gesture_params.GetGestureType());
++  CHECK(!gesture_params.positions.empty());
++}
++
++SyntheticMousePathGesture::~SyntheticMousePathGesture() = default;
++
++SyntheticGesture::Result SyntheticMousePathGesture::ForwardInputEvents(
++    const base::TimeTicks& timestamp,
++    SyntheticGestureTarget* target) {
++  CHECK(dispatching_controller_);
++  const base::WeakPtr<SyntheticGestureController> weak_controller =
++      dispatching_controller_;
++
++  if (!pointer_driver_) {
++    pointer_driver_ = SyntheticPointerDriver::Create(
++        content::mojom::GestureSourceType::kMouseInput,
++        params().from_devtools_debugger);
++  }
++
++  const auto& positions = params().positions;
++  const base::TimeDelta interval = params().polling_interval;
++
++  if (!started_) {
++    // The first position goes out immediately.
++    started_ = true;
++    gesture_start_time_ = timestamp;
++    DispatchMove(0, target);
++    if (!weak_controller) {
++      return SyntheticGesture::GESTURE_ABORT;
++    }
++    current_index_ = 1;
++    return positions.size() == 1 ? SyntheticGesture::GESTURE_FINISHED
++                                 : SyntheticGesture::GESTURE_RUNNING;
++  }
++
++  // Every position whose time has come is dispatched now, each stamped with
++  // its own nominal time on the polling grid.
++  const base::TimeDelta elapsed = timestamp - gesture_start_time_;
++  const size_t due =
++      std::min(positions.size(), static_cast<size_t>(elapsed / interval) + 1);
++  while (current_index_ < due) {
++    DispatchMove(current_index_, target);
++    if (!weak_controller) {
++      return SyntheticGesture::GESTURE_ABORT;
++    }
++    current_index_++;
++  }
++  return current_index_ >= positions.size() ? SyntheticGesture::GESTURE_FINISHED
++                                            : SyntheticGesture::GESTURE_RUNNING;
++}
++
++void SyntheticMousePathGesture::DispatchMove(size_t index,
++                                             SyntheticGestureTarget* target) {
++  // A held button rides on every move: SyntheticMouseDriverBase::Move turns
++  // it into the event's button modifiers, which the renderer reports as
++  // `buttons`.
++  const SyntheticMousePathGestureParams::Position& position =
++      params().positions[index];
++  pointer_driver_->Move(position.x, position.y, /*index=*/0,
++                        /*key_modifiers=*/0, /*width=*/1.f, /*height=*/1.f,
++                        /*rotation_angle=*/0.f, /*force=*/1.f,
++                        /*tangential_pressure=*/0.f, /*tilt_x=*/0, /*tilt_y=*/0,
++                        params().button);
++  pointer_driver_->DispatchEvent(
++      target, gesture_start_time_ + params().polling_interval * index);
++}
++
++void SyntheticMousePathGesture::WaitForTargetAck(
++    base::OnceClosure callback,
++    SyntheticGestureTarget* target) const {
++  target->WaitForTargetAck(params().GetGestureType(),
++                           content::mojom::GestureSourceType::kMouseInput,
++                           std::move(callback));
++}
++
++bool SyntheticMousePathGesture::AllowHighFrequencyDispatch() const {
++  return true;
++}
++
++}  // namespace content
+diff --git a/content/common/input/synthetic_mouse_path_gesture.h b/content/common/input/synthetic_mouse_path_gesture.h
+new file mode 100644
+index 0000000000..45943cbbb2
+--- /dev/null
++++ b/content/common/input/synthetic_mouse_path_gesture.h
+@@ -0,0 +1,51 @@
++// Copyright 2026 The browser Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CONTENT_COMMON_INPUT_SYNTHETIC_MOUSE_PATH_GESTURE_H_
++#define CONTENT_COMMON_INPUT_SYNTHETIC_MOUSE_PATH_GESTURE_H_
++
++#include <memory>
++
++#include "base/time/time.h"
++#include "content/common/content_export.h"
++#include "content/common/input/synthetic_gesture.h"
++#include "content/common/input/synthetic_gesture_target.h"
++#include "content/common/input/synthetic_mouse_path_gesture_params.h"
++#include "content/common/input/synthetic_pointer_driver.h"
++
++namespace content {
++
++// Moves the mouse through a list of positions at a fixed polling rate, for
++// Input.dispatchMousePath.
++class CONTENT_EXPORT SyntheticMousePathGesture
++    : public SyntheticGestureBase<SyntheticMousePathGestureParams> {
++ public:
++  explicit SyntheticMousePathGesture(
++      const SyntheticMousePathGestureParams& params);
++
++  SyntheticMousePathGesture(const SyntheticMousePathGesture&) = delete;
++  SyntheticMousePathGesture& operator=(const SyntheticMousePathGesture&) =
++      delete;
++
++  ~SyntheticMousePathGesture() override;
++
++  SyntheticGesture::Result ForwardInputEvents(
++      const base::TimeTicks& timestamp,
++      SyntheticGestureTarget* target) override;
++  void WaitForTargetAck(base::OnceClosure callback,
++                        SyntheticGestureTarget* target) const override;
++  bool AllowHighFrequencyDispatch() const override;
++
++ private:
++  void DispatchMove(size_t index, SyntheticGestureTarget* target);
++
++  std::unique_ptr<SyntheticPointerDriver> pointer_driver_;
++  base::TimeTicks gesture_start_time_;
++  size_t current_index_ = 0;
++  bool started_ = false;
++};
++
++}  // namespace content
++
++#endif  // CONTENT_COMMON_INPUT_SYNTHETIC_MOUSE_PATH_GESTURE_H_
+diff --git a/content/common/input/synthetic_mouse_path_gesture_params.cc b/content/common/input/synthetic_mouse_path_gesture_params.cc
+new file mode 100644
+index 0000000000..49be8adf40
+--- /dev/null
++++ b/content/common/input/synthetic_mouse_path_gesture_params.cc
+@@ -0,0 +1,28 @@
++// Copyright 2026 The browser Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "content/common/input/synthetic_mouse_path_gesture_params.h"
++
++namespace content {
++
++SyntheticMousePathGestureParams::SyntheticMousePathGestureParams() = default;
++
++SyntheticMousePathGestureParams::SyntheticMousePathGestureParams(
++    const SyntheticMousePathGestureParams& other)
++    : SyntheticGestureParams(other),
++      positions(other.positions),
++      polling_interval(other.polling_interval),
++      // SyntheticGestureBase copy-constructs the params it is handed, so a
++      // member missing from this list is silently dropped between the
++      // handler that sets it and the gesture that reads it.
++      button(other.button) {}
++
++SyntheticMousePathGestureParams::~SyntheticMousePathGestureParams() = default;
++
++SyntheticGestureParams::GestureType
++SyntheticMousePathGestureParams::GetGestureType() const {
++  return MOUSE_PATH_GESTURE;
++}
++
++}  // namespace content
+diff --git a/content/common/input/synthetic_mouse_path_gesture_params.h b/content/common/input/synthetic_mouse_path_gesture_params.h
+new file mode 100644
+index 0000000000..53f39ba625
+--- /dev/null
++++ b/content/common/input/synthetic_mouse_path_gesture_params.h
+@@ -0,0 +1,41 @@
++// Copyright 2026 The browser Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CONTENT_COMMON_INPUT_SYNTHETIC_MOUSE_PATH_GESTURE_PARAMS_H_
++#define CONTENT_COMMON_INPUT_SYNTHETIC_MOUSE_PATH_GESTURE_PARAMS_H_
++
++#include <vector>
++
++#include "base/time/time.h"
++#include "content/common/content_export.h"
++#include "content/common/input/synthetic_gesture_params.h"
++#include "content/common/input/synthetic_pointer_action_params.h"
++
++namespace content {
++
++struct CONTENT_EXPORT SyntheticMousePathGestureParams
++    : public SyntheticGestureParams {
++  struct Position {
++    float x;
++    float y;
++  };
++
++  SyntheticMousePathGestureParams();
++  SyntheticMousePathGestureParams(const SyntheticMousePathGestureParams& other);
++  ~SyntheticMousePathGestureParams() override;
++
++  GestureType GetGestureType() const override;
++
++  std::vector<Position> positions;
++  base::TimeDelta polling_interval;
++
++  // Held for every move along the path. NO_BUTTON makes the path a hover;
++  // anything else makes it a drag.
++  SyntheticPointerActionParams::Button button =
++      SyntheticPointerActionParams::Button::NO_BUTTON;
++};
++
++}  // namespace content
++
++#endif  // CONTENT_COMMON_INPUT_SYNTHETIC_MOUSE_PATH_GESTURE_PARAMS_H_

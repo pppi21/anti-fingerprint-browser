@@ -1,0 +1,30 @@
+From c97876752c58a7fcbcfa4be63195811e1c095f1b Mon Sep 17 00:00:00 2001
+From: Leo Rodarte <leorodarte07@gmail.com>
+Date: Sat, 19 Sep 2026 23:45:40 -0400
+Subject: [PATCH 23/41] translate-parity
+
+Force TranslateService for hrefTranslate IDL parity.
+---
+ .../blink/renderer/core/exported/web_view_impl.cc        | 9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/third_party/blink/renderer/core/exported/web_view_impl.cc b/third_party/blink/renderer/core/exported/web_view_impl.cc
+index 0707d2f2c6..ca7e3f143d 100644
+--- a/third_party/blink/renderer/core/exported/web_view_impl.cc
++++ b/third_party/blink/renderer/core/exported/web_view_impl.cc
+@@ -1924,8 +1924,13 @@ void WebView::ApplyWebPreferences(const web_pref::WebPreferences& prefs,
+   RuntimeEnabledFeatures::SetMiddleClickAutoscrollEnabled(true);
+ #endif
+ 
+-  RuntimeEnabledFeatures::SetTranslateServiceEnabled(
+-      prefs.translate_service_available);
++  // browser: always on. TranslateService gates the HrefTranslate runtime
++  // feature and with it the hrefTranslate attribute of HTMLAnchorElement.
++  // Chrome ships with Google API keys, so TranslateManager::IsAvailable() is
++  // true there and the attribute is always present; this build has no keys,
++  // and the missing attribute would be a fingerprint. The translate service
++  // itself is still gated by --translate-script-url.
++  RuntimeEnabledFeatures::SetTranslateServiceEnabled(true);
+ 
+ #if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_ANDROID)
+   if (web_view_impl->GetPage()) {
