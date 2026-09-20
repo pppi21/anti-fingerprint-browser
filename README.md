@@ -4,14 +4,14 @@ A Chromium build that lets you control what your browser reports about your mach
 
 Spoofing happens inside the browser, not through injected JavaScript, so there's no `Object.defineProperty` wrapper for a page to detect. Identities are either random per launch or reproducible from an integer seed.
 
-**Windows only. Closed source, distributed as a binary. See [Trust & verification](#trust--verification) before installing.**
+**Windows only.** Distributed as a binary; the source is the patch series in [`patches/`](patches), applied on top of Chromium.
 
 ---
 
 ## Contents
 
 - [Download](#download)
-- [Trust & verification](#trust--verification)
+- [Source](#source)
 - [Install](#install)
 - [What this does and doesn't do](#what-this-does-and-doesnt-do)
 - [Privacy defaults](#privacy-defaults)
@@ -32,16 +32,28 @@ Grab the latest build from the [Releases page](../../releases):
 | `AntiFingerprintChromium-Setup-<version>.exe` | Installer with Windows integration |
 | `AntiFingerprintChromium-<version>-portable.zip` | Portable, no installation |
 
-## Trust & verification
+## Source
 
-**The source is closed, and I don't intend to open it.** I don't have any experience with open source so I'd rather keep it closed for now. If someone would like to help me safely open-source this project just email me [support@nodriver.app].
+Everything this browser changes lives in [`patches/`](patches): one numbered patch per feature, applied in order to the Chromium release named in the patch series. Each patch is self-contained and readable on its own, so you can see exactly what is spoofed and how before you run the binary.
 
-Use [Mullvad Browser](https://mullvad.net/en/browser), [LibreWolf](https://librewolf.net/), or [Brave](https://brave.com/) instead if you need open source.
+To check the behavior independently, run the browser against [CreepJS](https://abrahamjuliot.github.io/creepjs/), [BrowserScan](https://www.browserscan.com/), or [FingerprintJS](https://demo.fingerprint.com/playground) with spoofing on and off and compare, or watch its network traffic with Wireshark or Fiddler to confirm the telemetry claims.
 
-What you can check independently today:
+### Building from source
 
-- Run the browser against [CreepJS](https://abrahamjuliot.github.io/creepjs/), [BrowserScan](https://www.browserscan.com/), or [FingerprintJS](https://demo.fingerprint.com/playground) with spoofing on and off, and compare.
-- Monitor its network traffic with Wireshark or Fiddler to confirm the telemetry claims.
+`build.py` does the whole job: it clones [ungoogled-chromium-windows](https://github.com/ungoogled-software/ungoogled-chromium-windows) at the pinned tag, checks out the matching Chromium release with its tooling, fetches the toolchain downloads, applies the curated ungoogled patches followed by this project's patch series, and runs the build.
+
+```
+python build.py [-j N] [--widevine-dir DIR] [--package]
+```
+
+Requirements, the same as for ungoogled-chromium-windows: Windows 10 or 11 x64, Visual Studio 2026 with the C++ workload and the Windows SDK version Chromium pins (10.0.28000 for this release), Python 3, Git, 7-Zip, around 100 GB of free disk space and 16 GB or more of RAM. A full build takes several hours. Run it from a regular prompt; the script sets up the Visual Studio environment itself. A second run skips the checkout and patching and goes straight to the build; `--clean` starts over.
+
+Two pieces of the released binaries are not in this repository because they cannot be redistributed:
+
+- **Widevine CDM.** Pass `--widevine-dir` with a directory holding the CDM's `LICENSE` and `win/x64/manifest.json`, `widevinecdm.dll` and `widevinecdm.dll.sig` to bundle one you obtained yourself. Without it the build disables Widevine, and the browser still plays DRM content that uses PlayReady on Windows.
+- **Font bundle.** `--browser-font-bundle` loads fonts from a `browser_fonts/` directory next to `chrome.exe` at runtime. The release ships a set of licensed fonts; the build does not need them, and the switch simply does nothing when the directory is absent.
+
+The installer and portable zip on the Releases page are packaged separately; `--package` runs the stock ungoogled-chromium-windows packaging instead, which produces an installer and a zip under `build/ungoogled-chromium-windows/build/`.
 
 ## Install
 
@@ -110,7 +122,6 @@ The **Master** column indicates whether the switch activates implicitly when `--
 |---|---|---|
 | `--fingerprint-seed=auto\|<int>` | auto, integer | Master seed driving every "Master ✓" switch below. `auto` allocates one random seed per launch; `<int>` is reproducible across launches. Usually set persistently via `chrome://browser-settings` rather than here; a command-line value overrides the saved one for that launch. |
 | `--use-chromium-defaults` | presence-only | Opt out of the always-on browser-defaults preset for this launch, running with stock Chromium behavior. |
-| `--browser-defaults` | presence-only | No-op, kept for backward compatibility: the preset it used to enable is now applied by default on every launch (opt out with `--use-chromium-defaults`). |
 
 </details>
 
@@ -153,7 +164,6 @@ These exist but are not activated by `--fingerprint-seed`. Pass them with `=auto
 | `--fingerprint-media-features=<scheme,motion,contrast,colors,gamut>` | auto, seed:N, explicit | CSS `matchMedia('(prefers-color-scheme: …)')`, `(color-gamut: …)`, `(prefers-reduced-motion: …)`, `(prefers-contrast: …)`, `(forced-colors: …)`. |
 | `--fingerprint-media=<mics,webcams,speakers>` | auto, seed:N, explicit | `navigator.mediaDevices.enumerateDevices()` per-kind counts. Pre-permission state collapses any non-zero count to one entry per kind. |
 | `--fingerprint-history-length=<int>` | auto, seed:N, explicit | `history.length`. Derive range `[1, 5]`. |
-| `--audio-noise=<float>` | auto, seed:N, explicit | Per-sample Gaussian noise amplitude for `OfflineAudioContext` rendering. Range `[1e-7, 1e-6]`. |
 | `--fingerprint-text-rendering=gamma:<float>,contrast:<float>` | explicit only | Skia `text_gamma` / `text_contrast` overrides (Windows). Retained for experimentation; no `auto`/`seed:N` support. |
 
 </details>
@@ -309,8 +319,6 @@ Built on [Chromium](https://www.chromium.org/). The Safe Browsing removal draws 
 
 ## License
 
-<!-- TODO: replace with the actual SPDX identifier from LICENSE.txt, e.g. "Released under the MIT License." -->
+BSD-3-Clause, see [`LICENSE`](LICENSE).
 
-See [`LICENSE.txt`](LICENSE.txt). Free for personal and commercial use, with no warranty.
-
-Chromium itself is BSD-3-Clause and bundles components under other licenses; those obligations carry over to this derivative. Third-party notices are listed at `chrome://credits` within the running browser.
+Chromium itself is BSD-3-Clause and bundles components under other licenses; those obligations carry over to this derivative. Third-party notices are listed at `chrome://credits` within the running browser. The curated patches under `patches/ungoogled/` come from [ungoogled-chromium](https://github.com/ungoogled-software/ungoogled-chromium) and [ungoogled-chromium-windows](https://github.com/ungoogled-software/ungoogled-chromium-windows), also BSD-3-Clause.
