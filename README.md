@@ -93,7 +93,7 @@ The always-on privacy preset **turns off Google Safe Browsing**, which is what n
 
 A telemetry-off + privacy preset is applied automatically on **every** launch, with no flags or shortcuts needed. It turns off pings, background networking, usage/crash reporting, and **keeps Manifest V2 extension support enabled**, so [uBlock Origin](https://github.com/gorhill/ublock) works as it did pre-Chrome-127.
 
-To launch with stock Chromium behavior instead, add `--use-chromium-defaults`.
+To launch with stock Chromium behavior instead, add `--use-chromium-defaults` (safebrowsing will stay off regardless).
 
 ## Fingerprint identity
 
