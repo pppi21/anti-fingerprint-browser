@@ -46,12 +46,12 @@ To check the behavior independently, run the browser against [CreepJS](https://a
 python build.py [-j N] [--widevine-dir DIR] [--package]
 ```
 
-Requirements, the same as for ungoogled-chromium-windows: Windows 10 or 11 x64, Visual Studio 2026 with the C++ workload and the Windows SDK version Chromium pins (10.0.28000 for this release), Python 3, Git, 7-Zip, around 100 GB of free disk space and 16 GB or more of RAM. A full build takes several hours. Run it from a regular prompt; the script sets up the Visual Studio environment itself. A second run skips the checkout and patching and goes straight to the build; `--clean` starts over.
+Requirements, the same as for ungoogled-chromium-windows: Windows 10 or 11 x64, Visual Studio 2026 with the C++ workload and the Windows SDK version Chromium pins (10.0.28000 for this release), Python 3, Git, 7-Zip, around 45 GB of free disk space and 32 GB or more of RAM. A full build takes several hours. Run it from a regular prompt; the script sets up the Visual Studio environment itself. A second run skips the checkout and patching and goes straight to the build; `--clean` starts over.
 
 Two pieces of the released binaries are not in this repository because they cannot be redistributed:
 
 - **Widevine CDM.** Pass `--widevine-dir` with a directory holding the CDM's `LICENSE` and `win/x64/manifest.json`, `widevinecdm.dll` and `widevinecdm.dll.sig` to bundle one you obtained yourself. Without it the build disables Widevine, and the browser still plays DRM content that uses PlayReady on Windows.
-- **Font bundle.** `--browser-font-bundle` loads fonts from a `browser_fonts/` directory next to `chrome.exe` at runtime. The release ships a set of licensed fonts; the build does not need them, and the switch simply does nothing when the directory is absent.
+- **Font bundle.** `--browser-font-bundle` loads fonts from a `browser_fonts/` directory next to `chrome.exe` at runtime. The release ships a set of fonts; the build does not need them, and the switch simply does nothing when the directory is absent.
 
 The installer and portable zip on the Releases page are packaged separately; `--package` runs the stock ungoogled-chromium-windows packaging instead, which produces an installer and a zip under `build/ungoogled-chromium-windows/build/`.
 
